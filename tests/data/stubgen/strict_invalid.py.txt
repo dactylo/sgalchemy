@@ -1,0 +1,23 @@
+from sgalchemy import AsyncEngine, Engine, async_scoped_session, async_sessionmaker, func, scoped_session, sessionmaker
+from sgalchemy.entities import Shot
+
+
+def check_invalid(shot: Shot) -> None:
+    print(shot.unknown_field)  # error: reportAttributeAccessIssue
+    print(Shot.unknown_field)  # error: reportAttributeAccessIssue
+    shot.unknown_field = 'A'  # error: reportAttributeAccessIssue
+    shot.code = 42  # error: reportAttributeAccessIssue
+    shot.id = 42  # error: reportAttributeAccessIssue
+    shot.sg_uploaded_movie = 'clip.mov'  # error: reportAttributeAccessIssue
+    shot.filmstrip_image = None  # error: reportAttributeAccessIssue
+    image = shot.image
+    if image is not None:
+        print(image.upper())  # error: reportAttributeAccessIssue
+    print(func.medain)  # error: reportAttributeAccessIssue
+
+
+async def check_scoped_typos(engine: Engine, async_engine: AsyncEngine) -> None:
+    scoped = scoped_session(sessionmaker(engine))
+    scoped.comit()  # error: reportAttributeAccessIssue
+    async_scoped = async_scoped_session(async_sessionmaker(async_engine))
+    await async_scoped.comit()  # error: reportAttributeAccessIssue

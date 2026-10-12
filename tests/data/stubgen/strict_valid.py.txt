@@ -1,0 +1,166 @@
+from collections.abc import Callable, Iterable, Mapping
+from os import PathLike
+from pathlib import Path
+from typing import Any, assert_type
+
+from sgalchemy import AsyncEngine, Engine, AsyncSession, Entity, FieldExpr, InspectionInfo, Registry, Select, Session, inspect, select
+from sgalchemy._core._registry import RegistryBinding
+from sgalchemy.entities import Sequence, Shot, Take
+from sgalchemy.schema import EntitySchema
+
+
+class BytesPath:
+    def __fspath__(self) -> bytes:
+        return b'thumbnail.jpg'
+
+
+def check_fields(shot: Shot, sequence: Sequence) -> None:
+    entity: Entity = shot
+    assert_type(inspect(entity), InspectionInfo)
+    assert_type(Shot.code, FieldExpr)
+    assert_type(Shot.image, FieldExpr)
+    assert_type(Shot.sequence, FieldExpr)
+    assert_type(shot.code, str | None)
+    assert_type(shot.sg_sequence, Sequence | None)
+    assert_type(shot.sequence, Sequence | None)
+    assert_type(shot.sg_sequences, list[Sequence])
+    assert_type(shot.sequences, list[Sequence])
+    assert_type(shot.image, str | PathLike[str] | PathLike[bytes] | None)
+    assert_type(shot.filmstrip_image, str | PathLike[str] | PathLike[bytes] | None)
+    assert_type(Take.new(), Shot)
+    shot.code = 'A'
+    shot.code = None
+    shot.sg_sequence = sequence
+    shot.sequence = None
+    shot.sg_sequences = [sequence]
+    shot.sequences = []
+    shot.image = 'thumbnail.jpg'
+    shot.image = Path('thumbnail.jpg')
+    shot.image = BytesPath()
+    shot.image = None
+    shot.filmstrip_image = 'filmstrip.jpg'
+    shot.filmstrip_image = Path('filmstrip.jpg')
+    shot.filmstrip_image = BytesPath()
+
+
+def check_sync(session: Session, schemas: Mapping[str, EntitySchema]) -> None:
+    registry = Registry()
+    registry.bind(schemas, key='site')
+    assert_type(registry.binding_snapshot(), RegistryBinding | None)
+    assert_type(registry.entity_class('Shot'), type[Entity])
+    assert_type(Shot.new(code='A'), Shot)
+    assert_type(Shot.find(Shot.code == 'A', code='A'), list[Shot])
+    assert_type(session.get(Shot, 1), Shot | None)
+    assert_type(select(Shot), Select[Shot])
+    assert_type(session.scalars(select(Shot)), list[Shot])
+
+
+async def check_async(session: AsyncSession) -> None:
+    assert_type(await session.get(Shot, 1), Shot | None)
+    assert_type(await session.scalars(select(Shot)), list[Shot])
+
+
+def check_registry_api(schemas: Mapping[str, EntitySchema], shot: Shot) -> None:
+    registry = Registry()
+    assert_type(registry.alias_reports, list[str])
+    assert_type(registry.bound_key, str | None)
+    assert_type(registry.is_bound, bool)
+    assert_type(registry.known_names(), set[str])
+    assert_type(registry.schema_snapshot(), Mapping[str, EntitySchema] | None)
+    binding = RegistryBinding('site', schemas, {'Take': 'Shot'}, {'Shot': {'sequence': 'sg_sequence'}}, ())
+    assert_type(binding.key, str)
+    assert_type(binding.schemas, Mapping[str, EntitySchema])
+    assert_type(binding.entity_aliases, Mapping[str, str])
+    assert_type(binding.field_aliases, Mapping[str, Mapping[str, str]])
+    assert_type(binding.alias_reports, tuple[str, ...])
+    assert_type(registry.entity_class_for('Take', binding=binding), type[Entity])
+    assert_type(registry.entity_class_for('Shot', binding=None), type[Entity])
+    assert_type(shot.as_dict(), dict[str, Any])
+    info = InspectionInfo('Shot', None, {}, {}, False, False)
+    assert_type(info.entity_type, str)
+    assert_type(info.id, int | None)
+    assert_type(info.loaded, dict[str, Any])
+    assert_type(info.dirty, dict[str, Any])
+    assert_type(info.expired, bool)
+    assert_type(info.deleted, bool)
+    assert_type(info.refresh_required, frozenset[str])
+    assert_type(info.unverified_writes, frozenset[str])
+    InspectionInfo('Shot', 1, {}, {}, False, False, frozenset({'image'}), frozenset({'code'}))
+
+
+def check_registry_state(shot: Shot) -> None:
+    from sgalchemy._core import _registry
+
+    def guard(state: _registry.EntityState) -> None:
+        assert_type(state.id, int | None)
+
+    state = _registry.EntityState('Shot', None)
+    _registry.EntityState(
+        entity_type='Shot', id=1, loaded={}, dirty={}, clean={}, lazy={},
+        session=object(), access_guard=guard, expired=False, deleted=False,
+        indeterminate=False, dirty_types={}, refresh_required=set(),
+        unverified_writes=set(), clean_refresh_required=set(), clean_unverified_writes=set(),
+    )
+    assert_type(state.entity_type, str)
+    assert_type(state.id, int | None)
+    assert_type(state.loaded, dict[str, Any])
+    assert_type(state.dirty, dict[str, Any])
+    assert_type(state.clean, dict[str, Any])
+    assert_type(state.lazy['code'].resolve('code'), None)
+    assert_type(state.session, object | None)
+    assert_type(state.access_guard, Callable[[_registry.EntityState], None] | None)
+    assert_type(state.expired, bool)
+    assert_type(state.deleted, bool)
+    assert_type(state.indeterminate, bool)
+    assert_type(state.dirty_types, dict[str, str])
+    assert_type(state.refresh_required, set[str])
+    assert_type(state.unverified_writes, set[str])
+    assert_type(state.clean_refresh_required, set[str])
+    assert_type(state.clean_unverified_writes, set[str])
+    state.discard_field_provenance('code')
+    state.restore_field_from_snapshot('image')
+    _registry.initialize_entity(shot, state)
+    _registry.assert_entity_access(shot)
+    assert_type(_registry.entity_state(shot), _registry.EntityState)
+    assert_type(_registry.entity_type(Shot), str)
+    assert_type(_registry.entity_registry(Shot), Registry | None)
+    assert_type(_registry.container_children(shot), Iterable[object] | None)
+    assert_type(_registry.entity_reserved_attribute_names(), frozenset[str])
+    assert_type(_registry.inspect(shot), InspectionInfo)
+
+
+def check_registry_callbacks() -> None:
+    from sgalchemy._core import _registry
+    from sgalchemy._core._expressions import Filter, FilterGroup, RawFilters
+
+    def finder(
+        cls: type[Entity], conditions: tuple[Filter | FilterGroup | RawFilters, ...],
+        fields: dict[str, object],
+    ) -> list[Entity]:
+        return cls.find(*conditions, **fields)
+
+    def cache(cls: type[Entity]) -> None:
+        assert_type(cls.new(), Entity)
+
+    def publish() -> None:
+        pass
+
+    _registry.install_entity_finder(finder)
+    assert_type(_registry.resolve_default_entity_class('Shot', cache), type[Entity])
+    registry = _registry.default_registry()
+    assert_type(registry, Registry)
+    _registry.set_default_registry(registry)
+    assert_type(_registry.can_replace_default_registry(registry), bool)
+    owner = object()
+    assert_type(_registry.reserve_default_registry_transition(owner), Registry)
+    _registry.release_default_registry_transition(owner)
+    _registry.commit_default_registry_transition(registry, default_bound=True, publish=publish)
+
+
+def check_session_constructors(engine: Engine, async_engine: AsyncEngine) -> None:
+    assert_type(Session(engine), Session)
+    assert_type(Session(engine, max_implicit_queries=1), Session)
+    assert_type(AsyncSession(async_engine), AsyncSession)
+    assert_type(Entity(), Entity)
+    assert_type(Shot.new(), Shot)
+    assert_type(Shot.find(), list[Shot])

@@ -1,0 +1,15 @@
+from os import PathLike
+from typing import Any, assert_type
+
+from sgalchemy import FieldExpr
+from sgalchemy.entities import Shot
+
+
+def check_permissive(shot: Shot) -> None:
+    assert_type(shot.unknown_field, Any)
+    assert_type(Shot.unknown_field, FieldExpr)
+    shot.unknown_field = object()
+    assert_type(shot.code, str | None)
+    assert_type(Shot.code, FieldExpr)
+    assert_type(shot.image, str | PathLike[str] | PathLike[bytes] | None)
+    shot.code = 'known'

@@ -3,13 +3,26 @@ from dataclasses import fields
 from typing import Any, get_origin, get_type_hints
 
 import pytest
-from _fakes import _FakeShotgun
-from _support import fetch_schema
 
 from sgalchemy._core import _expressions as ex
 from sgalchemy._core._expressions import _SUMMARY_WIRE, func
 from sgalchemy._errors import CompilationError
 from sgalchemy.schema import _model
+from tests._fakes import FakeShotgun
+from tests._support import fetch_schema
+
+_FILTER_TRUTH = (
+    'filter conditions have no truth value; combine them with and_(), or_(), or several where() '
+    "arguments instead of Python's and/or/not, and use field.in_(values) instead of Python's in"
+)
+
+
+def _bound_and_symbolic(fake_sg: FakeShotgun) -> tuple[ex.FieldExpr, ex.FieldExpr]:
+    schemas = _model.build_schema(fetch_schema(fake_sg))
+    seq = ex.FieldExpr(
+        'Shot', ('sg_sequence',), schemas['Shot'].fields['sg_sequence'], schemas=schemas
+    )
+    return seq.code, ex.FieldExpr('Shot', ('sg_sequence',), None).Sequence.code
 
 
 def _shot_field(code: str) -> ex.FieldExpr:
@@ -68,6 +81,21 @@ def test_all_documented_grouping_modes() -> None:
 )
 def test_all_summary_spellings(name: str, wire_type: str) -> None:
     assert getattr(ex.func, name)(_shot_field('id')) == ex.Summary('id', wire_type, 'Shot')
+
+
+def test_and_or_reject_non_conditions() -> None:
+    prefix = 'takes filter conditions (Filter, FilterGroup, or RawFilters), not'
+    with pytest.raises(TypeError) as excinfo:
+        ex.and_(None)  # pyright: ignore[reportArgumentType]
+    assert str(excinfo.value) == f'and_() {prefix} NoneType'
+
+    invalid = True
+    with pytest.raises(TypeError) as excinfo:
+        ex.or_(invalid)  # pyright: ignore[reportArgumentType]
+    assert str(excinfo.value) == (
+        f"or_() {prefix} bool; Python's in, and, and or were already evaluated, "
+        'so use field.in_(), and_(), or or_() instead'
+    )
 
 
 def test_boolean_nesting_preserves_full_structure() -> None:
@@ -140,7 +168,7 @@ def test_complete_method_operator_inventory(
     assert result == ex.Filter('code', operator, value, extra_values)
 
 
-def test_dot_field_traversal_renders_path(fake_sg: _FakeShotgun) -> None:
+def test_dot_field_traversal_renders_path(fake_sg: FakeShotgun) -> None:
     schemas = _model.build_schema(fetch_schema(fake_sg))
     seq = ex.FieldExpr('Shot', ('sg_sequence',), schemas['Shot'].fields['sg_sequence'])
     deep = seq.code == 'SEQ01'
@@ -166,11 +194,38 @@ def test_expression_outputs_carry_root_entity_stamps() -> None:
     assert ex.func.count(field).entity_type == 'Shot'
 
 
-def test_field_expr_equality_still_builds_filter() -> None:
-    condition = _shot_field('code') == 'AB'
+def test_field_hash_matches_structural_equality(fake_sg: FakeShotgun) -> None:
+    bound, symbolic = _bound_and_symbolic(fake_sg)
+    assert hash(bound) == hash(symbolic)
+    assert symbolic in {bound, _shot_field('code')}
+    assert {bound: 'kept'}[symbolic] == 'kept'
+    assert ex.FieldExpr('Asset', ('code',), None) not in {
+        _shot_field('code'),
+        _shot_field('sg_status_list'),
+    }
 
-    assert isinstance(condition, ex.Filter)
-    assert (condition.path, condition.op, condition.value) == ('code', 'is', 'AB')
+
+def test_field_to_field_comparison_has_structural_identity(fake_sg: FakeShotgun) -> None:
+    bound, symbolic = _bound_and_symbolic(fake_sg)
+    assert bool(bound == symbolic)
+    assert not bool(bound != symbolic)
+    assert not bool(_shot_field('code') == ex.FieldExpr('Asset', ('code',), None))
+    assert _shot_field('code') in [_shot_field('sg_status_list'), _shot_field('code')]
+
+
+@pytest.mark.parametrize(
+    'condition',
+    [
+        _shot_field('code') == 'A',
+        ex.and_(_shot_field('code') == 'A'),
+        ex.raw([['code', 'is', 'A']]),
+    ],
+    ids=['filter', 'group', 'raw'],
+)
+def test_filter_conditions_have_no_truth_value(condition: object) -> None:
+    with pytest.raises(TypeError) as excinfo:
+        bool(condition)
+    assert str(excinfo.value) == _FILTER_TRUTH
 
 
 def test_filter_field_order_keeps_extra_values_before_entity_type() -> None:
@@ -189,7 +244,42 @@ def test_func_type_declarations_match_runtime_summary_names() -> None:
     assert all(get_origin(annotation) is Callable for annotation in hints.values())
 
 
-def test_missing_target_field_teaches_refresh_then_valid_code(fake_sg: _FakeShotgun) -> None:
+@pytest.mark.parametrize('method', ['in_', 'not_in'])
+def test_in_accepts_one_collection_or_separate_values(method: str) -> None:
+    build = getattr(_shot_field('sg_status_list'), method)
+    assert build(['ip', 'rev']).value == ['ip', 'rev']
+    assert build(('ip', 'rev')).value == ['ip', 'rev']
+    assert sorted(build({'ip', 'rev'}).value) == ['ip', 'rev']
+    assert sorted(build(frozenset({'ip', 'rev'})).value) == ['ip', 'rev']
+    assert build('ip', 'rev').value == ['ip', 'rev']
+    assert build('ip').value == ['ip']
+    assert build().value == []
+
+
+@pytest.mark.parametrize('method', ['in_', 'not_in'])
+def test_in_expands_other_single_iterables_but_not_text_or_mappings(method: str) -> None:
+    assert getattr(_shot_field('id'), method)(range(1, 4)).value == [1, 2, 3]
+    assert getattr(_shot_field('code'), method)(c for c in 'ab').value == ['a', 'b']
+    assert getattr(_shot_field('code'), method)({'a': 1, 'b': 2}.keys()).value == ['a', 'b']
+    assert getattr(_shot_field('code'), method)(b'ab').value == [b'ab']
+    assert getattr(_shot_field('code'), method)(bytearray(b'ab')).value == [bytearray(b'ab')]
+    link = {'type': 'Sequence', 'id': 1}
+    assert getattr(_shot_field('sg_sequence'), method)(link).value == [link]
+
+
+@pytest.mark.parametrize('method', ['in_', 'not_in'])
+def test_in_rejects_a_collection_mixed_with_other_arguments(method: str) -> None:
+    build = getattr(_shot_field('sg_status_list'), method)
+    for values in (['ip'], 'rev'), ('ip', ('rev',)):
+        with pytest.raises(TypeError) as excinfo:
+            build(*values)
+        assert str(excinfo.value) == (
+            f'{method}() takes either one iterable of values or the values as separate arguments, '
+            'not both'
+        )
+
+
+def test_missing_target_field_teaches_refresh_then_valid_code(fake_sg: FakeShotgun) -> None:
     schemas = _model.build_schema(fetch_schema(fake_sg))
     sequence = ex.FieldExpr(
         'Shot', ('sg_sequence',), schemas['Shot'].fields['sg_sequence'], schemas=schemas
@@ -202,14 +292,14 @@ def test_missing_target_field_teaches_refresh_then_valid_code(fake_sg: _FakeShot
         _ = sequence.not_a_field
 
 
-def test_multi_entity_traversal_rejected(fake_sg: _FakeShotgun) -> None:
+def test_multi_entity_traversal_rejected(fake_sg: FakeShotgun) -> None:
     schemas = _model.build_schema(fetch_schema(fake_sg))
     assets = ex.FieldExpr('Shot', ('assets',), schemas['Shot'].fields['assets'])
     with pytest.raises(CompilationError, match='multi-entity'):
         _ = assets.code  # the wire drills through single-entity links only
 
 
-def test_multi_hop_traversal_chains_with_schemas_mapping(fake_sg: _FakeShotgun) -> None:
+def test_multi_hop_traversal_chains_with_schemas_mapping(fake_sg: FakeShotgun) -> None:
     schemas = _model.build_schema(fetch_schema(fake_sg))
     seq = ex.FieldExpr(
         'Shot', ('sg_sequence',), schemas['Shot'].fields['sg_sequence'], schemas=schemas
@@ -235,7 +325,7 @@ def test_ordering_grouping_and_func() -> None:
 
 
 def test_polymorphic_traversal_teaches_concrete_filter_or_loader(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
 ) -> None:
     schemas = _model.build_schema(fetch_schema(fake_sg))
     entity = ex.FieldExpr('Version', ('entity',), schemas['Version'].fields['entity'])
@@ -247,6 +337,20 @@ def test_polymorphic_traversal_teaches_concrete_filter_or_loader(
         _ = entity.code
 
 
+def test_python_and_or_not_and_in_raise_instead_of_dropping_conditions() -> None:
+    code = _shot_field('code')
+    first = code == 'A'
+    second = code == 'B'
+    with pytest.raises(TypeError, match='no truth value'):
+        _ = first and second
+    with pytest.raises(TypeError, match='no truth value'):
+        _ = first or second
+    with pytest.raises(TypeError, match='no truth value'):
+        _ = not first
+    with pytest.raises(TypeError, match='no truth value'):
+        _ = code in ['A', 'B']
+
+
 def test_raw_filters_preserve_list_identity() -> None:
     filters: list[Any] = [['code', 'is', 'SHOT_001']]
 
@@ -255,7 +359,26 @@ def test_raw_filters_preserve_list_identity() -> None:
     assert result.filters is filters
 
 
-def test_scalar_traversal_teaches_direct_filtering(fake_sg: _FakeShotgun) -> None:
+@pytest.mark.parametrize('method', ['in_last', 'in_next', 'not_in_last', 'not_in_next'])
+def test_relative_date_units_are_checked_and_sent_uppercase(method: str) -> None:
+    build = getattr(_shot_field('sg_due_date'), method)
+    for unit in ('HOUR', 'day', 'Week', 'month', 'YEAR'):
+        condition = build(2, unit)
+        assert (condition.op, condition.value, condition.extra_values) == (
+            method,
+            2,
+            (unit.upper(),),
+        )
+    for bad in ('DAYS', 3):
+        with pytest.raises(CompilationError) as excinfo:
+            build(2, bad)
+        assert str(excinfo.value) == (
+            f'unknown time unit {bad!r}; server-supported units: HOUR, DAY, WEEK, MONTH, YEAR '
+            '(any letter case)'
+        )
+
+
+def test_scalar_traversal_teaches_direct_filtering(fake_sg: FakeShotgun) -> None:
     schemas = _model.build_schema(fetch_schema(fake_sg))
     code = ex.FieldExpr('Shot', ('code',), schemas['Shot'].fields['code'])
 
@@ -263,7 +386,7 @@ def test_scalar_traversal_teaches_direct_filtering(fake_sg: _FakeShotgun) -> Non
         _ = code.anything
 
 
-def test_unknown_target_teaches_schema_refresh(fake_sg: _FakeShotgun) -> None:
+def test_unknown_target_teaches_schema_refresh(fake_sg: FakeShotgun) -> None:
     schemas = _model.build_schema(fetch_schema(fake_sg))
     del schemas['CustomEntity03']
     vendor = ex.FieldExpr(

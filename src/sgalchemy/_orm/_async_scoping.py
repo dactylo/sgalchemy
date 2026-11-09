@@ -5,9 +5,10 @@ import logging
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 
 from sgalchemy._core._async_engine import AsyncEngine
+from sgalchemy._core._engine import Engine
 from sgalchemy._core._engine_common import add_note_once
 from sgalchemy._core._expressions import FieldExpr
 from sgalchemy._core._registry import Entity
@@ -18,6 +19,14 @@ from sgalchemy._orm._async_session import AsyncSession, automatic_cleanup, commi
 from sgalchemy._orm._scope_common import SuppressOrdinaryFailure as _SuppressFailure
 from sgalchemy._orm._scope_common import record_close_failure
 
+_CLOSE_UNFINISHED_NOTE = (
+    "sgalchemy: the factory's AsyncSession.close() did not finish; "
+    'call close() on the session again'
+)
+_CLOSE_UNFINISHED_RESTAGE_NOTE = (
+    _CLOSE_UNFINISHED_NOTE
+    + ', and explicitly restage any desired unsent work on a new AsyncSession'
+)
 _COMMIT_FAILURE_CLOSE_NOTE = (
     'sgalchemy: the factory closed the AsyncSession and discarded its local retry queue; '
     'callers must explicitly restage any desired unsent work on a usable AsyncSession'
@@ -45,7 +54,7 @@ class _AsyncCommitOnSuccess:
         exc_type: type[BaseException] | None,
         exc_value: BaseException | None,
         traceback: TracebackType | None,
-    ) -> bool:
+    ) -> Literal[False]:
         """Commit a clean body, preserve the primary fault, and always close."""
         del exc_type, traceback
         session = self._session
@@ -53,13 +62,13 @@ class _AsyncCommitOnSuccess:
             raise RuntimeError('commit_on_success() entered without an AsyncSession')
         try:
             if exc_value is not None:
-                await _close_preserving(session, exc_value)
+                await _close_preserving(session, exc_value, restage=False)
                 return False
             try:
                 await commit_async_session(session, wrap_ordinary_failure=True)
             except BaseException as primary:
-                await _close_preserving(session, primary)
-                add_note_once(primary, _COMMIT_FAILURE_CLOSE_NOTE)
+                if await _close_preserving(session, primary, restage=True):
+                    add_note_once(primary, _COMMIT_FAILURE_CLOSE_NOTE)
                 raise
             else:
                 await session.close()
@@ -72,8 +81,8 @@ class _AsyncCommitOnSuccess:
 class _ScopedEntry:
     """Store one exact task Session and its stable completion callback."""
 
-    _session: AsyncSession
-    _callback: Callable[[asyncio.Task[object]], None]
+    session: AsyncSession
+    callback: Callable[[asyncio.Task[object]], None]
 
 
 class AsyncScopedSession:
@@ -98,7 +107,7 @@ class AsyncScopedSession:
         )
         existing = sessions.get(task)
         if existing is not None:
-            return existing._session  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            return existing.session
         factory = cast(
             'Callable[[], AsyncSession]',
             object.__getattribute__(self, '_factory'),
@@ -114,12 +123,12 @@ class AsyncScopedSession:
                 return
             registry.pop(completed_task)
             automatic_cleanup(
-                entry._session,  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                entry.session,
                 task_name=completed_task.get_name(),
                 cancelled=completed_task.cancelled(),
             )
 
-        entry = _ScopedEntry(_session=session, _callback=cleanup)
+        entry = _ScopedEntry(session=session, callback=cleanup)
         sessions[task] = entry
         task.add_done_callback(cleanup)
         return session
@@ -146,10 +155,14 @@ class AsyncScopedSession:
         return task
 
     def add(self, obj: Entity) -> None:
-        """Forward an entity creation stage to the current AsyncSession.
+        """Stage a pending create or attach a detached persistent entity.
 
         Args:
-            obj: Schema-bound pending entity from `Entity.new()`.
+            obj: Schema-bound pending or persistent entity.
+
+        Raises:
+            SgalchemyError: If session access, entity ownership, state, or
+                identity prevents attachment.
         """
         self().add(obj)
 
@@ -160,8 +173,23 @@ class AsyncScopedSession:
     async def commit(self, batch_size: int | None = None) -> None:
         """Forward staged work to the current AsyncSession's commit.
 
+        A commit is atomic only when its complete plan uses one provider batch.
+        An interrupted submitted write can quarantine the session.
+
         Args:
-            batch_size: Maximum provider operations per batch request.
+            batch_size: Optional positive maximum requests per batch. The limit
+                must fit every indivisible operation group.
+
+        Raises:
+            CommitError: If execution reports partial outcome evidence or a
+                successful batch cannot be reconciled safely.
+            RetiredEntityWriteError: If staged writes on a retired entity lack
+                revival intent.
+            SgalchemyError: If session access or local planning is rejected.
+            ValueError: If the batch limit is invalid or too small.
+            asyncio.CancelledError: If the commit is cancelled.
+            Exception: Original provider or schema-preparation failure; a
+                sole-batch provider failure remains unwrapped.
         """
         await self().commit(batch_size)
 
@@ -190,6 +218,14 @@ class AsyncScopedSession:
 
         Returns:
             Projection result or raw summary payload.
+
+        Raises:
+            TypeError: If `stmt` selects entities.
+            CompilationError: If the statement cannot compile.
+            SgalchemyError: If session access or the provider result is
+                invalid.
+            Exception: Original schema-preparation or provider failure,
+                annotated and unwrapped.
         """
         return await self().execute(stmt)
 
@@ -214,6 +250,14 @@ class AsyncScopedSession:
 
         Returns:
             Identity-mapped entity or `None` when absent.
+
+        Raises:
+            SchemaUnavailableError: If the entity type remains absent after one
+                forced schema refresh.
+            SgalchemyError: If session access, identity, or ownership is
+                invalid.
+            Exception: Original schema-preparation or provider failure,
+                annotated and unwrapped.
         """
         return await self().get(cls, entity_id)
 
@@ -226,7 +270,17 @@ class AsyncScopedSession:
 
         Args:
             objects: One entity or an iterable of entities to load.
-            field: Relationship field rooted at every object's entity type.
+            field: Direct relationship field rooted at every object's type.
+
+        Raises:
+            CompilationError: If the field is not a readable direct
+                relationship.
+            RelationshipTargetUnavailableError: If observed target types remain
+                absent after one forced schema refresh.
+            SgalchemyError: If session access, parent ownership or identity,
+                relationship values, or a required parent response is invalid.
+            Exception: Original schema-preparation or provider failure,
+                annotated and unwrapped.
         """
         await self().load(objects, field)
 
@@ -246,6 +300,14 @@ class AsyncScopedSession:
 
         Args:
             obj: Session-owned persistent entity.
+
+        Raises:
+            SchemaUnavailableError: If the entity type remains absent after one
+                forced schema refresh.
+            SgalchemyError: If session access, ownership, or the provider
+                result is invalid.
+            Exception: Original schema-preparation or provider failure,
+                annotated and unwrapped.
         """
         await self().refresh(obj)
 
@@ -263,8 +325,8 @@ class AsyncScopedSession:
         entry = sessions.pop(task, None)
         if entry is None:
             return
-        task.remove_done_callback(entry._callback)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
-        await entry._session.close()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        task.remove_done_callback(entry.callback)
+        await entry.session.close()
 
     def revive(self, obj: Entity) -> None:
         """Forward an entity revival stage to the current AsyncSession.
@@ -286,6 +348,15 @@ class AsyncScopedSession:
 
         Returns:
             Identity-mapped entities in provider order.
+
+        Raises:
+            TypeError: If `stmt` is a projection or summary.
+            CompilationError: If the statement or loader options cannot
+                compile.
+            SgalchemyError: If session access, ownership, returned identity
+                data, or relationship loading is invalid.
+            Exception: Original schema-preparation or provider failure,
+                annotated and unwrapped.
         """
         return await self().scalars(stmt)
 
@@ -330,13 +401,21 @@ def _record_close_failure(primary: BaseException, secondary: BaseException) -> N
     record_close_failure(primary, secondary, 'AsyncSession', _LOGGER)
 
 
-async def _close_preserving(session: AsyncSession, primary: BaseException) -> None:
-    """Keep the primary on close `Exception`; propagate cleanup or diagnostic `BaseException`."""
+async def _close_preserving(
+    session: AsyncSession, primary: BaseException, *, restage: bool
+) -> bool:
+    """Keep the primary on ordinary close failure and report whether close finished."""
     suppression = _SuppressFailure()
     with suppression:
         await session.close()
     if suppression.error is not None:
         _record_close_failure(primary, suppression.error)
+        add_note_once(
+            primary,
+            _CLOSE_UNFINISHED_RESTAGE_NOTE if restage else _CLOSE_UNFINISHED_NOTE,
+        )
+        return False
+    return True
 
 
 def async_scoped_session(
@@ -355,7 +434,15 @@ def async_scoped_session(
     Returns:
         Callable task-local registry with public `AsyncSession` passthrough,
         awaited `remove()`, and automatic completion cleanup.
+
+    Raises:
+        TypeError: If `factory` is an Engine.
     """
+    if isinstance(factory, Engine):
+        raise TypeError(
+            'async_scoped_session() requires an AsyncSession factory, not an Engine; use '
+            'scoped_session(sessionmaker(engine))'
+        )
     return AsyncScopedSession(factory)
 
 
@@ -372,5 +459,12 @@ def async_sessionmaker(
 
     Returns:
         Zero-argument AsyncSession factory.
+
+    Raises:
+        TypeError: If `engine` is an Engine.
     """
+    if isinstance(engine, Engine):
+        raise TypeError(
+            'async_sessionmaker() requires an AsyncEngine, not an Engine; use sessionmaker(engine)'
+        )
     return AsyncSessionFactory(engine)

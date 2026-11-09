@@ -13,7 +13,7 @@ def entity_registry(cls: type[object]) -> object | None:
         cls: Reflected or explicitly marked entity class.
 
     Returns:
-        Opaque owning registry, or `None` when the class has no registry.
+        Opaque owning registry, or `None` for an unregistered class.
     """
     return _ENTITY_REGISTRIES.get(cls)
 
@@ -39,17 +39,14 @@ def entity_type(cls: type[object]) -> str:
 def register_entity_class(
     cls: type[object],
     type_name: str,
-    registry: object | None,
+    registry: object,
 ) -> None:
     """Register collision-free metadata for an entity class.
 
     Args:
         cls: Entity class to register.
         type_name: Canonical or symbolic API type name.
-        registry: Opaque owning registry, or `None` for a compiler test target.
+        registry: Opaque owning registry.
     """
     _ENTITY_TYPES[cls] = type_name
-    if registry is not None:
-        _ENTITY_REGISTRIES[cls] = registry
-    else:
-        _ENTITY_REGISTRIES.pop(cls, None)
+    _ENTITY_REGISTRIES[cls] = registry

@@ -7,7 +7,7 @@ import threading
 from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
-from typing import Any, Literal, ParamSpec, Protocol, TypeVar
+from typing import Any, ParamSpec, Protocol, TypeVar
 
 from sgalchemy._core._construction import (
     checked_async_client,
@@ -35,11 +35,8 @@ class ThreadedSyncBackend:
     Reset drains the executor, closes owned clients, and permits reuse.
 
     Attributes:
-        mode: The threaded execution strategy.
         site: Canonical site identity required of created clients.
     """
-
-    mode: Literal['native', 'threaded'] = 'threaded'
 
     def __init__(
         self,
@@ -157,7 +154,7 @@ class ThreadedSyncBackend:
         **kwargs: _P.kwargs,
     ) -> _R:
         """Observe executor acceptance before awaiting shielded work."""
-        await self._reset_gate._wait()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        await self._reset_gate.wait()
         future = self._ensure_executor().submit(operation, *args, **kwargs)
         if progress is not None:
             progress.dispatched.set()
@@ -194,7 +191,7 @@ class ThreadedSyncBackend:
             method: Provider method name.
             args: Positional provider arguments.
             kwargs: Keyword provider arguments.
-            progress: Fresh per-call events, or None for an unobserved call.
+            progress: Fresh per-call events, or `None` for an unobserved call.
 
         Returns:
             Provider result without wrapping.
@@ -221,11 +218,17 @@ class ThreadedSyncBackend:
         `reset()` leaves the reset running to completion, and the
         reset-completion event always resolves.
 
-        Ordinary shutdown or client-close failures propagate and leave cleanup
-        retryable. If multiple clients fail to close, the first failure is
-        raised and all failed clients are retained for a later reset.
+        Ordinary shutdown or client-close failures leave cleanup retryable.
+        If multiple clients fail to close, all failed clients are retained for
+        a later reset.
+
+        Raises:
+            asyncio.CancelledError: If the awaiting caller is cancelled;
+                the reset continues.
+            Exception: The original executor shutdown failure or first
+                client-close failure.
         """
-        await self._reset_gate._run(self._perform_reset)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        await self._reset_gate.run(self._perform_reset)
 
     async def supports(self, method: str) -> bool:
         """Check one sync method on a worker-owned client.
@@ -258,11 +261,9 @@ class AsyncBackend(Protocol):
     reach provider arguments.
 
     Attributes:
-        mode: Whether execution uses native awaits or synchronous workers.
         site: Canonical site identity exposed to the owning engine.
     """
 
-    mode: Literal['native', 'threaded']
     site: str
 
     async def call_with_progress(
@@ -278,7 +279,7 @@ class AsyncBackend(Protocol):
             method: Provider method name.
             args: Positional provider arguments.
             kwargs: Keyword provider arguments.
-            progress: Fresh per-call events, or None for an unobserved call.
+            progress: Fresh per-call events, or `None` for an unobserved call.
 
         Returns:
             Provider result without wrapping.
@@ -302,11 +303,8 @@ class NativeAsyncBackend:
     preserving supplied connections and permitting later lazy acquisition.
 
     Attributes:
-        mode: The native execution strategy.
         site: Canonical site identity required of created clients.
     """
-
-    mode: Literal['native', 'threaded'] = 'native'
 
     def __init__(
         self,
@@ -448,21 +446,19 @@ class NativeAsyncBackend:
             method: Provider method name.
             args: Positional provider arguments.
             kwargs: Keyword provider arguments.
-            progress: Fresh per-call events, or None for an unobserved call.
+            progress: Fresh per-call events, or `None` for an unobserved call.
 
         Returns:
             Provider result without wrapping.
 
         Raises:
-            _AsyncAcquisitionCancelled: If cancellation interrupts lazy client
-                acquisition.
-            asyncio.CancelledError: If cancellation interrupts a reset wait or
-                the provider call after acquisition.
+            asyncio.CancelledError: If cancellation interrupts client
+                acquisition, a reset wait, or the provider call.
             TypeError: If the provider method does not return an awaitable.
             Exception: Other client acquisition or provider failures propagate
                 unchanged.
         """
-        await self._reset_gate._wait()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        await self._reset_gate.wait()
         self._active_calls += 1
         self._idle.clear()
         try:
@@ -486,10 +482,15 @@ class NativeAsyncBackend:
 
         The reset body runs in its own task: cancelling a caller awaiting
         `reset()` leaves the reset running to completion, and the
-        reset-completion event always resolves. A close failure propagates to
-        awaiters and leaves a retry possible.
+        reset-completion event always resolves. Failed clients remain available
+        for a later reset.
+
+        Raises:
+            asyncio.CancelledError: If the awaiting caller is cancelled;
+                the reset continues.
+            Exception: The original first client-close failure.
         """
-        await self._reset_gate._run(self._perform_reset, before=self._invalidate_generation)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        await self._reset_gate.run(self._perform_reset, before=self._invalidate_generation)
 
     async def supports(self, method: str) -> bool:
         """Return whether the async client exposes one public method.
@@ -501,14 +502,12 @@ class NativeAsyncBackend:
             Whether the provider exposes a callable attribute named `method`.
 
         Raises:
-            _AsyncAcquisitionCancelled: If cancellation interrupts lazy client
-                acquisition.
-            asyncio.CancelledError: If cancellation occurs while waiting for an
-                active reset.
+            asyncio.CancelledError: If cancellation interrupts lazy client
+                acquisition or a wait for an active reset.
             Exception: Any ordinary failure raised by client acquisition or
                 provider attribute inspection is propagated unchanged.
         """
-        await self._reset_gate._wait()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        await self._reset_gate.wait()
         self._active_calls += 1
         self._idle.clear()
         try:
@@ -538,7 +537,7 @@ class _ResetGate:
             self._resetting = False
             self._done.set()
 
-    async def _run(
+    async def run(
         self,
         operation: Callable[[], Awaitable[None]],
         *,
@@ -556,7 +555,7 @@ class _ResetGate:
                 self._task = task
         await asyncio.shield(task)
 
-    async def _wait(self) -> None:
+    async def wait(self) -> None:
         """Wait until reset completion permits another call."""
         while self._resetting:
             await self._done.wait()

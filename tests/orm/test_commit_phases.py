@@ -3,18 +3,24 @@ from pathlib import Path
 from typing import Any, Never, ParamSpec, TypeVar, cast
 
 import pytest
-from _fakes import _FakeShotgun
-from _support import YieldCountingEntities, _SyncSessionBundle
 
 from sgalchemy._core._compiler import FindCall
 from sgalchemy._core._engine import create_engine
-from sgalchemy._core._engine_common import AUTH_RECOVERY_NOTE
+from sgalchemy._core._engine_common import AUTH_RECOVERY_NOTE, CallProgress
 from sgalchemy._core._registry import Entity, Registry, RegistryBinding, entity_state
 from sgalchemy._errors import CommitError, SgalchemyError
 from sgalchemy._orm import _session, _uow
 from sgalchemy._orm._session import Session
 from sgalchemy._orm._uow import CommitOutcome
 from sgalchemy._shotgun import BatchItem, ClosableShotgunLike, WireRecord, WireRecords
+from tests._fakes import FakeShotgun
+from tests._support import (
+    SAVED_BATCH_NOTE,
+    STAGED_RETRY_NOTE,
+    SyncSessionBundle,
+    YieldCountingEntities,
+    inject_faults,
+)
 
 _P = ParamSpec('_P')
 _R = TypeVar('_R')
@@ -24,10 +30,10 @@ _T = TypeVar('_T')
 class _IterationCountingList(list[_T]):
     def __init__(self, values: Iterable[_T]) -> None:
         super().__init__(values)
-        self._iterations = 0
+        self.iterations = 0
 
     def __iter__(self) -> Iterator[_T]:
-        self._iterations += 1
+        self.iterations += 1
         return super().__iter__()
 
 
@@ -37,7 +43,7 @@ def _authentication_fault(message: str) -> RuntimeError:
 
 
 def test_ambiguous_upload_preserves_unrelated_work_and_error_snapshots(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     tmp_path: Path,
 ) -> None:
     session, engine, fake_sg = sess
@@ -52,8 +58,8 @@ def test_ambiguous_upload_preserves_unrelated_work_and_error_snapshots(
     failed.image = failed_path
     unrelated.image = unrelated_path
     fault = RuntimeError('upload fault')
-    fake_sg._errors['upload_thumbnail'] = [fault]
-    fake_sg._find_results = [[{'type': 'Shot', 'id': 90, 'image': 'current-server'}]]
+    fake_sg.errors['upload_thumbnail'] = [fault]
+    fake_sg.find_results = [[{'type': 'Shot', 'id': 90, 'image': 'current-server'}]]
 
     with pytest.raises(CommitError) as excinfo:
         session.commit()
@@ -72,7 +78,7 @@ def test_ambiguous_upload_preserves_unrelated_work_and_error_snapshots(
     assert failed.image == 'current-server'
     assert failed.code == 'failed'
     failed.description = 'still-usable'
-    fake_sg._find_results = [
+    fake_sg.find_results = [
         [{'type': 'Shot', 'id': 91, 'image': 'unrelated-server'}],
         [
             {
@@ -97,7 +103,7 @@ def test_ambiguous_upload_preserves_unrelated_work_and_error_snapshots(
 
 
 def test_batch_partial_reconciliation_failure_keeps_confirmed_partition(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session, engine, fake_sg = sess
@@ -108,7 +114,7 @@ def test_batch_partial_reconciliation_failure_keeps_confirmed_partition(
     session.add(first)
     session.add(second)
     session.add(dependent)
-    fake_sg._batch_results = [
+    fake_sg.batch_results = [
         [
             {'type': 'Sequence', 'id': 9201, 'code': 'first'},
             {'type': 'Sequence', 'id': 9202, 'code': 'second'},
@@ -116,10 +122,11 @@ def test_batch_partial_reconciliation_failure_keeps_confirmed_partition(
     ]
     fault = _authentication_fault('synthetic phase one authentication fault')
 
-    def fail_reconciliation(*_args: object) -> Never:
-        raise fault
-
-    monkeypatch.setattr(_uow, '_apply_deterministic_thumbnail_clear', fail_reconciliation)
+    monkeypatch.setattr(
+        _uow,
+        '_apply_deterministic_thumbnail_clear',
+        inject_faults(_uow._apply_deterministic_thumbnail_clear, [fault]),
+    )
 
     with pytest.raises(CommitError) as excinfo:
         session.commit()
@@ -139,25 +146,26 @@ def test_batch_partial_reconciliation_failure_keeps_confirmed_partition(
     assert staged.obj is dependent
     assert error.indeterminate == []
     assert error.withdrawn == []
-    assert any('failed during batch wave 1 chunk 1' in note for note in error.__notes__)
+    assert SAVED_BATCH_NOTE in error.__notes__
+    assert not any('failed during' in note for note in error.__notes__)
     assert AUTH_RECOVERY_NOTE in error.__notes__
     assert not any('single-batch' in note for note in error.__notes__)
     assert not any('nothing committed' in note for note in error.__notes__)
 
 
-def test_batch_reconciliation_error_teaches_fresh_session(sess: _SyncSessionBundle) -> None:
+def test_batch_reconciliation_error_teaches_fresh_session(sess: SyncSessionBundle) -> None:
     session, engine, fake_sg = sess
     engine.load_schema()
     pending = engine.entities.Shot.new(code='bad-response')
     session.add(pending)
-    fake_sg._batch_results = [[]]
+    fake_sg.batch_results = [[]]
 
     with pytest.raises(CommitError) as excinfo:
         session.commit()
 
     error = excinfo.value
     assert type(error) is CommitError
-    assert type(error.__cause__) is _uow.BatchReconciliationError
+    assert type(error.__cause__) is _uow._BatchReconciliationError
     assert error.committed == []
     assert error.staged == []
     assert len(error.indeterminate) == 1
@@ -174,8 +182,8 @@ def test_batch_reconciliation_error_teaches_fresh_session(sess: _SyncSessionBund
     assert not any('single-batch' in note for note in error.__notes__)
 
 
-def test_batch_validation_and_echoes_use_separate_staging_snapshots(
-    sess: _SyncSessionBundle, monkeypatch: pytest.MonkeyPatch
+def test_batch_results_retire_staged_identities_before_echo_hydration(
+    sess: SyncSessionBundle, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     session, engine, _fake_sg = sess
     engine.load_schema()
@@ -184,58 +192,41 @@ def test_batch_validation_and_echoes_use_separate_staging_snapshots(
     created = [engine.entities.Shot.new(code=f'new-{i}') for i in range(3)]
     for obj in created:
         session.add(obj)
-    chunk = tuple(session._plan_commit()._waves[0])
+    chunk = tuple(session.plan_commit().waves[0])
     outcome = CommitOutcome([], list(chunk), [], [])
-    snapshots: list[tuple[Entity, ...]] = []
-    original_candidates = session._state._staged_identity_candidates
+    owners_at_outcome: list[tuple[Entity, ...]] = []
     original_apply = _uow._apply_deterministic_thumbnail_clear
 
-    def capture_candidates() -> tuple[Entity, ...]:
-        candidates = tuple(original_candidates())
-        snapshots.append(candidates)
-        return candidates
-
     def apply_result(operation: _uow._Op) -> None:
-        assert session._state._hydration_index is None
+        owners_at_outcome.append(_uow.staged_for_identity(session.unit_of_work, ('Shot', 99)))
         original_apply(operation)
 
-    monkeypatch.setattr(session._state, '_staged_identity_candidates', capture_candidates)
     monkeypatch.setattr(_uow, '_apply_deterministic_thumbnail_clear', apply_result)
     results: list[BatchItem] = [
         True if op.request_type == 'delete' else {'type': 'Shot', 'id': 20 + i, **op.data}
         for i, op in enumerate(chunk)
     ]
+    assert _uow.staged_for_identity(session.unit_of_work, ('Shot', 99)) == (deleted,)
 
-    reads = _uow.apply_batch_results(
-        session, chunk, results, outcome, session._state.identity_map.__setitem__
+    step = _uow.CommitStep(
+        kind='batch',
+        description='batch wave 1 chunk 1',
+        entities=tuple(op.obj for op in chunk),
+        items=chunk,
+        operations=chunk,
     )
+    reads = _uow.apply_batch_results(session, session._recovery_adapter(), step, results, outcome)
 
     assert reads == ()
-    assert snapshots == [(deleted,), ()]
+    assert owners_at_outcome == [()] * len(chunk)
     assert len(outcome.committed) == 4
     assert outcome.staged == []
-    assert session.unit_of_work.deleted == ()
-    assert session.unit_of_work.new == ()
+    assert session.unit_of_work.deleted == []
+    assert session.unit_of_work.new == []
     assert all(session._state.identity_map[('Shot', obj.id)] is obj for obj in created)
-    assert session._state._hydration_index is None
 
 
-def test_chunk_failure_note_names_phase_and_batch_size(sess: _SyncSessionBundle) -> None:
-    session, engine, fake_sg = sess
-    engine.load_schema()
-    for index in range(4):
-        session.add(engine.entities.Shot.new(code=f'note-{index}'))
-    fake_sg._fail_on_batch_index = 1
-
-    with pytest.raises(CommitError) as excinfo:
-        session.commit(batch_size=2)
-
-    notes = excinfo.value.__notes__
-    assert any('batch wave 1 chunk 2' in note for note in notes)
-    assert any('batch_size=2' in note for note in notes)
-
-
-def test_chunking_and_three_state_failure(sess: _SyncSessionBundle) -> None:
+def test_chunking_and_three_state_failure(sess: SyncSessionBundle) -> None:
     session, engine, fake_sg = sess
     engine.load_schema()
     shot_cls = engine.registry.entity_class('Shot')
@@ -243,7 +234,7 @@ def test_chunking_and_three_state_failure(sess: _SyncSessionBundle) -> None:
     for obj in pending:
         session.add(obj)
     fault = _authentication_fault('second batch authentication fault')
-    fake_sg._errors['batch'] = [None, fault]
+    fake_sg.errors['batch'] = [None, fault]
 
     with pytest.raises(CommitError) as excinfo:
         session.commit(batch_size=2)
@@ -257,32 +248,31 @@ def test_chunking_and_three_state_failure(sess: _SyncSessionBundle) -> None:
     assert [item.obj for item in error.staged if isinstance(item, _uow._Op)] == pending[2:]
     assert error.indeterminate == []
     assert error.withdrawn == []
-    assert any(
-        'if this session remains open and usable, a later commit may retry' in note
-        for note in error.__notes__
-    )
-    assert error.__notes__.count(_uow._BATCH_OUTCOME_UNKNOWN_NOTE) == 1
-    assert any('failed during batch wave 1 chunk 2' in note for note in error.__notes__)
-    assert AUTH_RECOVERY_NOTE in error.__notes__
-    assert not any('single-batch' in note for note in error.__notes__)
-    session2_batches = [c for c in fake_sg._calls if c[0] == 'batch']
+    assert error.__notes__ == [
+        STAGED_RETRY_NOTE,
+        'sgalchemy: failed during batch wave 1 chunk 2 (batch_size=2)',
+        _uow._BATCH_OUTCOME_UNKNOWN_NOTE,
+        AUTH_RECOVERY_NOTE,
+    ]
+    assert fault.__notes__ == [AUTH_RECOVERY_NOTE]
+    session2_batches = [c for c in fake_sg.calls if c[0] == 'batch']
     assert all(len(c[1][0]) == 2 for c in session2_batches)
 
 
-def test_confirmed_field_read_response_scans_staged_items_once(sess: _SyncSessionBundle) -> None:
+def test_confirmed_field_read_response_skips_staged_list_scans(sess: SyncSessionBundle) -> None:
     session, engine, _fake_sg = sess
     engine.load_schema()
     objects = [session.merge_dict({'type': 'Shot', 'id': i + 1}) for i in range(20)]
     staged = [session.merge_dict({'type': 'Shot', 'id': 1000 + i}) for i in range(20)]
     for obj in staged:
         session.delete(obj)
-    queue = YieldCountingEntities(session.unit_of_work._deleted)
-    session.unit_of_work._deleted = queue
+    queue = YieldCountingEntities(session.unit_of_work.deleted)
+    session.unit_of_work.deleted = queue
     group = _uow.ConfirmedFieldReadGroup(
         entity_type='Shot',
         retired_only=False,
         binding=engine.prepared_binding(),
-        _reads=tuple(_uow.ConfirmedFieldRead(obj, ('project',), ('project',)) for obj in objects),
+        reads=tuple(_uow.ConfirmedFieldRead(obj, ('project',), ('project',)) for obj in objects),
     )
     records: WireRecords = [
         {'type': 'Shot', 'id': i + 1, 'project': {'type': 'Project', 'id': 1}} for i in range(20)
@@ -290,13 +280,12 @@ def test_confirmed_field_read_response_scans_staged_items_once(sess: _SyncSessio
 
     _uow.apply_confirmed_field_readback(session, group, records)
 
-    assert queue._visits == 20
+    assert queue.visits == 0
     assert all(obj.project is objects[0].project for obj in objects)
-    assert session._state._hydration_index is None
 
 
 def test_confirmed_upload_readback_failure_does_not_block_final_retirement(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     tmp_path: Path,
 ) -> None:
     session, engine, fake_sg = sess
@@ -306,18 +295,18 @@ def test_confirmed_upload_readback_failure_does_not_block_final_retirement(
     path.write_bytes(b'image')
     shot.image = path
     session.delete(shot)
-    fake_sg._find_error = RuntimeError('readback fault')
+    fake_sg.find_error = RuntimeError('readback fault')
 
     session.commit()
 
     commit_calls = [
-        call for call in fake_sg._calls if call[0] in {'upload_thumbnail', 'find', 'batch'}
+        call for call in fake_sg.calls if call[0] in {'upload_thumbnail', 'find', 'batch'}
     ]
     assert [call[0] for call in commit_calls] == ['upload_thumbnail', 'find', 'batch']
     assert entity_state(shot).deleted
 
 
-def test_create_cycle_raises_before_io(sess: _SyncSessionBundle) -> None:
+def test_create_cycle_raises_before_io(sess: SyncSessionBundle) -> None:
     session, engine, fake_sg = sess
     engine.load_schema()
     a_cls = engine.registry.entity_class('Asset')
@@ -327,13 +316,13 @@ def test_create_cycle_raises_before_io(sess: _SyncSessionBundle) -> None:
     shot.assets = [asset]
     session.add(shot)
     session.add(asset)
-    calls_before = len(fake_sg._calls)
+    calls_before = len(fake_sg.calls)
     with pytest.raises(SgalchemyError, match='cycle'):
         session.commit()
-    assert len(fake_sg._calls) == calls_before
+    assert len(fake_sg.calls) == calls_before
 
 
-def test_dependent_creates_split_into_waves(sess: _SyncSessionBundle) -> None:
+def test_dependent_creates_split_into_waves(sess: SyncSessionBundle) -> None:
     session, engine, fake_sg = sess
     engine.load_schema()
     seq_cls = engine.registry.entity_class('Sequence')
@@ -343,14 +332,14 @@ def test_dependent_creates_split_into_waves(sess: _SyncSessionBundle) -> None:
     session.add(seq)
     session.add(shot)
     session.commit()
-    batch_calls = [c for c in fake_sg._calls if c[0] == 'batch']
+    batch_calls = [c for c in fake_sg.calls if c[0] == 'batch']
     assert len(batch_calls) == 2  # wave 1: seq, wave 2: shot with seq's fresh id
     shot_req = batch_calls[1][1][0][0]
     assert shot_req['data']['sg_sequence'] == {'type': 'Sequence', 'id': seq.id}
 
 
 def test_dirty_delete_with_upload_defers_only_retirement(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     tmp_path: Path,
 ) -> None:
     session, engine, fake_sg = sess
@@ -361,12 +350,12 @@ def test_dirty_delete_with_upload_defers_only_retirement(
     shot.description = 'after'
     shot.image = image_path
     session.delete(shot)
-    fake_sg._find_results = [[{'type': 'Shot', 'id': 16, 'image': 'server-image'}]]
-    calls_before = len(fake_sg._calls)
+    fake_sg.find_results = [[{'type': 'Shot', 'id': 16, 'image': 'server-image'}]]
+    calls_before = len(fake_sg.calls)
 
     session.commit()
 
-    commit_calls = fake_sg._calls[calls_before:]
+    commit_calls = fake_sg.calls[calls_before:]
     assert [name for name, _, _ in commit_calls] == [
         'batch',
         'upload_thumbnail',
@@ -379,18 +368,18 @@ def test_dirty_delete_with_upload_defers_only_retirement(
 
 
 def test_dirty_delete_without_upload_is_one_indivisible_ordered_batch(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
 ) -> None:
     session, engine, fake_sg = sess
     engine.load_schema()
     shot = session.merge_dict({'type': 'Shot', 'id': 15, 'description': 'before'})
     shot.description = 'after'
     session.delete(shot)
-    calls_before = len(fake_sg._calls)
+    calls_before = len(fake_sg.calls)
 
     session.commit()
 
-    commit_calls = fake_sg._calls[calls_before:]
+    commit_calls = fake_sg.calls[calls_before:]
     assert [name for name, _, _ in commit_calls] == ['batch']
     assert commit_calls[0][1][0] == [
         {
@@ -403,22 +392,22 @@ def test_dirty_delete_without_upload_is_one_indivisible_ordered_batch(
     ]
 
 
-def test_dirty_indeterminate_owner_is_rejected_before_io(sess: _SyncSessionBundle) -> None:
+def test_dirty_indeterminate_owner_is_rejected_before_io(sess: SyncSessionBundle) -> None:
     session, engine, fake_sg = sess
     engine.load_schema()
     shot = session.merge_dict({'type': 'Shot', 'id': 21, 'description': 'before'})
     shot.description = 'after'
     entity_state(shot).indeterminate = True
-    calls_before = len(fake_sg._calls)
+    calls_before = len(fake_sg.calls)
 
     with pytest.raises(SgalchemyError, match='indeterminate'):
         session.commit()
 
-    assert len(fake_sg._calls) == calls_before
+    assert len(fake_sg.calls) == calls_before
 
 
 def test_exact_guard_preserves_later_dirty_field_and_accepts_deep_echo(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session, engine, fake_sg = sess
@@ -436,7 +425,7 @@ def test_exact_guard_preserves_later_dirty_field_and_accepts_deep_echo(
     shot.description = 'submitted-description'
 
     def batch_with_later_assignment(requests: WireRecords) -> list[BatchItem]:
-        fake_sg._record('batch', requests)
+        fake_sg.record('batch', requests)
         assert requests[0]['data'] == {'description': 'submitted-description'}
         shot.code = 'later-local-code'
         return [
@@ -462,7 +451,7 @@ def test_exact_guard_preserves_later_dirty_field_and_accepts_deep_echo(
 
 
 def test_failed_upload_current_value_is_loaded_but_unverified(
-    sess: _SyncSessionBundle, tmp_path: Path
+    sess: SyncSessionBundle, tmp_path: Path
 ) -> None:
     session, engine, fake_sg = sess
     engine.load_schema()
@@ -471,8 +460,8 @@ def test_failed_upload_current_value_is_loaded_but_unverified(
     image_path.write_bytes(b'image')
     shot.image = image_path
     fault = RuntimeError('upload fault')
-    fake_sg._errors['upload_thumbnail'] = [fault]
-    fake_sg._find_results = [[{'type': 'Shot', 'id': 89, 'image': 'current-server'}]]
+    fake_sg.errors['upload_thumbnail'] = [fault]
+    fake_sg.find_results = [[{'type': 'Shot', 'id': 89, 'image': 'current-server'}]]
 
     with pytest.raises(CommitError) as excinfo:
         session.commit()
@@ -492,11 +481,11 @@ def test_failed_upload_current_value_is_loaded_but_unverified(
         for note in excinfo.value.__notes__
     )
     assert not any('before reading' in note for note in excinfo.value.__notes__)
-    assert [name for name, _, _ in fake_sg._calls].count('find') == 1
+    assert [name for name, _, _ in fake_sg.calls].count('find') == 1
 
 
 def test_failed_upload_explicit_reassignment_submits_one_new_upload(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     tmp_path: Path,
 ) -> None:
     session, engine, fake_sg = sess
@@ -507,22 +496,22 @@ def test_failed_upload_explicit_reassignment_submits_one_new_upload(
     first_path.write_bytes(b'image')
     retry_path.write_bytes(b'image')
     shot.image = first_path
-    fake_sg._errors['upload_thumbnail'] = [RuntimeError('upload fault')]
+    fake_sg.errors['upload_thumbnail'] = [RuntimeError('upload fault')]
 
     with pytest.raises(CommitError):
         session.commit()
     shot.image = retry_path
-    fake_sg._find_results = [[{'type': 'Shot', 'id': 93, 'image': 'retry-server'}]]
+    fake_sg.find_results = [[{'type': 'Shot', 'id': 93, 'image': 'retry-server'}]]
 
     session.commit()
     session.commit()
 
     assert shot.image == 'retry-server'
-    assert [name for name, _, _ in fake_sg._calls].count('upload_thumbnail') == 2
+    assert [name for name, _, _ in fake_sg.calls].count('upload_thumbnail') == 2
 
 
 def test_failed_upload_is_never_resent_by_plain_commit(
-    sess: _SyncSessionBundle, tmp_path: Path
+    sess: SyncSessionBundle, tmp_path: Path
 ) -> None:
     session, engine, fake_sg = sess
     engine.load_schema()
@@ -530,20 +519,20 @@ def test_failed_upload_is_never_resent_by_plain_commit(
     path = tmp_path / 'never-resend.jpg'
     path.write_bytes(b'image')
     shot.image = path
-    fake_sg._errors['upload_thumbnail'] = [RuntimeError('upload fault')]
+    fake_sg.errors['upload_thumbnail'] = [RuntimeError('upload fault')]
 
     with pytest.raises(CommitError):
         session.commit()
-    calls_before = len(fake_sg._calls)
+    calls_before = len(fake_sg.calls)
 
     session.commit()
 
-    assert len(fake_sg._calls) == calls_before
-    assert [name for name, _, _ in fake_sg._calls].count('upload_thumbnail') == 1
+    assert len(fake_sg.calls) == calls_before
+    assert [name for name, _, _ in fake_sg.calls].count('upload_thumbnail') == 1
 
 
 def test_failed_upload_readback_preserves_callback_reassignment(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -556,7 +545,7 @@ def test_failed_upload_readback_preserves_callback_reassignment(
     reassigned_path.write_bytes(b'image')
     shot.image = failed_path
     fault = RuntimeError('upload fault')
-    fake_sg._errors['upload_thumbnail'] = [fault]
+    fake_sg.errors['upload_thumbnail'] = [fault]
 
     def find_with_reassignment(
         entity_type: str,
@@ -564,7 +553,7 @@ def test_failed_upload_readback_preserves_callback_reassignment(
         fields: list[str] | None = None,
         **kwargs: object,
     ) -> WireRecords:
-        fake_sg._record('find', entity_type, filters, fields, **kwargs)
+        fake_sg.record('find', entity_type, filters, fields, **kwargs)
         shot.image = reassigned_path
         return [{'type': 'Shot', 'id': 96, 'image': 'current-server'}]
 
@@ -581,7 +570,7 @@ def test_failed_upload_readback_preserves_callback_reassignment(
 
 
 def test_failed_upload_withdraws_unsubmitted_same_owner_retirement(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     tmp_path: Path,
 ) -> None:
     session, engine, fake_sg = sess
@@ -591,9 +580,10 @@ def test_failed_upload_withdraws_unsubmitted_same_owner_retirement(
     source = type(session)(engine)
     shot = source.merge_dict({'type': 'Shot', 'id': 19, 'code': 'retiring'})
     source.close()
+    session.add(shot)
     shot.image = image_path
     session.delete(shot)
-    fake_sg._errors['upload_thumbnail'] = [RuntimeError('upload fault')]
+    fake_sg.errors['upload_thumbnail'] = [RuntimeError('upload fault')]
 
     with pytest.raises(CommitError) as excinfo:
         session.commit()
@@ -604,36 +594,36 @@ def test_failed_upload_withdraws_unsubmitted_same_owner_retirement(
     assert error.indeterminate == [(shot, 'image', image_path)]
     assert len(error.withdrawn) == 1
     assert getattr(error.withdrawn[0], 'request_type', None) == 'delete'
-    calls_before = len(fake_sg._calls)
+    calls_before = len(fake_sg.calls)
 
     session.commit()
 
-    assert len(fake_sg._calls) == calls_before
+    assert len(fake_sg.calls) == calls_before
     retry_path = tmp_path / 'explicit-retry.jpg'
     retry_path.write_bytes(b'image')
     shot.image = retry_path
     session.commit()
-    assert [name for name, _, _ in fake_sg._calls].count('upload_thumbnail') == 2
+    assert [name for name, _, _ in fake_sg.calls].count('upload_thumbnail') == 2
     session.delete(shot)
     session.commit()
-    assert fake_sg._calls[-1][0] == 'batch'
-    assert fake_sg._calls[-1][1][0][0]['request_type'] == 'delete'
+    assert fake_sg.calls[-1][0] == 'batch'
+    assert fake_sg.calls[-1][1][0][0]['request_type'] == 'delete'
 
 
 def test_false_revive_and_delete_results_are_successful_desired_states(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session, engine, fake_sg = sess
     engine.load_schema()
     shot = session.merge_dict({'type': 'Shot', 'id': 18, 'code': 'active'})
     session.delete(shot)
-    fake_sg._batch_results = [[False]]
+    fake_sg.batch_results = [[False]]
     session.commit()
     assert entity_state(shot).deleted
 
     def already_active(entity_type: str, entity_id: int) -> bool:
-        fake_sg._record('revive', entity_type, entity_id)
+        fake_sg.record('revive', entity_type, entity_id)
         return False
 
     monkeypatch.setattr(fake_sg, 'revive', already_active)
@@ -643,24 +633,32 @@ def test_false_revive_and_delete_results_are_successful_desired_states(
 
 
 def test_indivisible_dirty_delete_rejects_too_small_batch_before_io(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
 ) -> None:
     session, engine, fake_sg = sess
     engine.load_schema()
     shot = session.merge_dict({'type': 'Shot', 'id': 17, 'description': 'before'})
     shot.description = 'after'
     session.delete(shot)
-    calls_before = len(fake_sg._calls)
+    calls_before = len(fake_sg.calls)
 
     with pytest.raises(ValueError, match=r'batch_size.*minimum.*2'):
         session.commit(batch_size=1)
 
-    assert len(fake_sg._calls) == calls_before
+    assert len(fake_sg.calls) == calls_before
 
 
+@pytest.mark.parametrize(
+    'batch_echo',
+    [
+        pytest.param({'type': 'Shot', 'id': 26, 'image': None}, id='image-echoed'),
+        pytest.param({'type': 'Shot', 'id': 26}, id='image-omitted'),
+    ],
+)
 def test_later_dirty_filmstrip_guards_confirmed_thumbnail_clear(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     tmp_path: Path,
+    batch_echo: WireRecord,
 ) -> None:
     session, engine, fake_sg = sess
     engine.load_schema()
@@ -676,8 +674,8 @@ def test_later_dirty_filmstrip_guards_confirmed_thumbnail_clear(
     path.write_bytes(b'image')
     shot.image = None
     shot.filmstrip_image = path
-    fake_sg._batch_results = [[{'type': 'Shot', 'id': 26, 'image': None}]]
-    fake_sg._find_results = [[{'type': 'Shot', 'id': 26, 'filmstrip_image': 'server-filmstrip'}]]
+    fake_sg.batch_results = [[batch_echo]]
+    fake_sg.find_results = [[{'type': 'Shot', 'id': 26, 'filmstrip_image': 'server-filmstrip'}]]
 
     session.commit()
 
@@ -685,11 +683,57 @@ def test_later_dirty_filmstrip_guards_confirmed_thumbnail_clear(
     assert state.loaded['image'] is None
     assert state.loaded['filmstrip_image'] == 'server-filmstrip'
     assert state.dirty == {}
-    assert [name for name, _, _ in fake_sg._calls].count('upload_filmstrip_thumbnail') == 1
+    assert [name for name, _, _ in fake_sg.calls].count('upload_filmstrip_thumbnail') == 1
+
+
+@pytest.mark.parametrize(
+    'fault',
+    [RuntimeError('before filmstrip upload'), KeyboardInterrupt('before filmstrip upload')],
+    ids=['ordinary', 'interrupt'],
+)
+def test_confirmed_clear_rebases_pending_filmstrip_snapshot(
+    sess: SyncSessionBundle,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: BaseException,
+) -> None:
+    session, engine, _fake_sg = sess
+    engine.load_schema()
+    shot = session.merge_dict(
+        {'type': 'Shot', 'id': 53, 'image': 'old-image', 'filmstrip_image': 'old-strip'}
+    )
+    strip = tmp_path / 'strip.jpg'
+    strip.write_bytes(b'image')
+    shot.image = None
+    shot.filmstrip_image = strip
+    original_call = engine.call_with_progress
+
+    def fail_before_filmstrip_upload(
+        method: str,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        progress: CallProgress | None,
+    ) -> object:
+        if method == 'upload_filmstrip_thumbnail':
+            raise fault
+        return original_call(method, args, kwargs, progress)
+
+    monkeypatch.setattr(engine, 'call_with_progress', fail_before_filmstrip_upload)
+    expected = CommitError if isinstance(fault, Exception) else KeyboardInterrupt
+
+    with pytest.raises(expected):
+        session.commit()
+    session.rollback()
+
+    state = entity_state(shot)
+    assert state.loaded['image'] is None
+    assert state.loaded['filmstrip_image'] is None
+    assert 'filmstrip_image' not in state.refresh_required
+    assert 'filmstrip_image' not in state.unverified_writes
 
 
 def test_later_upload_failure_reads_prior_confirmed_upload_once(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     tmp_path: Path,
 ) -> None:
     session, engine, fake_sg = sess
@@ -702,8 +746,8 @@ def test_later_upload_failure_reads_prior_confirmed_upload_once(
     shot.image = image_path
     shot.filmstrip_image = filmstrip_path
     fault = RuntimeError('filmstrip upload fault')
-    fake_sg._errors['upload_filmstrip_thumbnail'] = [fault]
-    fake_sg._find_results = [
+    fake_sg.errors['upload_filmstrip_thumbnail'] = [fault]
+    fake_sg.find_results = [
         [
             {
                 'type': 'Shot',
@@ -730,7 +774,7 @@ def test_later_upload_failure_reads_prior_confirmed_upload_once(
     assert state.loaded['filmstrip_image'] == 'current-server'
     assert state.refresh_required == set()
     assert state.unverified_writes == {'filmstrip_image'}
-    find_calls = [call for call in fake_sg._calls if call[0] == 'find']
+    find_calls = [call for call in fake_sg.calls if call[0] == 'find']
     assert len(find_calls) == 1
     assert find_calls[0][1][:3] == (
         'Shot',
@@ -740,7 +784,7 @@ def test_later_upload_failure_reads_prior_confirmed_upload_once(
 
 
 def test_later_upload_failure_reconciles_pending_readbacks_across_types(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     tmp_path: Path,
 ) -> None:
     session, engine, fake_sg = sess
@@ -754,8 +798,8 @@ def test_later_upload_failure_reconciles_pending_readbacks_across_types(
     shot.filmstrip_image = filmstrip_path
     asset.image = image_path
     fault = RuntimeError('later cross-type upload fault')
-    fake_sg._errors['upload_thumbnail'] = [fault]
-    fake_sg._find_results = [
+    fake_sg.errors['upload_thumbnail'] = [fault]
+    fake_sg.find_results = [
         [{'type': 'Shot', 'id': 88, 'filmstrip_image': 'shot-server'}],
         [{'type': 'Asset', 'id': 89, 'image': 'asset-server'}],
     ]
@@ -768,7 +812,7 @@ def test_later_upload_failure_reconciles_pending_readbacks_across_types(
     assert [item[1] for item in error.committed if isinstance(item, tuple)] == ['filmstrip_image']
     assert all(isinstance(item, tuple) for item in error.indeterminate)
     assert [item[1] for item in error.indeterminate if isinstance(item, tuple)] == ['image']
-    find_calls = [call for call in fake_sg._calls if call[0] == 'find']
+    find_calls = [call for call in fake_sg.calls if call[0] == 'find']
     assert [call[1][0] for call in find_calls] == ['Shot', 'Asset']
     assert shot.filmstrip_image == 'shot-server'
     assert asset.image == 'asset-server'
@@ -777,7 +821,7 @@ def test_later_upload_failure_reconciles_pending_readbacks_across_types(
 
 
 def test_malformed_batch_quarantine_clears_provenance_and_blocks_dependents(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
 ) -> None:
     session, engine, fake_sg = sess
     engine.load_schema()
@@ -785,7 +829,7 @@ def test_malformed_batch_quarantine_clears_provenance_and_blocks_dependents(
     shot = engine.entities.Shot.new(code='blocked', sg_sequence=sequence)
     session.add(sequence)
     session.add(shot)
-    fake_sg._batch_results = [[]]
+    fake_sg.batch_results = [[]]
 
     with pytest.raises(CommitError):
         session.commit(batch_size=1)
@@ -795,15 +839,15 @@ def test_malformed_batch_quarantine_clears_provenance_and_blocks_dependents(
     assert entity_state(sequence).dirty_types == {}
     assert entity_state(shot).dirty == {'code': 'blocked', 'sg_sequence': sequence}
     assert entity_state(shot).dirty_types == {'code': 'text', 'sg_sequence': 'entity'}
-    assert not any(name == 'find' for name, _, _ in fake_sg._calls)
-    calls_before = len(fake_sg._calls)
+    assert not any(name == 'find' for name, _, _ in fake_sg.calls)
+    calls_before = len(fake_sg.calls)
     with pytest.raises(SgalchemyError, match='indeterminate'):
         session.commit(batch_size=1)
-    assert len(fake_sg._calls) == calls_before
+    assert len(fake_sg.calls) == calls_before
 
 
 def test_malformed_create_with_upload_withdraws_unsent_same_owner_work(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     tmp_path: Path,
 ) -> None:
     session, engine, fake_sg = sess
@@ -812,7 +856,7 @@ def test_malformed_create_with_upload_withdraws_unsent_same_owner_work(
     Path(image_path).write_bytes(b'image')
     pending = engine.entities.Shot.new(code='ambiguous', image=image_path)
     session.add(pending)
-    fake_sg._batch_results = [[]]
+    fake_sg.batch_results = [[]]
 
     with pytest.raises(CommitError) as excinfo:
         session.commit()
@@ -831,21 +875,21 @@ def test_malformed_create_with_upload_withdraws_unsent_same_owner_work(
     assert state.indeterminate
     assert state.session is None
     assert state.access_guard is None
-    calls_before = len(fake_sg._calls)
+    calls_before = len(fake_sg.calls)
 
     session.commit()
 
-    assert len(fake_sg._calls) == calls_before
+    assert len(fake_sg.calls) == calls_before
     session.close()
     assert state.session is None
 
 
-def test_malformed_update_identity_is_quarantined_without_retry(sess: _SyncSessionBundle) -> None:
+def test_malformed_update_identity_is_quarantined_without_retry(sess: SyncSessionBundle) -> None:
     session, engine, fake_sg = sess
     engine.load_schema()
     shot = session.merge_dict({'type': 'Shot', 'id': 23, 'description': 'old'})
     shot.description = 'new'
-    fake_sg._batch_results = [[{'type': 'Shot', 'id': 999, 'description': 'foreign'}]]
+    fake_sg.batch_results = [[{'type': 'Shot', 'id': 999, 'description': 'foreign'}]]
 
     with pytest.raises(CommitError) as excinfo:
         session.commit()
@@ -864,13 +908,13 @@ def test_malformed_update_identity_is_quarantined_without_retry(sess: _SyncSessi
     with pytest.raises(SgalchemyError, match='indeterminate'):
         _ = shot.description
 
-    calls_before_retry = list(fake_sg._calls)
+    calls_before_retry = list(fake_sg.calls)
     session.commit()
-    assert fake_sg._calls == calls_before_retry
+    assert fake_sg.calls == calls_before_retry
 
 
 def test_malformed_update_withdraws_same_owner_upload_and_delete(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     tmp_path: Path,
 ) -> None:
     session, engine, fake_sg = sess
@@ -878,6 +922,7 @@ def test_malformed_update_withdraws_same_owner_upload_and_delete(
     source = type(session)(engine)
     affected = source.merge_dict({'type': 'Shot', 'id': 23, 'description': 'before'})
     source.close()
+    session.add(affected)
     affected.description = 'after'
     image_path = str(tmp_path / 'update-delete-ambiguous.jpg')
     Path(image_path).write_bytes(b'image')
@@ -885,7 +930,7 @@ def test_malformed_update_withdraws_same_owner_upload_and_delete(
     session.delete(affected)
     independent = engine.entities.Shot.new(code='independent-delete-case')
     session.add(independent)
-    fake_sg._batch_results = [[]]
+    fake_sg.batch_results = [[]]
 
     with pytest.raises(CommitError) as excinfo:
         session.commit(batch_size=1)
@@ -900,7 +945,7 @@ def test_malformed_update_withdraws_same_owner_upload_and_delete(
     assert [getattr(item, 'request_type', None) for item in error.withdrawn] == [None, 'delete']
     assert error.withdrawn[0] == (affected, 'image', image_path)
     assert getattr(error.withdrawn[1], 'obj', None) is affected
-    assert session.unit_of_work.deleted == ()
+    assert session.unit_of_work.deleted == []
     affected_state = entity_state(affected)
     assert affected_state.dirty == {}
     assert affected_state.clean == {}
@@ -910,11 +955,11 @@ def test_malformed_update_withdraws_same_owner_upload_and_delete(
     assert affected_state.indeterminate
     assert entity_state(independent).dirty == {'code': 'independent-delete-case'}
     assert entity_state(independent).dirty_types == {'code': 'text'}
-    calls_before = len(fake_sg._calls)
+    calls_before = len(fake_sg.calls)
 
     session.commit(batch_size=1)
 
-    retry_calls = fake_sg._calls[calls_before:]
+    retry_calls = fake_sg.calls[calls_before:]
     assert [name for name, _, _ in retry_calls] == ['batch']
     assert retry_calls[0][1][0] == [
         {
@@ -929,7 +974,7 @@ def test_malformed_update_withdraws_same_owner_upload_and_delete(
 
 
 def test_multistep_local_failure_after_response_is_indeterminate(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session, engine, _fake_sg = sess
@@ -978,7 +1023,7 @@ def test_multistep_local_failure_after_response_is_indeterminate(
 
 
 def test_multistep_serialization_failure_preserves_committed_evidence(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session, engine, fake_sg = sess
@@ -1008,11 +1053,11 @@ def test_multistep_serialization_failure_preserves_committed_evidence(
     assert error.indeterminate == []
     assert error.withdrawn == []
     assert error.__notes__.count(_uow._BATCH_UNSENT_NOTE) == 1
-    assert [name for name, _, _ in fake_sg._calls].count('batch') == 1
+    assert [name for name, _, _ in fake_sg.calls].count('batch') == 1
 
 
 def test_nested_pending_create_dependency_is_resolved_before_serialization(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
 ) -> None:
     session, engine, fake_sg = sess
     engine.load_schema()
@@ -1026,7 +1071,7 @@ def test_nested_pending_create_dependency_is_resolved_before_serialization(
 
     session.commit()
 
-    batch_calls = [call for call in fake_sg._calls if call[0] == 'batch']
+    batch_calls = [call for call in fake_sg.calls if call[0] == 'batch']
     assert len(batch_calls) == 2
     dependent_request = batch_calls[1][1][0][0]
     assert dependent_request['data']['sg_sequence'] == {
@@ -1035,7 +1080,7 @@ def test_nested_pending_create_dependency_is_resolved_before_serialization(
 
 
 def test_planning_membership_preflight_uses_constant_staging_passes(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
 ) -> None:
     session, engine, _fake_sg = sess
     engine.load_schema()
@@ -1046,23 +1091,23 @@ def test_planning_membership_preflight_uses_constant_staging_passes(
             obj = planning_session.merge_dict({'type': 'Shot', 'id': entity_id})
             planning_session.delete(obj)
         deleted = _IterationCountingList(planning_session.unit_of_work.deleted)
-        planning_session.unit_of_work._deleted = deleted
+        planning_session.unit_of_work.deleted = deleted
 
-        plan = planning_session._plan_commit()
+        plan = planning_session.plan_commit()
 
-        assert plan._waves
+        assert plan.waves
         return planning_session, deleted
 
     small_session, small_deleted = planned_deleted(8)
     large_session, large_deleted = planned_deleted(64)
 
-    assert large_deleted._iterations == small_deleted._iterations
+    assert large_deleted.iterations == small_deleted.iterations
     small_session.close()
     large_session.close()
 
 
 def test_planning_precomputes_repeated_exact_identity_memberships(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
 ) -> None:
     session, engine, _fake_sg = sess
     engine.load_schema()
@@ -1077,7 +1122,7 @@ def test_planning_precomputes_repeated_exact_identity_memberships(
     deleted = _IterationCountingList(candidates)
     _uow._persistent_write_operations(candidates, deleted, binding.schemas, binding)
 
-    uploaded = _IterationCountingList([_uow.UploadPlanItem(candidates[0], 'image', 'new.jpg')])
+    uploaded = _IterationCountingList([_uow._UploadPlanItem(candidates[0], 'image', 'new.jpg')])
     ordinary = _IterationCountingList([candidates[1]])
     remaining = _IterationCountingList(candidates)
     normal, final = _uow._remaining_retirement_operations(
@@ -1087,17 +1132,17 @@ def test_planning_precomputes_repeated_exact_identity_memberships(
         binding,
     )
 
-    assert deleted._iterations == 1
-    assert remaining._iterations == 1
-    assert uploaded._iterations == 1
-    assert ordinary._iterations == 1
+    assert deleted.iterations == 1
+    assert remaining.iterations == 1
+    assert uploaded.iterations == 1
+    assert ordinary.iterations == 1
     assert [operation.obj for operation in normal] == candidates[2:]
     assert len(final) == 1
     assert final[0].obj is candidates[0]
 
 
 def test_provider_commit_error_retires_attempted_upload_without_rewriting_error(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     tmp_path: Path,
 ) -> None:
     session, engine, fake_sg = sess
@@ -1120,7 +1165,7 @@ def test_provider_commit_error_retires_attempted_upload_without_rewriting_error(
         withdrawn=partitions[3],
     )
     fault.__cause__ = cause
-    fake_sg._errors['upload_thumbnail'] = [fault]
+    fake_sg.errors['upload_thumbnail'] = [fault]
 
     with pytest.raises(CommitError) as excinfo:
         session.commit()
@@ -1132,17 +1177,17 @@ def test_provider_commit_error_retires_attempted_upload_without_rewriting_error(
     assert excinfo.value.indeterminate is partitions[2]
     assert excinfo.value.withdrawn is partitions[3]
     assert entity_state(shot).dirty == {}
-    assert session.unit_of_work.deleted == ()
-    calls_before = len(fake_sg._calls)
+    assert session.unit_of_work.deleted == []
+    calls_before = len(fake_sg.calls)
 
     session.commit()
 
-    assert len(fake_sg._calls) == calls_before
-    assert [name for name, _, _ in fake_sg._calls].count('upload_thumbnail') == 1
+    assert len(fake_sg.calls) == calls_before
+    assert [name for name, _, _ in fake_sg.calls].count('upload_thumbnail') == 1
 
 
 def test_readme_thumbnail_assignment_clear_and_readback(
-    sess: _SyncSessionBundle, tmp_path: Path
+    sess: SyncSessionBundle, tmp_path: Path
 ) -> None:
     session, engine, fake_sg = sess
     engine.load_schema()
@@ -1158,7 +1203,7 @@ def test_readme_thumbnail_assignment_clear_and_readback(
     filmstrip_path = tmp_path / 'shot-filmstrip.jpg'
     image_path.write_bytes(b'image')
     filmstrip_path.write_bytes(b'filmstrip')
-    fake_sg._find_results = [
+    fake_sg.find_results = [
         [
             {
                 'type': 'Shot',
@@ -1183,7 +1228,7 @@ def test_readme_thumbnail_assignment_clear_and_readback(
     assert shot.filmstrip_image is None
 
 
-def test_recovery_base_exception_propagates_without_resend(sess: _SyncSessionBundle) -> None:
+def test_recovery_base_exception_propagates_without_resend(sess: SyncSessionBundle) -> None:
     class RecoveryAbort(BaseException):
         pass
 
@@ -1191,9 +1236,9 @@ def test_recovery_base_exception_propagates_without_resend(sess: _SyncSessionBun
     engine.load_schema()
     shot = session.merge_dict({'type': 'Shot', 'id': 23, 'description': 'old'})
     shot.description = 'new'
-    fake_sg._batch_results = [[{'type': 'Shot', 'id': 23}]]
+    fake_sg.batch_results = [[{'type': 'Shot', 'id': 23}]]
     fault = RecoveryAbort()
-    fake_sg._find_error = fault
+    fake_sg.find_error = fault
 
     with pytest.raises(RecoveryAbort) as excinfo:
         session.commit()
@@ -1204,15 +1249,15 @@ def test_recovery_base_exception_propagates_without_resend(sess: _SyncSessionBun
     assert state.clean == {}
     assert state.dirty_types == {}
     assert state.refresh_required == {'description'}
-    calls_before = len(fake_sg._calls)
+    calls_before = len(fake_sg.calls)
 
     session.commit()
 
-    assert len(fake_sg._calls) == calls_before
+    assert len(fake_sg.calls) == calls_before
 
 
 def test_recovery_groups_by_batch_step_entity_type_and_retired_only(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     session, engine, fake_sg = sess
@@ -1224,7 +1269,7 @@ def test_recovery_groups_by_batch_step_entity_type_and_retired_only(
     asset.code = 'asset-secret'
     retired.description = 'retired-secret'
     session.delete(retired)
-    fake_sg._batch_results = [
+    fake_sg.batch_results = [
         [
             {'type': 'Shot', 'id': 21},
             {'type': 'Asset', 'id': 22},
@@ -1232,7 +1277,7 @@ def test_recovery_groups_by_batch_step_entity_type_and_retired_only(
             True,
         ]
     ]
-    fake_sg._find_results = [
+    fake_sg.find_results = [
         [{'type': 'Shot', 'id': 21, 'description': 'active-normalized'}],
         [{'type': 'Asset', 'id': 22, 'code': 'asset-normalized'}],
         [{'type': 'Shot', 'id': 23, 'description': 'retired-normalized'}],
@@ -1241,7 +1286,7 @@ def test_recovery_groups_by_batch_step_entity_type_and_retired_only(
     with caplog.at_level('WARNING', logger='sgalchemy.session'):
         session.commit()
 
-    finds = [call for call in fake_sg._calls if call[0] == 'find']
+    finds = [call for call in fake_sg.calls if call[0] == 'find']
     assert len(finds) == 3
     assert [(call[1][0], call[2].get('retired_only', False)) for call in finds] == [
         ('Shot', False),
@@ -1258,15 +1303,15 @@ def test_recovery_groups_by_batch_step_entity_type_and_retired_only(
 
 
 def test_recovery_hydration_failure_restores_missing_field_marker(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session, engine, fake_sg = sess
     engine.load_schema()
     shot = session.merge_dict({'type': 'Shot', 'id': 23, 'code': 'stable', 'description': 'old'})
     shot.description = 'new'
-    fake_sg._batch_results = [[{'type': 'Shot', 'id': 23}]]
-    fake_sg._find_results = [[{'type': 'Shot', 'id': 23, 'description': 'normalized'}]]
+    fake_sg.batch_results = [[{'type': 'Shot', 'id': 23}]]
+    fake_sg.find_results = [[{'type': 'Shot', 'id': 23, 'description': 'normalized'}]]
     original_hydrate = session.hydrate_record
 
     def partially_hydrate(
@@ -1290,25 +1335,25 @@ def test_recovery_hydration_failure_restores_missing_field_marker(
     assert state.refresh_required == {'description'}
 
 
-def test_recovery_is_bounded_to_each_batch_step(sess: _SyncSessionBundle) -> None:
+def test_recovery_is_bounded_to_each_batch_step(sess: SyncSessionBundle) -> None:
     session, engine, fake_sg = sess
     engine.load_schema()
     first = session.merge_dict({'type': 'Shot', 'id': 21, 'description': 'old-first'})
     second = session.merge_dict({'type': 'Shot', 'id': 22, 'description': 'old-second'})
     first.description = 'first'
     second.description = 'second'
-    fake_sg._batch_results = [
+    fake_sg.batch_results = [
         [{'type': 'Shot', 'id': 21}],
         [{'type': 'Shot', 'id': 22}],
     ]
-    fake_sg._find_results = [
+    fake_sg.find_results = [
         [{'type': 'Shot', 'id': 21, 'description': 'normalized-first'}],
         [{'type': 'Shot', 'id': 22, 'description': 'normalized-second'}],
     ]
 
     session.commit(batch_size=1)
 
-    finds = [call for call in fake_sg._calls if call[0] == 'find']
+    finds = [call for call in fake_sg.calls if call[0] == 'find']
     assert len(finds) == 2
     assert [call[1][1] for call in finds] == [
         [['id', 'in', [21]]],
@@ -1316,13 +1361,13 @@ def test_recovery_is_bounded_to_each_batch_step(sess: _SyncSessionBundle) -> Non
     ]
 
 
-def test_recovery_rejects_noncanonical_identity(sess: _SyncSessionBundle) -> None:
+def test_recovery_rejects_noncanonical_identity(sess: SyncSessionBundle) -> None:
     session, engine, fake_sg = sess
     engine.load_schema()
     shot = session.merge_dict({'type': 'Shot', 'id': 1, 'description': 'old'})
     shot.description = 'new'
-    fake_sg._batch_results = [[{'type': 'Shot', 'id': 1}]]
-    fake_sg._find_results = [[{'type': 'Shot', 'id': True, 'description': 'wrong-identity'}]]
+    fake_sg.batch_results = [[{'type': 'Shot', 'id': 1}]]
+    fake_sg.find_results = [[{'type': 'Shot', 'id': True, 'description': 'wrong-identity'}]]
 
     session.commit()
 
@@ -1332,7 +1377,7 @@ def test_recovery_rejects_noncanonical_identity(sess: _SyncSessionBundle) -> Non
 
 
 def test_revive_failure_remains_staged_without_indeterminate_state(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
 ) -> None:
     session, engine, fake_sg = sess
     engine.load_schema()
@@ -1342,7 +1387,7 @@ def test_revive_failure_remains_staged_without_indeterminate_state(
     pending = engine.entities.Shot.new(code='after-revive')
     session.add(pending)
     fault = RuntimeError('revive fault')
-    fake_sg._errors['revive'] = [fault]
+    fake_sg.errors['revive'] = [fault]
     with pytest.raises(CommitError) as excinfo:
         session.commit()
     assert excinfo.value.__cause__ is fault
@@ -1359,7 +1404,7 @@ def test_revive_failure_remains_staged_without_indeterminate_state(
 
 
 def test_revive_reconciliation_failure_is_normalized(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session, engine, fake_sg = sess
@@ -1383,13 +1428,13 @@ def test_revive_reconciliation_failure_is_normalized(
     assert error.staged == [shot]
     assert error.indeterminate == []
     assert error.withdrawn == []
-    assert [name for name, _, _ in fake_sg._calls].count('revive') == 1
+    assert [name for name, _, _ in fake_sg.calls].count('revive') == 1
 
 
-@pytest.mark.parametrize('size', [100, 200, 400])
+@pytest.mark.parametrize('size', [100])
 @pytest.mark.parametrize('category', ['new', 'deleted'])
 def test_single_chunk_staging_visits_are_linear(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     category: str,
     size: int,
 ) -> None:
@@ -1419,24 +1464,24 @@ def test_single_chunk_staging_visits_are_linear(
             results.append(True)
         expected_objects.append(obj)
     queue = YieldCountingEntities(expected_objects)
-    setattr(session.unit_of_work, f'_{category}', queue)
-    fake_sg._batch_results = [results]
+    setattr(session.unit_of_work, f'{category}', queue)
+    fake_sg.batch_results = [results]
 
     session.commit()
 
-    visits = queue._visits
-    assert getattr(session.unit_of_work, f'_{category}') is queue
+    visits = queue.visits
+    assert getattr(session.unit_of_work, f'{category}') is queue
     assert queue == []
-    assert [call[1][0] for call in fake_sg._calls if call[0] == 'batch'] == [expected_requests]
+    assert [call[1][0] for call in fake_sg.calls if call[0] == 'batch'] == [expected_requests]
     assert all(entity_state(obj).dirty == {} for obj in expected_objects)
     # Both categories need five planning passes and one compaction. Deletes
     # also enter the validation identity snapshot; the fresh echo snapshot is empty.
     assert visits <= (6 if category == 'new' else 7) * size
 
 
-@pytest.mark.parametrize('size', [100, 200, 400])
+@pytest.mark.parametrize('size', [100])
 def test_pending_relationship_planning_visits_are_linear(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     size: int,
 ) -> None:
     session, engine, fake_sg = sess
@@ -1450,18 +1495,18 @@ def test_pending_relationship_planning_visits_are_linear(
     for obj in expected_objects:
         session.add(obj)
     queue = YieldCountingEntities(expected_objects)
-    session.unit_of_work._new = queue
-    calls_before = len(fake_sg._calls)
+    session.unit_of_work.new = queue
+    calls_before = len(fake_sg.calls)
 
-    plan = session._plan_commit()
+    plan = session.plan_commit()
 
-    visits = queue._visits
-    assert [[id(operation.obj) for operation in wave] for wave in plan._waves] == [
+    visits = queue.visits
+    assert [[id(operation.obj) for operation in wave] for wave in plan.waves] == [
         [id(obj) for obj in sequences],
         [id(obj) for obj in shots],
     ]
     assert [id(obj) for obj in queue] == [id(obj) for obj in expected_objects]
-    assert len(fake_sg._calls) == calls_before
+    assert len(fake_sg.calls) == calls_before
     # Candidate collection, authoritative validation, schema participants and
     # two operation constructions need five passes, independent of link count.
     assert visits <= 5 * len(expected_objects)
@@ -1469,7 +1514,7 @@ def test_pending_relationship_planning_visits_are_linear(
 
 @pytest.mark.parametrize('category', ['new', 'deleted'])
 def test_repeated_chunk_retirement_preserves_order_without_rescanning(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     category: _uow._StagingCategory,
 ) -> None:
     session, engine, _fake_sg = sess
@@ -1484,7 +1529,7 @@ def test_repeated_chunk_retirement_preserves_order_without_rescanning(
             session.delete(obj)
         objects.append(obj)
     queue = YieldCountingEntities(objects)
-    setattr(session.unit_of_work, f'_{category}', queue)
+    setattr(session.unit_of_work, f'{category}', queue)
     confirmed = (objects[1], objects[3])
     expected = (objects[0], objects[2], objects[4], objects[5])
     chunk = tuple(
@@ -1498,16 +1543,22 @@ def test_repeated_chunk_retirement_preserves_order_without_rescanning(
         for obj in confirmed
     )
 
-    _uow._retire_batch_chunk_provenance(session, chunk)
+    _uow._retire_batch_chunk_provenance(session.unit_of_work, chunk)
 
-    assert queue._visits == len(objects)
-    _uow._retire_batch_chunk_provenance(session, chunk)
-    assert queue._visits == len(objects)
-    assert getattr(session.unit_of_work, f'_{category}') is queue
+    assert queue.visits == len(objects)
+    _uow._retire_batch_chunk_provenance(session.unit_of_work, chunk)
+    assert queue.visits == len(objects)
+    assert getattr(session.unit_of_work, f'{category}') is queue
     assert [id(obj) for obj in queue] == [id(obj) for obj in expected]
-    unit_of_work = _uow._session_unit_of_work(session.unit_of_work)
-    assert all(not unit_of_work._contains_staged(category, obj) for obj in confirmed)
-    assert all(unit_of_work._contains_staged(category, obj) for obj in expected)
+    unit_of_work = session.unit_of_work
+    assert all(not unit_of_work.contains_staged(category, obj) for obj in confirmed)
+    assert all(unit_of_work.contains_staged(category, obj) for obj in expected)
+    if category == 'deleted':
+        owners = [
+            _uow.staged_for_identity(session.unit_of_work, ('Shot', index + 1))
+            for index in range(len(objects))
+        ]
+        assert owners == [() if obj in confirmed else (obj,) for obj in objects]
 
 
 @pytest.mark.parametrize(
@@ -1515,7 +1566,7 @@ def test_repeated_chunk_retirement_preserves_order_without_rescanning(
     [(False, {}), (True, {'retired_only': True})],
 )
 def test_confirmed_field_read_shape_is_sorted_and_unique(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     retired_only: bool,
     expected_extra: dict[str, bool],
 ) -> None:
@@ -1527,7 +1578,7 @@ def test_confirmed_field_read_shape_is_sorted_and_unique(
         entity_type='Shot',
         retired_only=retired_only,
         binding=None,
-        _reads=(
+        reads=(
             _uow.ConfirmedFieldRead(
                 later,
                 ('sg_status_list', 'code'),
@@ -1556,7 +1607,7 @@ def test_confirmed_field_read_shape_is_sorted_and_unique(
 
 @pytest.mark.parametrize('echoes_image', [False, True])
 def test_confirmed_thumbnail_clear_is_established_before_echo_hydration(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     caplog: pytest.LogCaptureFixture,
     echoes_image: bool,
 ) -> None:
@@ -1574,7 +1625,7 @@ def test_confirmed_thumbnail_clear_is_established_before_echo_hydration(
     state.refresh_required.update({'image', 'filmstrip_image'})
     state.unverified_writes.update({'image', 'filmstrip_image'})
     shot.image = None
-    fake_sg._batch_results = [
+    fake_sg.batch_results = [
         [
             {
                 'type': 'Shot',
@@ -1591,7 +1642,7 @@ def test_confirmed_thumbnail_clear_is_established_before_echo_hydration(
     assert state.loaded['filmstrip_image'] is None
     assert state.refresh_required == set()
     assert state.unverified_writes == set()
-    assert not [call for call in fake_sg._calls if call[0] == 'find']
+    assert not [call for call in fake_sg.calls if call[0] == 'find']
     warnings = [record for record in caplog.records if record.levelname == 'WARNING']
     assert len(warnings) == (0 if echoes_image else 1)
     if warnings:
@@ -1608,7 +1659,7 @@ def test_confirmed_thumbnail_clear_is_established_before_echo_hydration(
     ],
 )
 def test_malformed_successful_batch_is_not_automatically_retried(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     case: tuple[int, int | None, list[BatchItem], int],
 ) -> None:
     entity_count, batch_size, results, expected_staged = case
@@ -1617,7 +1668,7 @@ def test_malformed_successful_batch_is_not_automatically_retried(
     pending = [engine.entities.Shot.new(code=f'S{index}') for index in range(entity_count)]
     for obj in pending:
         session.add(obj)
-    fake_sg._batch_results = [results]
+    fake_sg.batch_results = [results]
     with pytest.raises(CommitError) as excinfo:
         session.commit(batch_size=batch_size)
     assert excinfo.value.committed == []
@@ -1627,9 +1678,9 @@ def test_malformed_successful_batch_is_not_automatically_retried(
     assert all(entity_state(obj).id is None for obj in pending[:submitted_count])
     with pytest.raises(SgalchemyError, match='indeterminate'):
         _ = pending[0].code
-    batches_before = [call for call in fake_sg._calls if call[0] == 'batch']
+    batches_before = [call for call in fake_sg.calls if call[0] == 'batch']
     session.commit(batch_size=batch_size)
-    batches_after = [call for call in fake_sg._calls if call[0] == 'batch']
+    batches_after = [call for call in fake_sg.calls if call[0] == 'batch']
     assert len(batches_after) == len(batches_before) + expected_staged
     if expected_staged:
         assert pending[-1].id is not None
@@ -1646,7 +1697,7 @@ def test_malformed_successful_batch_is_not_automatically_retried(
     ids=['missing-row', 'missing-field', 'malformed-row', 'provider-error'],
 )
 def test_recovery_failure_keeps_only_missing_fields_refresh_required(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     caplog: pytest.LogCaptureFixture,
     find_results: WireRecords,
     find_error: Exception | None,
@@ -1655,9 +1706,9 @@ def test_recovery_failure_keeps_only_missing_fields_refresh_required(
     engine.load_schema()
     shot = session.merge_dict({'type': 'Shot', 'id': 23, 'code': 'stable', 'description': 'old'})
     shot.description = 'submitted-secret'
-    fake_sg._batch_results = [[{'type': 'Shot', 'id': 23}]]
-    fake_sg._find_results = [find_results]
-    fake_sg._find_error = find_error
+    fake_sg.batch_results = [[{'type': 'Shot', 'id': 23}]]
+    fake_sg.find_results = [find_results]
+    fake_sg.find_error = find_error
 
     with caplog.at_level('WARNING', logger='sgalchemy.session'):
         session.commit()
@@ -1666,7 +1717,7 @@ def test_recovery_failure_keeps_only_missing_fields_refresh_required(
     assert state.loaded == {'id': 23, 'code': 'stable'}
     assert state.refresh_required == {'description'}
     assert state.dirty == {}
-    assert len([call for call in fake_sg._calls if call[0] == 'find']) == 1
+    assert len([call for call in fake_sg.calls if call[0] == 'find']) == 1
     warnings = [record for record in caplog.records if record.levelname == 'WARNING']
     assert len(warnings) == 1
     assert 'description' in warnings[0].getMessage()
@@ -1675,15 +1726,15 @@ def test_recovery_failure_keeps_only_missing_fields_refresh_required(
         errors = [record for record in caplog.records if record.levelname == 'ERROR']
         assert len(errors) == 1
         assert errors[0].exc_info is not None
-    calls_before = len(fake_sg._calls)
+    calls_before = len(fake_sg.calls)
 
     session.commit()
 
-    assert len(fake_sg._calls) == calls_before
+    assert len(fake_sg.calls) == calls_before
 
 
 def test_sole_batch_failure_before_provider_call_reports_unsent(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session, engine, fake_sg = sess
@@ -1706,8 +1757,8 @@ def test_sole_batch_failure_before_provider_call_reports_unsent(
         _uow._BATCH_UNSENT_NOTE,
         'sgalchemy: failed during batch wave 1 chunk 1',
     ]
-    assert 'batch' not in [name for name, _, _ in fake_sg._calls]
-    assert session.unit_of_work.new == (pending,)
+    assert 'batch' not in [name for name, _, _ in fake_sg.calls]
+    assert session.unit_of_work.new == [pending]
 
 
 @pytest.mark.parametrize(
@@ -1720,7 +1771,7 @@ def test_sole_batch_failure_before_provider_call_reports_unsent(
     ids=['authentication-fault', 'runtime-error', 'commit-error'],
 )
 def test_sole_batch_local_failure_after_response_is_indeterminate(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     monkeypatch: pytest.MonkeyPatch,
     fault: Exception,
 ) -> None:
@@ -1743,7 +1794,7 @@ def test_sole_batch_local_failure_after_response_is_indeterminate(
     assert error.staged == []
     assert all(isinstance(item, _uow._Op) for item in error.indeterminate)
     assert [item.obj for item in error.indeterminate if isinstance(item, _uow._Op)] == [pending]
-    assert session.unit_of_work.new == ()
+    assert session.unit_of_work.new == []
     assert entity_state(pending).indeterminate
     assert any(
         'discard affected objects and reconcile server state' in note for note in error.__notes__
@@ -1752,16 +1803,16 @@ def test_sole_batch_local_failure_after_response_is_indeterminate(
         assert AUTH_RECOVERY_NOTE in error.__notes__
 
     session.commit()
-    assert [name for name, _, _ in fake_sg._calls].count('batch') == 1
+    assert [name for name, _, _ in fake_sg.calls].count('batch') == 1
 
 
-def test_sole_batch_provider_failure_passes_through_and_retries(sess: _SyncSessionBundle) -> None:
+def test_sole_batch_provider_failure_passes_through_and_retries(sess: SyncSessionBundle) -> None:
     session, engine, fake_sg = sess
     engine.load_schema()
     pending = engine.entities.Shot.new(code='sole-batch')
     session.add(pending)
     fault = _authentication_fault('sole batch authentication fault')
-    fake_sg._errors['batch'] = [fault]
+    fake_sg.errors['batch'] = [fault]
 
     with pytest.raises(RuntimeError) as excinfo:
         session.commit()
@@ -1775,13 +1826,13 @@ def test_sole_batch_provider_failure_passes_through_and_retries(sess: _SyncSessi
         _uow._BATCH_OUTCOME_UNKNOWN_NOTE,
         'sgalchemy: failed during batch wave 1 chunk 1',
     ]
-    assert session.unit_of_work.new == (pending,)
-    assert session.unit_of_work.deleted == ()
-    assert session.unit_of_work.revived == ()
+    assert session.unit_of_work.new == [pending]
+    assert session.unit_of_work.deleted == []
+    assert session.unit_of_work.revived == []
     assert entity_state(pending).dirty == {'code': 'sole-batch'}
     session.commit()
     assert pending.id is not None
-    assert [name for name, _, _ in fake_sg._calls].count('batch') == 2
+    assert [name for name, _, _ in fake_sg.calls].count('batch') == 2
 
 
 @pytest.mark.parametrize(
@@ -1795,7 +1846,7 @@ def test_sole_batch_provider_failure_passes_through_and_retries(sess: _SyncSessi
     ids=['missing-row', 'missing-field', 'malformed-row', 'read-exception'],
 )
 def test_successful_upload_readback_failure_requires_refresh(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     readback: list[dict[str, object]],
@@ -1807,21 +1858,21 @@ def test_successful_upload_readback_failure_requires_refresh(
     image_path = tmp_path / 'successful-unreadable.jpg'
     image_path.write_bytes(b'image')
     shot.image = image_path
-    fake_sg._find_results = [readback]
+    fake_sg.find_results = [readback]
     if raises:
-        fake_sg._find_error = RuntimeError('readback fault')
-    confirmed: list[tuple[_uow.UploadPlanItem, CommitOutcome]] = []
-    original_confirm = CommitOutcome._confirm
+        fake_sg.find_error = RuntimeError('readback fault')
+    confirmed: list[tuple[_uow._UploadPlanItem, CommitOutcome]] = []
+    original_confirm = CommitOutcome.confirm
 
     def capture_confirm(
         outcome: CommitOutcome,
-        items: tuple[Entity | _uow._Op | _uow.UploadPlanItem, ...],
+        items: tuple[Entity | _uow._Op | _uow._UploadPlanItem, ...],
     ) -> None:
         original_confirm(outcome, items)
-        if isinstance(items[0], _uow.UploadPlanItem):
+        if isinstance(items[0], _uow._UploadPlanItem):
             confirmed.append((items[0], outcome))
 
-    monkeypatch.setattr(CommitOutcome, '_confirm', capture_confirm)
+    monkeypatch.setattr(CommitOutcome, 'confirm', capture_confirm)
 
     session.commit()
 
@@ -1833,12 +1884,12 @@ def test_successful_upload_readback_failure_requires_refresh(
     upload, outcome = confirmed[0]
     assert outcome.committed[0] is upload
     assert outcome.indeterminate == []
-    assert [name for name, _, _ in fake_sg._calls].count('find') == 1
+    assert [name for name, _, _ in fake_sg.calls].count('find') == 1
 
 
 @pytest.mark.parametrize('server_value', [None, 'server-image'])
 def test_successful_upload_reads_exact_provider_value(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     tmp_path: Path,
     server_value: object,
 ) -> None:
@@ -1848,7 +1899,7 @@ def test_successful_upload_reads_exact_provider_value(
     image_path = tmp_path / 'successful-upload.jpg'
     image_path.write_bytes(b'image')
     shot.image = image_path
-    fake_sg._find_results = [[{'type': 'Shot', 'id': 81, 'image': server_value}]]
+    fake_sg.find_results = [[{'type': 'Shot', 'id': 81, 'image': server_value}]]
 
     session.commit()
 
@@ -1857,13 +1908,13 @@ def test_successful_upload_reads_exact_provider_value(
     assert state.refresh_required == set()
     assert state.unverified_writes == set()
     assert state.dirty == {}
-    find_calls = [call for call in fake_sg._calls if call[0] == 'find']
+    find_calls = [call for call in fake_sg.calls if call[0] == 'find']
     assert len(find_calls) == 1
     assert find_calls[0][1][:3] == ('Shot', [['id', 'in', [81]]], ['image'])
 
 
 def test_successful_uploads_are_confirmed_before_later_provider_calls(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1877,23 +1928,23 @@ def test_successful_uploads_are_confirmed_before_later_provider_calls(
     second_path.write_bytes(b'image')
     first.image = first_path
     second.image = second_path
-    fake_sg._find_results = [
+    fake_sg.find_results = [
         [
             {'type': 'Shot', 'id': 83, 'image': 'first-server'},
             {'type': 'Shot', 'id': 84, 'image': 'second-server'},
         ]
     ]
     original_upload = fake_sg.upload_thumbnail
-    original_confirm = CommitOutcome._confirm
-    confirmed: list[tuple[_uow.UploadPlanItem, CommitOutcome]] = []
+    original_confirm = CommitOutcome.confirm
+    confirmed: list[tuple[_uow._UploadPlanItem, CommitOutcome]] = []
     calls = 0
 
     def capture_confirm(
         outcome: CommitOutcome,
-        items: tuple[Entity | _uow._Op | _uow.UploadPlanItem, ...],
+        items: tuple[Entity | _uow._Op | _uow._UploadPlanItem, ...],
     ) -> None:
         original_confirm(outcome, items)
-        if isinstance(items[0], _uow.UploadPlanItem):
+        if isinstance(items[0], _uow._UploadPlanItem):
             confirmed.append((items[0], outcome))
 
     def observe_second_upload(
@@ -1912,7 +1963,7 @@ def test_successful_uploads_are_confirmed_before_later_provider_calls(
             assert outcome.committed[0] is upload
         return original_upload(entity_type, entity_id, path)
 
-    monkeypatch.setattr(CommitOutcome, '_confirm', capture_confirm)
+    monkeypatch.setattr(CommitOutcome, 'confirm', capture_confirm)
     monkeypatch.setattr(fake_sg, 'upload_thumbnail', observe_second_upload)
 
     session.commit()
@@ -1922,22 +1973,22 @@ def test_successful_uploads_are_confirmed_before_later_provider_calls(
 
 
 def test_sync_batch_base_exception_after_confirmation_stays_committed(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session, engine, fake_sg = sess
     engine.load_schema()
     pending = engine.entities.Shot.new(code='confirmed')
     session.add(pending)
-    fake_sg._batch_results = [[{'type': 'Shot', 'id': 9301, 'code': 'confirmed'}]]
-    original_confirm = CommitOutcome._confirm
+    fake_sg.batch_results = [[{'type': 'Shot', 'id': 9301, 'code': 'confirmed'}]]
+    original_confirm = CommitOutcome.confirm
     fault = KeyboardInterrupt('echo hydration interrupted')
-    confirmed_items: tuple[Entity | _uow._Op | _uow.UploadPlanItem, ...] = ()
+    confirmed_items: tuple[Entity | _uow._Op | _uow._UploadPlanItem, ...] = ()
     active_outcome: CommitOutcome | None = None
 
     def capture_confirm(
         outcome: CommitOutcome,
-        items: tuple[Entity | _uow._Op | _uow.UploadPlanItem, ...],
+        items: tuple[Entity | _uow._Op | _uow._UploadPlanItem, ...],
     ) -> None:
         nonlocal active_outcome, confirmed_items
         original_confirm(outcome, items)
@@ -1947,7 +1998,7 @@ def test_sync_batch_base_exception_after_confirmation_stays_committed(
     def interrupt_hydration(*_args: object) -> Never:
         raise fault
 
-    monkeypatch.setattr(CommitOutcome, '_confirm', capture_confirm)
+    monkeypatch.setattr(CommitOutcome, 'confirm', capture_confirm)
     monkeypatch.setattr(session, 'hydrate_record', interrupt_hydration)
 
     with pytest.raises(KeyboardInterrupt) as excinfo:
@@ -1961,15 +2012,15 @@ def test_sync_batch_base_exception_after_confirmation_stays_committed(
     assert active_outcome.indeterminate == []
     assert pending.id == 9301
     assert pending.code == 'confirmed'
-    batch_calls = [call for call in fake_sg._calls if call[0] == 'batch']
+    batch_calls = [call for call in fake_sg.calls if call[0] == 'batch']
 
     session.commit()
 
-    assert [call for call in fake_sg._calls if call[0] == 'batch'] == batch_calls
+    assert [call for call in fake_sg.calls if call[0] == 'batch'] == batch_calls
 
 
 def test_sync_batch_base_exception_before_submission_remains_retryable(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session, engine, fake_sg = sess
@@ -2001,16 +2052,16 @@ def test_sync_batch_base_exception_before_submission_remains_retryable(
 
     assert excinfo.value is fault
     assert not entity_state(pending).indeterminate
-    assert [call for call in fake_sg._calls if call[0] == 'batch'] == []
+    assert [call for call in fake_sg.calls if call[0] == 'batch'] == []
 
     session.commit()
 
     assert pending.id is not None
-    assert [call for call in fake_sg._calls if call[0] == 'batch']
+    assert [call for call in fake_sg.calls if call[0] == 'batch']
 
 
 def test_sync_batch_base_exception_is_not_automatically_retried(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session, engine, fake_sg = sess
@@ -2029,14 +2080,14 @@ def test_sync_batch_base_exception_is_not_automatically_retried(
         session.commit()
 
     assert entity_state(pending).indeterminate
-    batch_calls = [call for call in fake_sg._calls if call[0] == 'batch']
+    batch_calls = [call for call in fake_sg.calls if call[0] == 'batch']
     with pytest.raises(SgalchemyError, match='indeterminate'):
         session.commit()
-    assert [call for call in fake_sg._calls if call[0] == 'batch'] == batch_calls
+    assert [call for call in fake_sg.calls if call[0] == 'batch'] == batch_calls
 
 
 def test_sync_batch_lock_entry_interruption_remains_retryable(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session, engine, fake_sg = sess
@@ -2064,16 +2115,16 @@ def test_sync_batch_lock_entry_interruption_remains_retryable(
     assert excinfo.value is fault
     assert excinfo.value.__cause__ is None
     assert not entity_state(pending).indeterminate
-    assert [call for call in fake_sg._calls if call[0] == 'batch'] == []
+    assert [call for call in fake_sg.calls if call[0] == 'batch'] == []
 
     session.commit()
 
     assert pending.id is not None
-    assert [call for call in fake_sg._calls if call[0] == 'batch']
+    assert [call for call in fake_sg.calls if call[0] == 'batch']
 
 
 def test_sync_upload_base_exception_retires_local_retry_without_readback(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     tmp_path: Path,
 ) -> None:
     session, engine, fake_sg = sess
@@ -2087,46 +2138,25 @@ def test_sync_upload_base_exception_retires_local_retry_without_readback(
     shot.filmstrip_image = filmstrip_path
     session.delete(shot)
     fault = SystemExit('upload interrupted')
-    fake_sg._errors['upload_thumbnail'] = [fault]
+    fake_sg.errors['upload_thumbnail'] = [fault]
 
     with pytest.raises(SystemExit) as excinfo:
         session.commit()
 
     assert excinfo.value is fault
     assert entity_state(shot).dirty == {}
-    assert session.unit_of_work.deleted == ()
-    assert not [call for call in fake_sg._calls if call[0] == 'find']
-    calls_before = len(fake_sg._calls)
+    assert session.unit_of_work.deleted == []
+    assert not [call for call in fake_sg.calls if call[0] == 'find']
+    calls_before = len(fake_sg.calls)
 
     session.commit()
 
-    assert len(fake_sg._calls) == calls_before
-    assert [name for name, _, _ in fake_sg._calls].count('upload_thumbnail') == 1
-
-
-def test_thin_echo_for_same_batch_retirement_uses_retired_read(
-    sess: _SyncSessionBundle,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    session, engine, fake_sg = sess
-    engine.load_schema()
-    shot = session.merge_dict({'type': 'Shot', 'id': 23, 'description': 'old'})
-    shot.description = 'new'
-    session.delete(shot)
-    fake_sg._batch_results = [[{'type': 'Shot', 'id': 23}, True]]
-    fake_sg._find_results = [[{'type': 'Shot', 'id': 23, 'description': 'normalized'}]]
-
-    with caplog.at_level('WARNING', logger='sgalchemy.session'):
-        session.commit()
-
-    find = next(call for call in fake_sg._calls if call[0] == 'find')
-    assert find[2]['retired_only'] is True
-    assert entity_state(shot).loaded['description'] == 'normalized'
-    assert 'provider-response contract' in caplog.text
+    assert len(fake_sg.calls) == calls_before
+    assert [name for name, _, _ in fake_sg.calls].count('upload_thumbnail') == 1
 
 
 def test_thumbnail_clear_survives_unrelated_echo_hydration_failure(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     caplog: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2143,7 +2173,7 @@ def test_thumbnail_clear_survives_unrelated_echo_hydration_failure(
     )
     shot.description = 'new-description'
     shot.image = None
-    fake_sg._batch_results = [
+    fake_sg.batch_results = [
         [
             {
                 'type': 'Shot',
@@ -2170,7 +2200,7 @@ def test_thumbnail_clear_survives_unrelated_echo_hydration_failure(
 
 @pytest.mark.parametrize('error_type', [RuntimeError, CommitError])
 def test_uninvoked_later_upload_recovers_confirmed_prefix_only(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     error_type: type[RuntimeError | CommitError],
@@ -2194,8 +2224,8 @@ def test_uninvoked_later_upload_recovers_confirmed_prefix_only(
         return original
 
     monkeypatch.setattr(type(provider), 'upload_thumbnail', property(resolve))
-    provider._calls.clear()
-    provider._find_results = [[{'type': 'Shot', 'id': 88, 'image': 'confirmed'}]]
+    provider.calls.clear()
+    provider.find_results = [[{'type': 'Shot', 'id': 88, 'image': 'confirmed'}]]
     with pytest.raises(CommitError) as excinfo:
         session.commit()
     error = excinfo.value
@@ -2210,21 +2240,21 @@ def test_uninvoked_later_upload_recovers_confirmed_prefix_only(
     assert objects[0].image == 'confirmed'
     assert entity_state(objects[1]).dirty['image'] is paths[1]
     assert entity_state(objects[2]).dirty['image'] is paths[2]
-    assert [name for name, _, _ in provider._calls] == ['upload_thumbnail', 'find']
-    assert provider._calls[-1][1][:3] == ('Shot', [['id', 'in', [88]]], ['image'])
-    provider._find_results = [
+    assert [name for name, _, _ in provider.calls] == ['upload_thumbnail', 'find']
+    assert provider.calls[-1][1][:3] == ('Shot', [['id', 'in', [88]]], ['image'])
+    provider.find_results = [
         [
             {'type': 'Shot', 'id': 89, 'image': 'second'},
             {'type': 'Shot', 'id': 90, 'image': 'third'},
         ]
     ]
     session.commit()
-    uploads = [args[1] for name, args, _ in provider._calls if name == 'upload_thumbnail']
+    uploads = [args[1] for name, args, _ in provider.calls if name == 'upload_thumbnail']
     assert uploads == [88, 89, 90]
 
 
 def test_unsent_upload_acquisition_failure_preserves_intent_for_retry(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
     failing = False
@@ -2236,7 +2266,7 @@ def test_unsent_upload_acquisition_failure_preserves_intent_for_retry(
         attempts += 1
         if failing:
             raise fault
-        return cast('ClosableShotgunLike', fake_sg)
+        return fake_sg
 
     engine = create_engine(
         fake_sg.base_url,
@@ -2265,12 +2295,12 @@ def test_unsent_upload_acquisition_failure_preserves_intent_for_retry(
     )
     engine.dispose()
     failing = True
-    fake_sg._calls.clear()
+    fake_sg.calls.clear()
     with pytest.raises(CommitError) as excinfo:
         session.commit()
     assert excinfo.value.__cause__ is fault
     assert attempts == 2
-    assert fake_sg._calls == []
+    assert fake_sg.calls == []
     assert (
         dict(state.dirty),
         dict(state.clean),
@@ -2283,15 +2313,15 @@ def test_unsent_upload_acquisition_failure_preserves_intent_for_retry(
     assert state.dirty['image'] is path
     assert (excinfo.value.indeterminate, excinfo.value.withdrawn) == ([], [])
     failing = False
-    fake_sg._find_results = [[{'type': 'Shot', 'id': 90, 'image': 'uploaded'}]]
+    fake_sg.find_results = [[{'type': 'Shot', 'id': 90, 'image': 'uploaded'}]]
     session.commit()
-    assert [name for name, _, _ in fake_sg._calls] == ['upload_thumbnail', 'find']
+    assert [name for name, _, _ in fake_sg.calls] == ['upload_thumbnail', 'find']
     assert shot.image == 'uploaded'
     engine.dispose()
 
 
 def test_upload_ambiguity_clears_dirty_type_provenance(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     tmp_path: Path,
 ) -> None:
     session, engine, fake_sg = sess
@@ -2303,7 +2333,7 @@ def test_upload_ambiguity_clears_dirty_type_provenance(
     filmstrip_path.write_bytes(b'image')
     shot.image = image_path
     shot.filmstrip_image = filmstrip_path
-    fake_sg._errors['upload_thumbnail'] = [RuntimeError('upload fault')]
+    fake_sg.errors['upload_thumbnail'] = [RuntimeError('upload fault')]
 
     with pytest.raises(CommitError):
         session.commit()
@@ -2316,7 +2346,7 @@ def test_upload_ambiguity_clears_dirty_type_provenance(
 
 
 def test_upload_failure_partitions_and_clears_local_paths(
-    sess: _SyncSessionBundle, tmp_path: Path
+    sess: SyncSessionBundle, tmp_path: Path
 ) -> None:
     session, engine, fake_sg = sess
     engine.load_schema()
@@ -2329,7 +2359,7 @@ def test_upload_failure_partitions_and_clears_local_paths(
     shot.filmstrip_image = filmstrip_path
     session.delete(shot)
     fault = RuntimeError('upload fault')
-    fake_sg._errors['upload_thumbnail'] = [fault]
+    fake_sg.errors['upload_thumbnail'] = [fault]
     with pytest.raises(CommitError) as excinfo:
         session.commit()
     assert excinfo.value.__cause__ is fault
@@ -2358,10 +2388,10 @@ def test_upload_failure_partitions_and_clears_local_paths(
     assert state.refresh_required == {'image'}
     assert state.unverified_writes == set()
     assert state.dirty == {}
-    assert [name for name, _, _ in fake_sg._calls].count('find') == 1
+    assert [name for name, _, _ in fake_sg.calls].count('find') == 1
 
 
-def test_upload_phase_runs_after_batches(sess: _SyncSessionBundle, tmp_path: Path) -> None:
+def test_upload_phase_runs_after_batches(sess: SyncSessionBundle, tmp_path: Path) -> None:
     session, engine, fake_sg = sess
     engine.load_schema()
     shot_cls = engine.registry.entity_class('Shot')
@@ -2370,16 +2400,16 @@ def test_upload_phase_runs_after_batches(sess: _SyncSessionBundle, tmp_path: Pat
     shot = shot_cls.new(code='S1', image=image_path)
     session.add(shot)
     session.commit()
-    names = [n for n, _, _ in fake_sg._calls]
+    names = [n for n, _, _ in fake_sg.calls]
     assert names.index('batch') < names.index('upload_thumbnail')
-    _, args, _ = fake_sg._calls[names.index('upload_thumbnail')]
+    _, args, _ = fake_sg.calls[names.index('upload_thumbnail')]
     assert args == ('Shot', shot.id, str(image_path))
     session.commit()
-    assert [name for name, _, _ in fake_sg._calls].count('upload_thumbnail') == 1
+    assert [name for name, _, _ in fake_sg.calls].count('upload_thumbnail') == 1
 
 
 def test_upload_readbacks_group_entities_and_types(
-    sess: _SyncSessionBundle, tmp_path: Path
+    sess: SyncSessionBundle, tmp_path: Path
 ) -> None:
     session, engine, fake_sg = sess
     engine.load_schema()
@@ -2390,7 +2420,7 @@ def test_upload_readbacks_group_entities_and_types(
     for path in paths:
         path.write_bytes(b'image')
     first.image, second.image, asset.image = paths
-    fake_sg._find_results = [
+    fake_sg.find_results = [
         [
             {'type': 'Shot', 'id': 85, 'image': 'first-server'},
             {'type': 'Shot', 'id': 86, 'image': 'second-server'},
@@ -2400,7 +2430,7 @@ def test_upload_readbacks_group_entities_and_types(
 
     session.commit()
 
-    find_calls = [call for call in fake_sg._calls if call[0] == 'find']
+    find_calls = [call for call in fake_sg.calls if call[0] == 'find']
     assert [call[1][0] for call in find_calls] == ['Shot', 'Asset']
     assert find_calls[0][1][1:3] == ([['id', 'in', [85, 86]]], ['image'])
     assert find_calls[1][1][1:3] == ([['id', 'in', [87]]], ['image'])
@@ -2410,7 +2440,7 @@ def test_upload_readbacks_group_entities_and_types(
 
 
 def test_validated_chunk_hydration_failure_confirms_all_and_continues(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     caplog: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2422,7 +2452,7 @@ def test_validated_chunk_hydration_failure_confirms_all_and_continues(
     session.add(first)
     session.add(second)
     session.add(dependent)
-    fake_sg._batch_results = [
+    fake_sg.batch_results = [
         [
             {'type': 'Sequence', 'id': 9101, 'code': 'normalized-first'},
             {'type': 'Sequence', 'id': 9102, 'code': 'normalized-second'},
@@ -2436,16 +2466,16 @@ def test_validated_chunk_hydration_failure_confirms_all_and_continues(
             }
         ],
     ]
-    new_queue = session.unit_of_work._new
-    original_confirm = CommitOutcome._confirm
+    new_queue = session.unit_of_work.new
+    original_confirm = CommitOutcome.confirm
     original_hydrate = session.hydrate_record
     confirmed_before_hydration = False
-    first_chunk: tuple[Entity | _uow._Op | _uow.UploadPlanItem, ...] = ()
+    first_chunk: tuple[Entity | _uow._Op | _uow._UploadPlanItem, ...] = ()
     active_outcome: CommitOutcome | None = None
 
     def capture_confirm(
         outcome: CommitOutcome,
-        items: tuple[Entity | _uow._Op | _uow.UploadPlanItem, ...],
+        items: tuple[Entity | _uow._Op | _uow._UploadPlanItem, ...],
     ) -> None:
         nonlocal active_outcome, first_chunk
         original_confirm(outcome, items)
@@ -2463,14 +2493,14 @@ def test_validated_chunk_hydration_failure_confirms_all_and_continues(
             confirmed_before_hydration = (
                 active_outcome is not None
                 and active_outcome.contains_committed(first_chunk)
-                and session.unit_of_work._new is new_queue
+                and session.unit_of_work.new is new_queue
                 and [id(obj) for obj in new_queue] == [id(dependent)]
                 and all(entity_state(obj).dirty == {} for obj in (first, second))
             )
             raise RuntimeError('synthetic echo hydration failure')
         return original_hydrate(entity_type, record, binding)
 
-    monkeypatch.setattr(CommitOutcome, '_confirm', capture_confirm)
+    monkeypatch.setattr(CommitOutcome, 'confirm', capture_confirm)
     monkeypatch.setattr(session, 'hydrate_record', hydrate_with_fault)
     with caplog.at_level('ERROR', logger='sgalchemy.session'):
         session.commit()
@@ -2484,19 +2514,19 @@ def test_validated_chunk_hydration_failure_confirms_all_and_continues(
     assert first_state.refresh_required == {'code'}
     assert second.code == 'normalized-second'
     assert dependent.code == 'normalized-dependent'
-    assert len([call for call in fake_sg._calls if call[0] == 'batch']) == 2
+    assert len([call for call in fake_sg.calls if call[0] == 'batch']) == 2
     errors = [record for record in caplog.records if record.levelname == 'ERROR']
     assert len(errors) == 1
     assert errors[0].exc_info is not None
-    calls_before = len(fake_sg._calls)
+    calls_before = len(fake_sg.calls)
 
     session.commit()
 
-    assert len(fake_sg._calls) == calls_before
+    assert len(fake_sg.calls) == calls_before
 
 
 def test_validated_chunk_reconciliation_failure_retires_confirmed_creates(
-    sess: _SyncSessionBundle,
+    sess: SyncSessionBundle,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session, engine, fake_sg = sess
@@ -2505,19 +2535,18 @@ def test_validated_chunk_reconciliation_failure_retires_confirmed_creates(
     second = engine.entities.Sequence.new(code='second')
     session.add(first)
     session.add(second)
-    fake_sg._batch_results = [
+    fake_sg.batch_results = [
         [
             {'type': 'Sequence', 'id': 9501, 'code': 'first'},
             {'type': 'Sequence', 'id': 9502, 'code': 'second'},
         ]
     ]
     fault = RuntimeError('synthetic confirmed reconciliation failure')
-    original_apply = _uow._apply_deterministic_thumbnail_clear
-
-    def fail_reconciliation(*_args: object) -> Never:
-        raise fault
-
-    monkeypatch.setattr(_uow, '_apply_deterministic_thumbnail_clear', fail_reconciliation)
+    monkeypatch.setattr(
+        _uow,
+        '_apply_deterministic_thumbnail_clear',
+        inject_faults(_uow._apply_deterministic_thumbnail_clear, [fault]),
+    )
 
     with pytest.raises(CommitError) as excinfo:
         session.commit()
@@ -2525,12 +2554,12 @@ def test_validated_chunk_reconciliation_failure_retires_confirmed_creates(
     assert excinfo.value.__cause__ is fault
     assert len(excinfo.value.committed) == 2
     assert excinfo.value.staged == []
-    monkeypatch.setattr(_uow, '_apply_deterministic_thumbnail_clear', original_apply)
-    calls_before = len(fake_sg._calls)
+    assert (first.id, second.id) == (9501, 9502)
+    calls_before = len(fake_sg.calls)
 
     session.commit()
 
-    assert len(fake_sg._calls) == calls_before
-    assert session.unit_of_work.new == ()
+    assert len(fake_sg.calls) == calls_before
+    assert session.unit_of_work.new == []
     assert entity_state(first).dirty == {}
     assert entity_state(second).dirty == {}

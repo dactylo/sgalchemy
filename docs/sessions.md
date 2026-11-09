@@ -8,11 +8,11 @@ start with the [README quick start](../README.md#quick-start).
 | If you want to...                                     | Start here                                                    |
 | ----------------------------------------------------- | ------------------------------------------------------------- |
 | Create, change, retire, or revive records             | [Everyday lifecycle](#everyday-lifecycle)                     |
+| Upload or clear thumbnails                            | [Thumbnails](#thumbnails)                                     |
+| Create sessions from a factory or commit in a block   | [Session factories](#session-factories)                       |
 | Know whether a commit is all-or-nothing               | [When a commit is atomic](#when-a-commit-is-atomic)           |
 | Decide what to do after a commit fails                | [Recover from a failed commit](#recover-from-a-failed-commit) |
 | Handle `RefreshRequiredError` or unverified values    | [Field trust](#field-trust)                                   |
-| Upload or clear thumbnails                            | [Thumbnails](#thumbnails)                                     |
-| Create sessions from a factory or commit in a block   | [Session factories](#session-factories)                       |
 | Check which session methods are supported             | [Supported session methods](#supported-session-methods)       |
 | Understand how sgalchemy checks a successful response | [Response reconciliation](#response-reconciliation)           |
 
@@ -35,7 +35,9 @@ Nothing reaches SG until `commit()`; queries never send staged changes. The sess
 local operations:
 
 - `Shot.new(**fields)` builds a pending entity, validated against the schema, and
-  `session.add(obj)` stages its creation.
+  `session.add(obj)` stages its creation. It also re-attaches an entity kept from a closed session
+  so later field assignments are sent by `commit()`. Assigning to such an entity before `add()`
+  raises an error.
 - Assigning a field on a loaded entity stages an update.
 - `session.delete(obj)` stages retirement. SG retires records rather than erasing them, and
   `session.revive(obj)` stages the revival of a retired record. `delete()` also cancels a staged
@@ -72,6 +74,102 @@ assignment to a field that the schema marks noneditable. Fields with no `editabl
 as editable. This check uses cached schema, so it can be stale: if a field has become editable,
 call `engine.load_schema(force=True)` and assign it again. SG's role permissions remain the final
 authority, and the provider's own permission exception reaches you unchanged.
+
+## Thumbnails
+
+Assign a local `str` or `os.PathLike` path to the conventional `image` or `filmstrip_image` field,
+then commit. Assignment performs no I/O.
+
+```python
+from pathlib import Path
+
+shot.image = Path('shot.jpg')
+shot.filmstrip_image = Path('shot-filmstrip.jpg')
+session.commit()
+
+# Clear both thumbnails.
+shot.image = None
+session.commit()
+```
+
+Commit checks that every path names a readable, nonempty file before its first provider write, so a
+bad path fails before anything is sent. It then calls the provider's dedicated upload operation for
+each field. After any upload attempt, the entity no longer holds your local path as though it were
+the provider's value.
+
+Uploaded fields are read back in bounded groups. The value you see afterward is SG's current value,
+which may be absent, temporary, or final.
+
+### Clear thumbnails
+
+To clear thumbnails, assign `image=None`; it clears both. Assigning `filmstrip_image=None` raises
+an error, because the provider silently ignores it. A confirmed clear sets both local values to
+`None` and removes both fields from `refresh_required` and `unverified_writes`. If
+`filmstrip_image` has an unsent assignment when the clear is confirmed, such as a new path in the
+same commit, the clear leaves that value and its markers alone. Assigning `image=None` also
+discards a `filmstrip_image` path you assigned before it in the same session, so that upload is
+never sent. To clear both thumbnails and upload a new filmstrip in one commit, assign `image=None`
+first and the new `filmstrip_image` path after it.
+
+### Recover from an upload failure
+
+An ordinary upload exception raises `CommitError`, removes the local path, and performs at most one
+field-level readback. If that read succeeds, the field holds SG's current value as unverified; if
+it fails, reading the field raises [`RefreshRequiredError`](#field-trust).
+
+## Session factories
+
+Factories create sessions with shared settings:
+
+| Factory or registry                                  | Sessions and accepted settings                               |
+| ---------------------------------------------------- | ------------------------------------------------------------ |
+| `sessionmaker(engine, *, max_implicit_queries=None)` | Independent synchronous sessions; optional lazy-query budget |
+| `async_sessionmaker(engine)`                         | Independent async sessions; no defaults accepted             |
+| `scoped_session(factory)`                            | One session per thread                                       |
+| `async_scoped_session(factory)`                      | One session per asyncio task; no custom `scopefunc`          |
+
+See [Task-scoped sessions](async.md#task-scoped-sessions) for async cleanup.
+
+Unsupported arguments fail when you construct the factory. Both scoped registries are callable and
+pass public session methods through to the current session.
+
+### Commit on success
+
+Each factory offers `commit_on_success()`, a context manager that commits once and always attempts
+to close the session:
+
+```python
+from sgalchemy import AsyncEngine, Engine, async_sessionmaker, sessionmaker
+
+
+async def commit_examples(engine: Engine, async_engine: AsyncEngine) -> None:
+    factory = sessionmaker(engine)
+    with factory.commit_on_success() as session:
+        session.add(engine.entities.Shot.new(code='sq010_sh020'))
+
+    async_factory = async_sessionmaker(async_engine)
+    async with async_factory.commit_on_success() as session:
+        session.add(async_engine.entities.Shot.new(code='sq010_sh030'))
+```
+
+When the block finishes cleanly, the manager performs one ordinary commit, then closes the session.
+If the block raises, it skips the commit. It is not a transaction: it adds no retry or rollback of
+provider writes, and an explicit commit inside the block can send writes that a later failure in
+the block cannot undo. Factories provide no `begin()`, because SG cannot keep a transaction promise
+across revives, batches, uploads, readbacks, and retirement batches.
+
+If the factory's commit raises `CommitError`, its [four partitions](#recover-from-a-failed-commit)
+describe the instant that commit failed. When the automatic close finishes, it has discarded the
+session's retry queue, so restage any `staged` work you still want on a usable session.
+
+### If automatic close fails
+
+If closing the session fails with an ordinary error after a body or commit failure, the original
+failure remains the one you receive. If a note says the factory's `Session.close()` or
+`AsyncSession.close()` did not finish, call `close()` on the session again. The close failure is
+attached as a note when possible, or logged on the `sgalchemy.session` logger. A close failure on
+its own propagates. If close is interrupted while handling a body or commit failure, the
+interruption propagates with that earlier failure as its context.
 
 ## When a commit is atomic
 
@@ -131,6 +229,10 @@ The exception's notes say whether a failed batch reached the provider:
 - `sgalchemy: the failed batch call started but returned no usable result; its server outcome is unknown`
   means SG may have applied the batch even though the call raised. A plain `commit()` resubmits any
   of its work that remains staged.
+- `sgalchemy: SG saved batch wave 1 chunk 1 before this failure; it counts as committed and a later commit will not send it again`
+  means SG saved that batch before the failure. Nothing in it needs redoing, and a later plain
+  `commit()` sends only work that was never sent. Some fields sent in that batch may need a
+  refresh; reading one raises `RefreshRequiredError`, which says what to do.
 
 When the outcome is unknown, reconcile each kind of staged work before you commit again:
 
@@ -178,100 +280,31 @@ or unverified.
 `session.expire(obj)` and `session.expire_all()` mark entities as expired. Reading a field of an
 expired entity raises `StaleObjectError` until you call `session.refresh(obj)`.
 
-## Thumbnails
-
-Assign a local `str` or `os.PathLike` path to the conventional `image` or `filmstrip_image` field,
-then commit. Assignment performs no I/O.
-
-```python
-from pathlib import Path
-
-shot.image = Path('shot.jpg')
-shot.filmstrip_image = Path('shot-filmstrip.jpg')
-session.commit()
-
-# The provider documents image=None as clearing both thumbnails.
-shot.image = None
-session.commit()
-```
-
-Commit checks that every path names a readable, nonempty file before its first provider write, so a
-bad path fails before anything is sent. It then calls the provider's dedicated upload operation for
-each field. After any upload attempt, the entity no longer holds your local path as though it were
-the provider's value.
-
-Uploaded fields are read back in bounded groups. The value you see afterward is SG's current value,
-which may be absent, temporary, or final.
-
-To clear thumbnails, assign `image=None`; it clears both. Assigning `filmstrip_image=None` raises
-an error, because the provider silently ignores it. A confirmed clear sets both local values to
-`None` and removes both fields from `refresh_required` and `unverified_writes`. If
-`filmstrip_image` has an unsent assignment when the clear is confirmed, such as a new path in the
-same commit, the clear leaves that value and its markers alone.
-
-An ordinary upload exception raises `CommitError`, removes the local path, and performs at most one
-field-level readback. If that read succeeds, the field holds SG's current value as unverified; if
-it fails, reading the field raises `RefreshRequiredError`.
-
-## Session factories
-
-Factories create sessions with shared settings. They deliberately expose less configuration than
-SQLAlchemy:
-
-- `sessionmaker(engine, *, max_implicit_queries=None)` creates independent synchronous sessions.
-- `async_sessionmaker(engine)` creates independent async sessions and accepts no defaults.
-- `scoped_session(factory)` keeps one session per thread.
-- `async_scoped_session(factory)` keeps one session per asyncio task and accepts no custom
-  `scopefunc`; see [Async usage](async.md#task-scoped-sessions).
-
-Unsupported arguments fail when you construct the factory. Both scoped registries are callable and
-pass public session methods through to the current session.
-
-### Commit on success
-
-Each factory offers `commit_on_success()`, a context manager that commits once and always closes
-the session:
-
-```python
-from sgalchemy import AsyncEngine, Engine, async_sessionmaker, sessionmaker
-
-
-async def commit_examples(engine: Engine, async_engine: AsyncEngine) -> None:
-    factory = sessionmaker(engine)
-    with factory.commit_on_success() as session:
-        session.add(engine.entities.Shot.new(code='sq010_sh020'))
-
-    async_factory = async_sessionmaker(async_engine)
-    async with async_factory.commit_on_success() as session:
-        session.add(async_engine.entities.Shot.new(code='sq010_sh030'))
-```
-
-When the block finishes cleanly, the manager performs one ordinary commit, then closes the session.
-If the block raises, it skips the commit. It is not a transaction: it adds no retry or rollback of
-provider writes, and an explicit commit inside the block can send writes that a later failure in
-the block cannot undo. Factories provide no `begin()`, because SG cannot keep a transaction promise
-across revives, batches, uploads, readbacks, and retirement batches.
-
-Every ordinary commit failure, including a single-batch failure, raises `CommitError` with all four
-partitions. The automatic close then discards the session's retry queue, so restage any `staged`
-work you still want on a usable session. An interruption such as cancellation propagates unchanged;
-a submitted async write also quarantines its session.
-
-If closing the session fails after a body or commit failure, the original failure remains the one
-you receive; the close failure is attached as a note when possible, or logged on the
-`sgalchemy.session` logger. A close failure on its own propagates, and an interruption raised
-during cleanup propagates.
-
 ## Reference
 
 ### Supported session methods
 
-`Session` supports `add()`, `close()`, `commit()`, `delete()`, `engine`, `execute()`, `expire()`,
-`expire_all()`, `get()`, `merge_dict()`, `refresh()`, `revive()`, `rollback()`, `scalars()`, and
-context-manager use. `AsyncSession` supports the same names plus `load()`, and is used with
-`async with`. Its `close()`, `commit()`, `execute()`, `get()`, `load()`, `refresh()`, and
-`scalars()` methods are awaited; the others perform no I/O and are called directly. Scoped
-registries add `remove()`, which is awaited on `AsyncScopedSession`.
+| Method or attribute | `Session`     | `AsyncSession` |
+| ------------------- | ------------- | -------------- |
+| `add()`             | Call directly | Call directly  |
+| `close()`           | Call directly | Await          |
+| `commit()`          | Call directly | Await          |
+| `delete()`          | Call directly | Call directly  |
+| `engine`            | Read property | Read property  |
+| `execute()`         | Call directly | Await          |
+| `expire()`          | Call directly | Call directly  |
+| `expire_all()`      | Call directly | Call directly  |
+| `get()`             | Call directly | Await          |
+| `load()`            | Not available | Await          |
+| `merge_dict()`      | Call directly | Call directly  |
+| `refresh()`         | Call directly | Await          |
+| `revive()`          | Call directly | Call directly  |
+| `rollback()`        | Call directly | Call directly  |
+| `scalars()`         | Call directly | Await          |
+| Context manager     | `with`        | `async with`   |
+
+The directly called async methods perform no I/O. Scoped registries also provide `remove()`: call
+it directly on `ScopedSession`, and await it on `AsyncScopedSession`.
 
 Other non-underscore session attributes are package-internal and unsupported.
 
@@ -281,17 +314,42 @@ directly is unsupported.
 
 ### Response reconciliation
 
-When a `batch()` call succeeds, sgalchemy validates the whole response before applying any of it:
+A successful `batch()` response is validated as a whole before sgalchemy applies any of it. Use the
+following diagnostics to decide what to do next.
 
-- If the response is structurally untrustworthy, the submitted operations become indeterminate, and
-  later work for the same records is withdrawn. Any other local failure between a successful
-  response and its confirmation is handled the same way.
-- Once a response is validated, its writes count as committed, even if applying one returned record
-  fails afterward. In that case sgalchemy logs the failure, marks only the affected submitted
-  fields refresh-required, leaves your other unsent changes and values loaded through linked fields
-  untouched, and continues with the remaining commit steps.
-- If a trustworthy response omits fields you submitted, sgalchemy logs a
-  `provider-response contract violation` warning on `sgalchemy.session` and reads the current
-  values. It makes at most one such read for each batch call, entity type, provider query chunk,
-  and active or retired lookup. If that read fails, only those fields become refresh-required;
-  sgalchemy does not retry the write, mark the whole entity untrustworthy, or repeat the read.
+#### Untrustworthy or interrupted response
+
+If the response is structurally untrustworthy, submitted operations become indeterminate and later
+work for the same records is withdrawn. A failure or interruption as the response arrives can also
+leave the batch indeterminate. Indeterminate work is never sent again; follow
+[failed-commit recovery](#recover-from-a-failed-commit).
+
+#### Confirmed write could not be loaded into the object
+
+An `ERROR` on `sgalchemy.session` saying `confirmed-write echo hydration failed for Shot(id=51)`
+means SG saved the write, but sgalchemy could not apply the returned record. Do not repeat the
+write. Reading a submitted field may raise `RefreshRequiredError`, which says what to do.
+
+#### SG saved the batch before an exception
+
+The saved-batch note in [Decide whether to retry](#decide-whether-to-retry) means the write
+succeeded, even for an interruption such as `KeyboardInterrupt`. These further messages explain
+recovery:
+
+| Message or object state                                                                                                           | What to do                                                                   |
+| --------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| `sgalchemy: SG saved that batch, but sgalchemy could not finish updating this session's objects; ...`                             | Carry on as usual; sgalchemy tries again on the next use, rollback, or close |
+| Error beginning `SG saved a batch from this session's last commit, but sgalchemy could not finish updating the session's objects` | Call `rollback()` or `close()`, then query the affected records again        |
+| `sgalchemy: rollback() did not finish` or `sgalchemy: close() did not finish`                                                     | Call `rollback()` or `close()` again                                         |
+| `Shot(id=26, outdated)`                                                                                                           | Discard the object and query its record again; the new object is usable      |
+
+A successful retry during ordinary session use preserves other staged work. `rollback()` and
+`close()` discard it as usual.
+
+#### Submitted fields missing from the response
+
+A trustworthy response that omits submitted fields causes a `provider-response contract violation`
+warning on `sgalchemy.session`. sgalchemy reads the current values at most once for each batch
+call, entity type, provider query chunk, and active or retired lookup. If that read fails, only
+those fields become refresh-required. It does not retry the write, mark the whole entity
+untrustworthy, or repeat the read.

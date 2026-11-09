@@ -80,7 +80,7 @@ class RetiredEntityWriteError(SgalchemyError):
 
 
 class SchemaUnavailableError(SgalchemyError):
-    """Opaque entity schema is unavailable for field access or mutation.
+    """Entity schema is unavailable for construction, field access, mutation, or a point read.
 
     This unresolved-schema error intentionally does not inherit
     `AttributeError`.
@@ -92,4 +92,4 @@ class StaleObjectError(SgalchemyError):
 
 
 class UnfetchedFieldError(SgalchemyError, AttributeError):
-    """Field was not loaded; the message names the loader option that would load it."""
+    """Field has no loaded value; the message says how to load or assign it."""

@@ -1,12 +1,12 @@
 """Synchronous engine, backend gateway, and schema lifecycle."""
 
-# pyright: reportPrivateUsage=false
-
 import logging
 import threading
 import weakref
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from os import PathLike
 from pathlib import Path
 from typing import Any, cast
 
@@ -15,6 +15,7 @@ from sgalchemy._core._construction import (
     StaticCredentials,
     checked_sync_client,
     close_quietly,
+    has_mismatched_methods,
     require_static_credential_https,
     validate_site,
     validate_static_credentials,
@@ -26,8 +27,11 @@ from sgalchemy._core._engine_common import (
     add_note_once,
     looks_like_auth_fault,
     looks_like_schema_fault,
+    missing_provider_error,
     provider_call_arguments,
+    try_store_cache,
     validated_schema,
+    warn_cache_not_written,
 )
 from sgalchemy._core._registry import Registry, RegistryBinding, default_registry
 from sgalchemy._errors import SgalchemyError
@@ -36,7 +40,6 @@ from sgalchemy.schema._cache import (
     SchemaCache,
     load_cache,
     normalize_server_info,
-    store_cache,
 )
 from sgalchemy.schema._cachedir import cache_file
 from sgalchemy.schema._model import EntitySchema, build_schema
@@ -45,27 +48,44 @@ from sgalchemy.schema._policy import SchemaCachePolicy, TTLPolicy
 _LOGGER = logging.getLogger('sgalchemy.engine')
 
 
+@dataclass(frozen=True)
+class SchemaLoad:
+    """Report the snapshot and cache outcome of one schema load.
+
+    Attributes:
+        cache: Snapshot fetched from the provider or loaded from disk.
+        path: Cache destination for this site.
+        fetched: Whether this load fetched the schema from the provider.
+        store_error: Cache-write filesystem failure, or `None` if absent.
+    """
+
+    cache: SchemaCache
+    path: Path
+    fetched: bool
+    store_error: OSError | None
+
+
 class _ThreadSlot:
     """One thread's engine-owned client and its lifecycle accounting."""
 
     __slots__ = (
         '__weakref__',
-        '_active',
-        '_client',
-        '_close_lock',
-        '_finalizer',
-        '_generation',
-        '_retired',
+        'active',
+        'client',
+        'close_lock',
+        'finalizer',
+        'generation',
+        'retired',
     )
 
     def __init__(self, client: ClosableShotgunLike, generation: int) -> None:
         """Initialize lifecycle accounting for one engine-owned client."""
-        self._active = 0
-        self._client = client
-        self._close_lock = threading.Lock()
-        self._finalizer: weakref.finalize[..., _ThreadSlot] | None = None
-        self._generation = generation
-        self._retired = False
+        self.active = 0
+        self.client = client
+        self.close_lock = threading.Lock()
+        self.finalizer: weakref.finalize[..., _ThreadSlot] | None = None
+        self.generation = generation
+        self.retired = False
 
 
 class Engine:
@@ -164,20 +184,20 @@ class Engine:
 
     def _close_slot(self, slot: _ThreadSlot, *, quiet: bool) -> None:
         """Close one owned slot exactly once, retaining it on any failure."""
-        with slot._close_lock:
-            finalizer = slot._finalizer
+        with slot.close_lock:
+            finalizer = slot.finalizer
             if finalizer is None or not finalizer.alive:
                 return
             if finalizer.detach() is None:
                 return
             try:
-                slot._client.close()
+                slot.client.close()
             except Exception:
-                slot._finalizer = weakref.finalize(
+                slot.finalizer = weakref.finalize(
                     slot,
                     Engine._finalize_client,
                     weakref.WeakMethod(self._close_finalized_client),
-                    slot._client,
+                    slot.client,
                 )
                 with self._disposal_lock:
                     self._retired_slots.add(slot)
@@ -194,7 +214,12 @@ class Engine:
             return checked_sync_client(self._creator(), self.site)
         if self._credentials is None:
             raise RuntimeError('engine has no owned-client construction source')
-        import shotgun_api3  # noqa: PLC0415 - provider import must remain lazy
+        try:
+            import shotgun_api3  # noqa: PLC0415 - provider import must remain lazy
+        except ModuleNotFoundError as err:
+            if err.name != 'shotgun_api3':
+                raise
+            raise missing_provider_error('connection= or creator=') from err
 
         constructor = cast('Callable[..., ClosableShotgunLike]', cast('Any', shotgun_api3).Shotgun)
         return constructor(cast('str', self._url), **self._credentials.provider_kwargs())
@@ -222,7 +247,7 @@ class Engine:
                 add_note_once(err, AUTH_RECOVERY_NOTE)
             raise
         slot = _ThreadSlot(client, generation)
-        slot._finalizer = weakref.finalize(
+        slot.finalizer = weakref.finalize(
             slot,
             Engine._finalize_client,
             weakref.WeakMethod(self._close_finalized_client),
@@ -240,8 +265,8 @@ class Engine:
             if slot is None:
                 slot = self._install_slot()
             with self._disposal_lock:
-                if slot._generation == self._generation and not slot._retired:
-                    slot._active += 1
+                if slot.generation == self._generation and not slot.retired:
+                    slot.active += 1
                     return slot
             self._local.slot = None
             self._close_slot(slot, quiet=True)
@@ -272,42 +297,66 @@ class Engine:
     def _release(self, slot: _ThreadSlot) -> None:
         """Finish one call, closing a retired slot after its last call."""
         with self._disposal_lock:
-            slot._active -= 1
-            deferred = slot._retired and slot._active == 0
+            slot.active -= 1
+            deferred = slot.retired and slot.active == 0
         if deferred:
             self._close_slot(slot, quiet=True)
+
+    def _supports(self, method: str) -> bool:
+        """Check provider capability while accounting for owned-client use."""
+        if self._wrapped is not None:
+            return callable(getattr(self._wrapped, method, None))
+        try:
+            slot = self._acquire()
+        except Exception as err:
+            if looks_like_auth_fault(err):
+                add_note_once(err, AUTH_RECOVERY_NOTE)
+            raise
+        try:
+            return callable(getattr(slot.client, method, None))
+        finally:
+            self._release(slot)
 
     @property
     def connection(self) -> ShotgunLike:
         """Return the supplied connection or this thread's owned client.
 
-        Raw access bypasses engine locking and lifecycle accounting; quiesce
-        raw use before `dispose()`.
+        Owned-client access may create a client lazily. Raw access bypasses
+        engine locking and lifecycle accounting; quiesce raw use before
+        `dispose()`.
 
         Returns:
             Connection used by the current thread.
+
+        Raises:
+            ModuleNotFoundError: If static-credential construction requires an
+                unavailable provider.
+            Exception: Other client acquisition failures, unwrapped.
         """
         if self._wrapped is not None:
             return self._wrapped
         slot: _ThreadSlot | None = getattr(self._local, 'slot', None)
         if slot is not None:
             with self._disposal_lock:
-                stale = slot._generation != self._generation or slot._retired
+                stale = slot.generation != self._generation or slot.retired
             if stale:
                 self._local.slot = None
                 self._close_slot(slot, quiet=True)
                 slot = None
         if slot is None:
             slot = self._install_slot()
-        return slot._client
+        return slot.client
 
     def dispose(self) -> None:
         """Close and forget owned clients; the engine stays usable.
 
         Idle owned clients close immediately; clients with an active call are
-        retired and closed by that call's completion. A close failure
-        propagates and leaves disposal retryable for clients not yet closed.
-        Supplied connections are never closed.
+        retired and closed by that call's completion. A close failure leaves
+        disposal retryable for clients not yet closed. Supplied connections are
+        never closed.
+
+        Raises:
+            Exception: The original failure from closing an owned client.
         """
         with self._disposal_lock:
             self._generation += 1
@@ -316,8 +365,8 @@ class Engine:
             live = [slot for ref in self._slot_refs if (slot := ref()) is not None]
             idle: list[_ThreadSlot] = []
             for slot in live:
-                if slot._active > 0:
-                    slot._retired = True
+                if slot.active > 0:
+                    slot.retired = True
                 else:
                     idle.append(slot)
             self._slot_refs = {ref for ref in self._slot_refs if ref() is not None}
@@ -344,10 +393,14 @@ class Engine:
             method: Provider method name.
             args: Positional provider arguments.
             kwargs: Keyword provider arguments, excluding observation metadata.
-            progress: Fresh per-call observation, or None for ordinary calls.
+            progress: Fresh per-call observation, or `None` for ordinary calls.
 
         Returns:
             Provider result without wrapping.
+
+        Raises:
+            Exception: Client acquisition or provider failures, annotated where
+                applicable and propagated without wrapping.
         """
         slot: _ThreadSlot | None = None
         wrapped = self._wrapped
@@ -360,7 +413,7 @@ class Engine:
                 if looks_like_auth_fault(err):
                     add_note_once(err, AUTH_RECOVERY_NOTE)
                 raise
-            client = slot._client
+            client = slot.client
         try:
             if self._call_lock is None:
                 return self._invoke(client, method, args, kwargs, progress)
@@ -401,12 +454,68 @@ class Engine:
 
         Returns:
             Provider query result.
+
+        Raises:
+            Exception: Client acquisition or provider failures, unwrapped.
         """
         method, args, kwargs = provider_call_arguments(call)
         return self.call(method, *args, **kwargs)
 
+    def load_schema_and_report(
+        self, *, force: bool
+    ) -> tuple[Mapping[str, EntitySchema], SchemaLoad | None]:
+        """Prepare schema and report its source without logging cache failures.
+
+        Args:
+            force: Ignore prepared state and disk cache.
+
+        Returns:
+            Published schema mapping and a load report. The report is `None`
+            when prepared state is reused; otherwise it includes the snapshot,
+            source path, fetch status, and any contained cache-write failure.
+
+        Raises:
+            SgalchemyError: If provider schema is malformed or the Registry is
+                already bound to another site.
+            Exception: Original client acquisition, provider, or schema-cache
+                serialization failure, unwrapped.
+        """
+        with self._schema_lock:
+            if self._schema is not None and not self._stale and not force:
+                schemas = self._registry.schema_snapshot()
+                if schemas is None:
+                    raise RuntimeError('prepared engine Registry has no schema binding')
+                return schemas, None
+            path = cache_file(self.site, root=self._cache_root)
+            cached = None if force or self._stale else load_cache(path)
+            fetched = False
+            store_error = None
+            if cached is None or not self._policy.is_fresh(cached):
+                fetched = True
+                raw_server_info = self.call('info') if self._supports('info') else None
+                cached = SchemaCache(
+                    fields=self.call('schema_read'),
+                    entities=self.call('schema_entity_read'),
+                    fetched_at=datetime.now(UTC),
+                    server_info=normalize_server_info(raw_server_info),
+                )
+                candidate = validated_schema(cached)
+                store_error = try_store_cache(path, cached)
+            else:
+                candidate = build_schema(cached)
+            self._registry.bind(candidate, key=self.site)
+            self._schema = candidate
+            self._stale = False
+            schemas = self._registry.schema_snapshot()
+            if schemas is None:
+                raise RuntimeError('Registry bind did not publish schema')
+            return schemas, SchemaLoad(cached, path, fetched, store_error)
+
     def load_schema(self, *, force: bool = False) -> Mapping[str, EntitySchema]:
         """Prepare schema and registry state through an explicit I/O boundary.
+
+        An unwritable cache logs a warning on `sgalchemy.engine` and publishes
+        the fetched schema.
 
         Args:
             force: Ignore prepared state and disk cache.
@@ -417,38 +526,13 @@ class Engine:
         Raises:
             SgalchemyError: If the provider returns malformed schema data or
                 the Registry is already bound to a different site.
-            Exception: Original provider or schema-cache exception, unwrapped.
+            Exception: Original provider exception or schema-cache
+                serialization error, unwrapped.
         """
-        with self._schema_lock:
-            if self._schema is not None and not self._stale and not force:
-                schemas = self._registry.schema_snapshot()
-                if schemas is None:
-                    raise RuntimeError('prepared engine Registry has no schema binding')
-                return schemas
-            path = cache_file(self.site, root=self._cache_root)
-            cached = None if force or self._stale else load_cache(path)
-            if cached is None or not self._policy.is_fresh(cached):
-                info = getattr(self.connection, 'info', None)
-                fields = self.call('schema_read')
-                entities = self.call('schema_entity_read')
-                raw_server_info = self.call('info') if callable(info) else None
-                cached = SchemaCache(
-                    fields=fields,
-                    entities=entities,
-                    fetched_at=datetime.now(UTC),
-                    server_info=normalize_server_info(raw_server_info),
-                )
-                candidate = validated_schema(cached)
-                store_cache(path, cached)
-            else:
-                candidate = build_schema(cached)
-            self._registry.bind(candidate, key=self.site)
-            self._schema = candidate
-            self._stale = False
-            schemas = self._registry.schema_snapshot()
-            if schemas is None:
-                raise RuntimeError('Registry bind did not publish schema')
-            return schemas
+        schemas, report = self.load_schema_and_report(force=force)
+        if report is not None and report.store_error is not None:
+            warn_cache_not_written(report.path, report.store_error)
+        return schemas
 
     def load_binding(self, *, force: bool = False) -> RegistryBinding:
         """Prepare schema and return one complete Registry binding.
@@ -505,7 +589,7 @@ class Engine:
                 raise SgalchemyError(
                     'engine schema is not loaded; call engine.load_schema() first'
                 )
-            schemas = self._registry.schema_snapshot()
+            schemas = self._prepared_schema()
             if schemas is None:
                 raise RuntimeError('prepared engine Registry has no schema binding')
             return schemas
@@ -532,7 +616,7 @@ def create_engine(  # noqa: PLR0913 - Preserve the SQLAlchemy-style factory surf
     script_name: str | None = None,
     api_key: str | None = None,
     session_token: str | None = None,
-    cache_root: Path | None = None,
+    cache_root: str | PathLike[str] | None = None,
     policy: SchemaCachePolicy | None = None,
     echo: bool = False,
     registry: Registry | None = None,
@@ -559,7 +643,7 @@ def create_engine(  # noqa: PLR0913 - Preserve the SQLAlchemy-style factory surf
         api_key: API key paired with `script_name`.
         session_token: JSON-RPC session token, exclusive with script
             credentials.
-        cache_root: Schema cache directory override.
+        cache_root: Schema cache directory override, as a path or string.
         policy: Cache freshness policy, or `None` for the default TTL policy.
         echo: Log provider calls and arguments on `sgalchemy.engine`.
         registry: Explicit Registry permanently paired with the engine.
@@ -573,6 +657,7 @@ def create_engine(  # noqa: PLR0913 - Preserve the SQLAlchemy-style factory surf
         Unprepared reusable engine.
 
     Raises:
+        TypeError: If `connection` declares asynchronous provider methods.
         ValueError: If the URL, sources, credentials, or options are
             inconsistent.
     """
@@ -601,6 +686,11 @@ def create_engine(  # noqa: PLR0913 - Preserve the SQLAlchemy-style factory surf
     )
     if credentials is not None:
         require_static_credential_https(site)
+    if connection is not None and has_mismatched_methods(connection, asynchronous=False):
+        raise TypeError(
+            'connection= received an async client; pass it to '
+            'create_async_engine(connection=...) instead'
+        )
     selected_registry = registry
     if selected_registry is None:
         selected_registry = default_registry() if bind_default else Registry()
@@ -610,9 +700,32 @@ def create_engine(  # noqa: PLR0913 - Preserve the SQLAlchemy-style factory surf
         credentials=credentials,
         connection=connection,
         creator=creator,
-        cache_root=cache_root,
+        cache_root=Path(cache_root) if cache_root is not None else None,
         policy=policy or TTLPolicy(),
         echo=echo,
         registry=selected_registry,
         serialize=serialize if serialize is not None else True,
     )
+
+
+def load_schema_with_source(engine: Engine, *, force: bool) -> SchemaLoad:
+    """Load schema and report its source without logging cache-write failures.
+
+    Args:
+        engine: Engine whose schema and Registry will be prepared.
+        force: Ignore prepared state and disk cache.
+
+    Returns:
+        Snapshot, source, and any cache-write filesystem failure.
+
+    Raises:
+        RuntimeError: If prepared state was reused and no schema load happened.
+        SgalchemyError: If the provider returns malformed schema data or the
+            Registry is already bound to a different site.
+        Exception: Original provider exception or schema-cache serialization
+            error, unwrapped.
+    """
+    _, report = engine.load_schema_and_report(force=force)
+    if report is None:
+        raise RuntimeError('no schema load happened; prepared state was reused')
+    return report

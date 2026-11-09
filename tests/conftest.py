@@ -4,19 +4,19 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 import pytest
-from _fakes import (
-    _SCHEMA_FIXTURE,
-    _FakeAsyncShotgun,
-    _FakeShotgun,
-    _FakeShotgunFactory,
-    _SchemaFixture,
-)
-from _support import PROVIDER_DISTRIBUTIONS, _SyncSessionBundle, fetch_schema
 
 from sgalchemy._core._engine import Engine, create_engine
 from sgalchemy._core._registry import Registry
 from sgalchemy._orm._session import Session
 from sgalchemy.schema import _model
+from tests._fakes import (
+    SCHEMA_FIXTURE,
+    FakeAsyncShotgun,
+    FakeShotgun,
+    FakeShotgunFactory,
+    SchemaFixture,
+)
+from tests._support import PROVIDER_DISTRIBUTIONS, SyncSessionBundle, fetch_schema
 
 _REQUIRED_NODEIDS: set[str] = set()
 _UNEXPECTED_REQUIRED_SKIPS: set[str] = set()
@@ -62,7 +62,7 @@ def _required_markers() -> set[str]:
 
 
 @pytest.fixture
-def engine(fake_sg: _FakeShotgun, tmp_path: Path) -> Engine:
+def engine(fake_sg: FakeShotgun, tmp_path: Path) -> Engine:
     return create_engine(
         connection=fake_sg,
         cache_root=tmp_path,
@@ -72,18 +72,18 @@ def engine(fake_sg: _FakeShotgun, tmp_path: Path) -> Engine:
 
 
 @pytest.fixture
-def fake_async_sg() -> _FakeAsyncShotgun:
-    return _FakeAsyncShotgun()
+def fake_async_sg() -> FakeAsyncShotgun:
+    return FakeAsyncShotgun()
 
 
 @pytest.fixture
-def fake_sg() -> _FakeShotgun:
-    return _FakeShotgun()
+def fake_sg() -> FakeShotgun:
+    return FakeShotgun()
 
 
 @pytest.fixture
-def fake_sg_factory() -> _FakeShotgunFactory:
-    return _FakeShotgunFactory()
+def fake_sg_factory() -> FakeShotgunFactory:
+    return FakeShotgunFactory()
 
 
 def pytest_collection_finish(session: pytest.Session) -> None:
@@ -105,12 +105,12 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
 
 
 @pytest.fixture
-def schemas(fake_sg: _FakeShotgun) -> dict[str, _model.EntitySchema]:
+def schemas(fake_sg: FakeShotgun) -> dict[str, _model.EntitySchema]:
     return _model.build_schema(fetch_schema(fake_sg))
 
 
 @pytest.fixture
-def sess(fake_sg: _FakeShotgun, tmp_path: Path) -> _SyncSessionBundle:
+def sess(fake_sg: FakeShotgun, tmp_path: Path) -> SyncSessionBundle:
     engine = create_engine(
         connection=fake_sg, cache_root=tmp_path, registry=Registry(), bind_default=False
     )
@@ -118,5 +118,5 @@ def sess(fake_sg: _FakeShotgun, tmp_path: Path) -> _SyncSessionBundle:
 
 
 @pytest.fixture
-def schema_fixture() -> _SchemaFixture:
-    return copy.deepcopy(_SCHEMA_FIXTURE)
+def schema_fixture() -> SchemaFixture:
+    return copy.deepcopy(SCHEMA_FIXTURE)

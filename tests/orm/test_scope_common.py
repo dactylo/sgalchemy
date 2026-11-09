@@ -1,9 +1,11 @@
-from typing import Any, Never
+import asyncio
+from typing import Never
 
 import pytest
 
 from sgalchemy._orm import _scoping
 from sgalchemy._orm._scope_common import SuppressOrdinaryFailure, record_close_failure
+from tests._support import InterruptingNoteAccess
 
 
 class _ControlSignal(BaseException):
@@ -12,6 +14,53 @@ class _ControlSignal(BaseException):
 
 def _raise_close_failure() -> Never:
     raise RuntimeError('secondary')
+
+
+@pytest.mark.parametrize('hook', ['__name__', '__str__', '__traceback__'])
+@pytest.mark.parametrize('interrupted', [False, True])
+def test_shared_close_failure_governs_foreign_diagnostic_hooks(
+    caplog: pytest.LogCaptureFixture,
+    hook: str,
+    interrupted: bool,
+) -> None:
+    fault = _ControlSignal('interrupted') if interrupted else ValueError('diagnostic failed')
+
+    class FailureType(type):
+        def __getattribute__(cls, name: str) -> object:
+            if name == hook:
+                raise fault
+            return super().__getattribute__(name)
+
+    class CloseError(Exception, metaclass=FailureType):
+        def __getattribute__(self, name: str) -> object:
+            if name == hook:
+                raise fault
+            return super().__getattribute__(name)
+
+        def __str__(self) -> str:
+            if hook == '__str__':
+                raise fault
+            return super().__str__()
+
+    class UnannotatableError(Exception):
+        def add_note(self, note: str) -> None:
+            raise ValueError(note)
+
+    primary = UnannotatableError('primary')
+    secondary = CloseError('secondary')
+    with caplog.at_level('ERROR', logger='sgalchemy.session'):
+        if interrupted:
+            with pytest.raises(_ControlSignal) as excinfo:
+                record_close_failure(primary, secondary, 'Session', _scoping._LOGGER)
+            assert excinfo.value is fault
+            assert not caplog.records
+        else:
+            record_close_failure(primary, secondary, 'Session', _scoping._LOGGER)
+            record = caplog.records[-1]
+            assert record.getMessage() == (
+                'Session.close() failed while preserving the primary exception'
+            )
+            assert record.exc_info is None
 
 
 def test_shared_close_failure_logs_secondary_when_primary_cannot_be_annotated(
@@ -35,12 +84,6 @@ def test_shared_close_failure_logs_secondary_when_primary_cannot_be_annotated(
 
 
 def test_shared_close_failure_propagates_note_access_interruption() -> None:
-    class InterruptingNoteAccess(BaseException):
-        def __getattribute__(self, name: str) -> Any:  # noqa: ANN401 - Delegate BaseException attributes while interrupting note access.
-            if name == '__notes__':
-                raise KeyboardInterrupt
-            return super().__getattribute__(name)
-
     with pytest.raises(KeyboardInterrupt):
         record_close_failure(
             InterruptingNoteAccess('primary'),
@@ -69,3 +112,16 @@ def test_shared_suppress_failure_records_without_suppressing_base_exception() ->
 
     assert excinfo.value is fault
     assert suppression.error is fault
+
+
+def test_suppress_failure_preserves_timeout_cancellation() -> None:
+    async def scenario() -> None:
+        async def time_out_suppression() -> None:
+            async with asyncio.timeout(0):
+                with SuppressOrdinaryFailure():
+                    await asyncio.sleep(0)
+
+        with pytest.raises(TimeoutError):
+            await time_out_suppression()
+
+    asyncio.run(scenario())

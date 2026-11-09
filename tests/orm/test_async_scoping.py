@@ -3,29 +3,36 @@ import asyncio
 import functools
 import gc
 import inspect
+from collections.abc import Callable
+from itertools import repeat
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Never, cast
+from typing import Any, Never, cast
 
 import pytest
-from _fakes import _FakeAsyncShotgun
-from _support import (
-    _AsyncCallback,
-    _AsyncExecutionEnvironment,
-    _AsyncSessionFactory,
-    assert_disjoint_commit_outcome,
-    isolated_async_engine,
-)
 
 from sgalchemy._core._async_engine import AsyncEngine, create_async_engine
+from sgalchemy._core._engine import Engine
+from sgalchemy._core._engine_common import AUTH_RECOVERY_NOTE
 from sgalchemy._core._registry import Entity, Registry, entity_state
 from sgalchemy._errors import CommitError, SgalchemyError
 from sgalchemy._orm import _async_scoping, _async_session, _uow
 from sgalchemy._orm._async_scoping import async_scoped_session, async_sessionmaker
 from sgalchemy._orm._async_session import AsyncSession
 from sgalchemy._orm._uow import RecoveryAdapter
-
-if TYPE_CHECKING:
-    from collections.abc import Callable
+from tests._fakes import FakeAsyncShotgun
+from tests._support import (
+    AUTHENTICATION_FAULT,
+    SAVED_BATCH_NOTE,
+    STAGED_RETRY_NOTE,
+    UNFINISHED_BATCH_NOTE,
+    AsyncCallback,
+    AsyncExecutionEnvironment,
+    AsyncSessionFactory,
+    assert_disjoint_commit_outcome,
+    inject_faults,
+    isolated_async_engine,
+    run_async,
+)
 
 _ASYNC_SCOPED_SESSION_METHODS = (
     'add',
@@ -54,11 +61,11 @@ class _DiagnosticSignal(BaseException):
 
 
 def _async_execution_error_body(
-    environment: _AsyncExecutionEnvironment,
+    environment: AsyncExecutionEnvironment,
     monkeypatch: pytest.MonkeyPatch,
     route: str,
     error: CommitError,
-) -> _AsyncCallback[[AsyncSession], None]:
+) -> AsyncCallback[[AsyncSession], None]:
     engine, fake_async_sg, tmp_path = environment
     if route == 'multi_batch':
         original_batch = fake_async_sg.batch
@@ -67,7 +74,7 @@ def _async_execution_error_body(
         async def fail_second_batch(requests: list[dict[str, Any]]) -> list[Any]:
             nonlocal calls
             if calls == 1:
-                fake_async_sg._errors['batch'] = [error]
+                fake_async_sg.errors['batch'] = [error]
             calls += 1
             return await original_batch(requests)
 
@@ -81,7 +88,7 @@ def _async_execution_error_body(
 
         return stage_batch
     if route == 'revive':
-        fake_async_sg._errors['revive'] = [error]
+        fake_async_sg.errors['revive'] = [error]
 
         async def stage_revive(session: AsyncSession) -> None:
             shot = session.merge_dict({'type': 'Shot', 'id': 37, 'image': 'old'})
@@ -91,7 +98,7 @@ def _async_execution_error_body(
         return stage_revive
     upload_path = tmp_path / 'async-existing-commit-error.jpg'
     upload_path.write_bytes(b'image')
-    fake_async_sg._errors['upload_thumbnail'] = [error]
+    fake_async_sg.errors['upload_thumbnail'] = [error]
 
     async def stage_upload(session: AsyncSession) -> None:
         shot = session.merge_dict({'type': 'Shot', 'id': 37, 'image': 'old'})
@@ -101,25 +108,25 @@ def _async_execution_error_body(
 
 
 async def _make_factory(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
-) -> tuple[AsyncEngine, _AsyncSessionFactory]:
+) -> tuple[AsyncEngine, AsyncSessionFactory]:
     engine = isolated_async_engine(fake_async_sg, tmp_path)
     await engine.load_schema()
     return engine, async_sessionmaker(engine)
 
 
 async def _run_commit_on_success(
-    factory: _AsyncSessionFactory,
-    body: _AsyncCallback[[AsyncSession], None],
+    factory: AsyncSessionFactory,
+    body: AsyncCallback[[AsyncSession], None],
 ) -> None:
     async with factory.commit_on_success() as session:
         await body(session)
 
 
 async def _run_direct_commit(
-    factory: _AsyncSessionFactory,
-    body: _AsyncCallback[[AsyncSession], None],
+    factory: AsyncSessionFactory,
+    body: AsyncCallback[[AsyncSession], None],
 ) -> None:
     session = factory()
     try:
@@ -127,6 +134,39 @@ async def _run_direct_commit(
         await session.commit()
     finally:
         await session.close()
+
+
+def test_async_cleanup_reads_raw_unit_of_work_without_access_check(
+    fake_async_sg: FakeAsyncShotgun,
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        engine = isolated_async_engine(fake_async_sg, tmp_path)
+        await engine.load_schema()
+        session = AsyncSession(engine)
+        pending = engine.entities.Shot.new(code='indeterminate')
+        session.add(pending)
+        fake_async_sg.errors['batch'] = [SystemExit('interrupted')]
+
+        with pytest.raises(SystemExit):
+            await session.commit()
+        with pytest.raises(SgalchemyError, match='indeterminate'):
+            _ = session.unit_of_work
+
+        _async_session.automatic_cleanup(session, task_name='interrupted', cancelled=True)
+
+        assert entity_state(pending).session is None
+        assert entity_state(pending).indeterminate
+        with pytest.raises(SgalchemyError, match='closed after an indeterminate write'):
+            _ = session.unit_of_work
+
+        reusable = AsyncSession(engine)
+        await reusable.close()
+        restaged = engine.entities.Shot.new(code='after-close')
+        reusable.add(restaged)
+        assert reusable.unit_of_work.new == [restaged]
+
+    asyncio.run(scenario())
 
 
 def test_async_close_failure_annotates_base_exception_once_without_logging(
@@ -146,7 +186,7 @@ def test_async_close_failure_annotates_base_exception_once_without_logging(
 
 
 def test_async_commit_on_success_cancellation_stays_primary_when_close_fails(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -160,7 +200,7 @@ def test_async_commit_on_success_cancellation_stays_primary_when_close_fails(
             raise close_fault
 
         monkeypatch.setattr(AsyncSession, 'close', failing_close)
-        entered, _release = fake_async_sg._block('batch')
+        entered, _release = fake_async_sg.block('batch')
         pending = engine.entities.Shot.new(code='cancelled')
         observed: list[asyncio.CancelledError] = []
 
@@ -190,13 +230,13 @@ def test_async_commit_on_success_cancellation_stays_primary_when_close_fails(
             for note in fault.__notes__
         )
         assert any('explicitly restage' in note for note in fault.__notes__)
-        assert [name for name, _args, _kwargs in fake_async_sg._calls].count('batch') == 1
+        assert [name for name, _args, _kwargs in fake_async_sg.calls].count('batch') == 1
 
-    asyncio.run(scenario())
+    run_async(scenario())
 
 
 def test_async_commit_on_success_close_failure_propagates_inside_outer_except(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -224,13 +264,13 @@ def test_async_commit_on_success_close_failure_propagates_inside_outer_except(
             await close_inside_outer_except()
 
         assert getattr(outer, '__notes__', []) == []
-        assert [name for name, _args, _kwargs in fake_async_sg._calls].count('batch') == 1
+        assert [name for name, _args, _kwargs in fake_async_sg.calls].count('batch') == 1
 
     asyncio.run(scenario())
 
 
 def test_async_commit_on_success_success_inside_outer_except_adds_no_note(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -246,26 +286,40 @@ def test_async_commit_on_success_success_inside_outer_except_adds_no_note(
 
         assert pending.id is not None
         assert getattr(outer, '__notes__', []) == []
-        assert [name for name, _args, _kwargs in fake_async_sg._calls].count('batch') == 1
+        assert [name for name, _args, _kwargs in fake_async_sg.calls].count('batch') == 1
 
     asyncio.run(scenario())
 
 
-def test_async_suppress_failure_preserves_timeout_cancellation() -> None:
-    async def scenario() -> None:
-        async def time_out_suppression() -> None:
-            async with asyncio.timeout(0):
-                with _async_scoping._SuppressFailure():
-                    await asyncio.sleep(0)
-
-        with pytest.raises(TimeoutError):
-            await time_out_suppression()
-
-    asyncio.run(scenario())
+@pytest.mark.parametrize(
+    ('factory', 'message'),
+    [
+        (
+            async_sessionmaker,
+            (
+                'async_sessionmaker() requires an AsyncEngine, not an Engine; use '
+                'sessionmaker(engine)'
+            ),
+        ),
+        (
+            async_scoped_session,
+            (
+                'async_scoped_session() requires an AsyncSession factory, not an Engine; use '
+                'scoped_session(sessionmaker(engine))'
+            ),
+        ),
+    ],
+)
+def test_async_factories_reject_a_sync_engine(
+    factory: Callable[..., object], message: str, engine: Engine
+) -> None:
+    with pytest.raises(TypeError) as excinfo:
+        factory(engine)
+    assert str(excinfo.value) == message
 
 
 def test_automatic_cleanup_counts_same_entity_work_after_commit_cancellation(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -275,7 +329,7 @@ def test_automatic_cleanup_counts_same_entity_work_after_commit_cancellation(
         scoped = async_scoped_session(async_sessionmaker(engine))
         upload_path = tmp_path / 'unsent-image-secret.jpg'
         upload_path.write_bytes(b'image')
-        entered, _release = fake_async_sg._block('batch')
+        entered, _release = fake_async_sg.block('batch')
         escaped: list[tuple[AsyncSession, Entity]] = []
 
         async def worker() -> None:
@@ -289,7 +343,7 @@ def test_automatic_cleanup_counts_same_entity_work_after_commit_cancellation(
 
         task = asyncio.create_task(worker(), name='same-entity-cancel-worker')
         await entered.wait()
-        calls_before_cleanup = list(fake_async_sg._calls)
+        calls_before_cleanup = list(fake_async_sg.calls)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -299,12 +353,12 @@ def test_automatic_cleanup_counts_same_entity_work_after_commit_cancellation(
         state = entity_state(shot)
         assert state.indeterminate
         assert state.session is None
-        assert fake_async_sg._calls == calls_before_cleanup
+        assert fake_async_sg.calls == calls_before_cleanup
         with pytest.raises(SgalchemyError, match='new AsyncSession'):
             await session.commit()
 
     with caplog.at_level('WARNING', logger='sgalchemy.session'):
-        asyncio.run(scenario())
+        run_async(scenario())
 
     warnings = [
         record.message
@@ -329,7 +383,7 @@ def test_automatic_cleanup_counts_same_entity_work_after_commit_cancellation(
 
 
 def test_automatic_cleanup_does_not_suppress_unretrieved_task_exception(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -369,7 +423,7 @@ def test_automatic_cleanup_does_not_suppress_unretrieved_task_exception(
 
 
 def test_automatic_cleanup_failure_is_logged_after_registry_pop(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
@@ -406,7 +460,7 @@ def test_automatic_cleanup_failure_is_logged_after_registry_pop(
 
 
 def test_automatic_cleanup_warns_when_completed_task_is_cancelled(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -435,7 +489,7 @@ def test_automatic_cleanup_warns_when_completed_task_is_cancelled(
         assert entity_state(escaped[0]).loaded['code'] == 'old'
 
     with caplog.at_level('WARNING', logger='sgalchemy.session'):
-        asyncio.run(scenario())
+        run_async(scenario())
 
     warnings = [
         record.message
@@ -447,7 +501,7 @@ def test_automatic_cleanup_warns_when_completed_task_is_cancelled(
 
 
 def test_automatic_cleanup_warns_when_completed_task_raises(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -484,7 +538,7 @@ def test_automatic_cleanup_warns_when_completed_task_raises(
 
 
 def test_automatic_cleanup_warns_with_exact_unsubmitted_counts(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -542,7 +596,7 @@ def test_automatic_cleanup_warns_with_exact_unsubmitted_counts(
 
 
 def test_automatic_cleanup_without_unsubmitted_work_does_not_warn(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -574,14 +628,14 @@ def test_automatic_task_scope_rejects_custom_scopefunc() -> None:
 
 
 def test_borrower_defers_automatic_cleanup_until_operation_finishes(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     async def scenario() -> None:
         engine = isolated_async_engine(fake_async_sg, tmp_path)
         await engine.load_schema()
-        entered, release = fake_async_sg._block('find_one')
+        entered, release = fake_async_sg.block('find_one')
         scoped = async_scoped_session(async_sessionmaker(engine))
         borrowers: list[asyncio.Task[Any]] = []
 
@@ -602,20 +656,20 @@ def test_borrower_defers_automatic_cleanup_until_operation_finishes(
         await asyncio.sleep(0)
 
         entries = object.__getattribute__(scoped, '_sessions')
-        unit_of_work = object.__getattribute__(session, '_unit_of_work')
+        unit_of_work = object.__getattribute__(session, 'raw_unit_of_work')
         assert owner_task not in entries
         assert entity_state(pending).session is session
-        assert unit_of_work.new == (pending,)
+        assert unit_of_work.new == [pending]
 
         release.set()
         await borrowers[0]
 
         assert entries == {}
         assert entity_state(pending).session is None
-        assert unit_of_work.new == ()
+        assert unit_of_work.new == []
 
     with caplog.at_level('WARNING', logger='sgalchemy.session'):
-        asyncio.run(scenario())
+        run_async(scenario())
 
     warnings = [record.message for record in caplog.records if record.levelname == 'WARNING']
     misuse = [message for message in warnings if 'cross-task' in message]
@@ -631,7 +685,7 @@ def test_borrower_defers_automatic_cleanup_until_operation_finishes(
 @pytest.mark.parametrize('route', ['multi_batch', 'revive', 'upload'])
 @pytest.mark.parametrize('through_factory', [False, True], ids=['direct', 'factory'])
 def test_commit_error_from_execution_passes_through_unchanged(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     route: str,
@@ -672,9 +726,50 @@ def test_commit_error_from_execution_passes_through_unchanged(
             expected_notes += (_async_scoping._COMMIT_FAILURE_CLOSE_NOTE,)
         assert tuple(existing.__notes__) == expected_notes
         if route == 'upload':
-            names = [name for name, _args, _kwargs in fake_async_sg._calls]
+            names = [name for name, _args, _kwargs in fake_async_sg.calls]
             assert names.count('upload_thumbnail') == 1
             assert 'find' not in names
+
+    asyncio.run(scenario())
+
+
+def test_commit_on_success_auth_failure_keeps_only_the_engine_note_on_the_cause(
+    fake_async_sg: FakeAsyncShotgun,
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        engine, factory = await _make_factory(fake_async_sg, tmp_path)
+        fault = AUTHENTICATION_FAULT('expired')
+        fake_async_sg.errors['batch'] = [fault]
+        pending = engine.entities.Shot.new(code='unsent')
+
+        async def stage(session: AsyncSession) -> None:
+            session.add(pending)
+
+        with pytest.raises(CommitError) as excinfo:
+            await _run_commit_on_success(factory, stage)
+
+        error = excinfo.value
+        assert error.__cause__ is fault
+        assert error.__notes__ == [
+            STAGED_RETRY_NOTE,
+            'sgalchemy: failed during batch wave 1 chunk 1',
+            _uow._BATCH_OUTCOME_UNKNOWN_NOTE,
+            AUTH_RECOVERY_NOTE,
+            _async_scoping._COMMIT_FAILURE_CLOSE_NOTE,
+        ]
+        assert getattr(fault, '__notes__', []) == [AUTH_RECOVERY_NOTE]
+        assert error.committed == []
+        assert len(error.staged) == 1
+        staged = error.staged[0]
+        assert isinstance(staged, _uow._Op)
+        assert staged.obj is pending
+        assert error.indeterminate == []
+        assert error.withdrawn == []
+        assert_disjoint_commit_outcome(error)
+        assert [name for name, _args, _kwargs in fake_async_sg.calls].count('batch') == 1
+        assert entity_state(pending).session is None
+        assert not entity_state(pending).dirty
 
     asyncio.run(scenario())
 
@@ -682,7 +777,7 @@ def test_commit_error_from_execution_passes_through_unchanged(
 @pytest.mark.parametrize('exception_type', [RuntimeError, KeyboardInterrupt])
 def test_commit_on_success_body_failure_skips_commit_and_stays_primary(
     exception_type: type[BaseException],
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -706,7 +801,7 @@ def test_commit_on_success_body_failure_skips_commit_and_stays_primary(
             await _run_commit_on_success(factory, fail_body)
 
         assert excinfo.value is fault
-        assert [name for name, _args, _kwargs in fake_async_sg._calls].count('batch') == 0
+        assert [name for name, _args, _kwargs in fake_async_sg.calls].count('batch') == 0
         assert len(close_calls) == 1
         assert entity_state(pending).session is None
         assert not entity_state(pending).dirty
@@ -715,7 +810,7 @@ def test_commit_on_success_body_failure_skips_commit_and_stays_primary(
 
 
 def test_commit_on_success_body_failure_stays_primary_when_close_fails(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -745,20 +840,115 @@ def test_commit_on_success_body_failure_stays_primary_when_close_fails(
         assert excinfo.value is body_fault
         assert close_calls == 1
         assert entity_state(pending).session is None
-        assert [name for name, _args, _kwargs in fake_async_sg._calls].count('batch') == 0
+        assert [name for name, _args, _kwargs in fake_async_sg.calls].count('batch') == 0
         assert any('close failed' in note for note in body_fault.__notes__)
+        assert _async_scoping._CLOSE_UNFINISHED_NOTE in body_fault.__notes__
+        assert not any('explicitly restage' in note for note in body_fault.__notes__)
+        assert _async_scoping._COMMIT_FAILURE_CLOSE_NOTE not in body_fault.__notes__
+
+    asyncio.run(scenario())
+
+
+def test_commit_on_success_close_interruption_keeps_primary_as_context(
+    fake_async_sg: FakeAsyncShotgun,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        engine, factory = await _make_factory(fake_async_sg, tmp_path)
+        monkeypatch.setattr(
+            _uow,
+            '_install_accepted_identities',
+            inject_faults(_uow._install_accepted_identities, repeat(RuntimeError('persistent'))),
+        )
+        monkeypatch.setattr(
+            _uow,
+            '_mark_outdated',
+            inject_faults(_uow._mark_outdated, [KeyboardInterrupt('release')]),
+        )
+        created = [engine.entities.Sequence.new(code=f'created-{index}') for index in range(2)]
+
+        async def stage(session: AsyncSession) -> None:
+            for obj in created:
+                session.add(obj)
+
+        with pytest.raises(KeyboardInterrupt) as excinfo:
+            await _run_commit_on_success(factory, stage)
+
+        assert isinstance(excinfo.value.__context__, CommitError)
+        assert (
+            'sgalchemy: close() did not finish; call rollback() or close() on this session '
+            'again before using it'
+        ) in excinfo.value.__notes__
+
+    asyncio.run(scenario())
+
+
+def test_commit_on_success_closes_after_unfinished_saved_batch(
+    fake_async_sg: FakeAsyncShotgun,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        engine, factory = await _make_factory(fake_async_sg, tmp_path)
+        monkeypatch.setattr(
+            _uow,
+            '_install_accepted_identities',
+            inject_faults(_uow._install_accepted_identities, repeat(RuntimeError('persistent'))),
+        )
+        created = [engine.entities.Sequence.new(code=f'created-{index}') for index in range(2)]
+        captured_session: AsyncSession | None = None
+
+        async def stage(session: AsyncSession) -> None:
+            nonlocal captured_session
+            captured_session = session
+            for obj in created:
+                session.add(obj)
+
+        with pytest.raises(CommitError) as excinfo:
+            await _run_commit_on_success(factory, stage)
+
+        error = excinfo.value
+        assert error.__notes__.index(SAVED_BATCH_NOTE) < error.__notes__.index(
+            UNFINISHED_BATCH_NOTE
+        )
+        assert error.__notes__.index(UNFINISHED_BATCH_NOTE) < error.__notes__.index(
+            _async_scoping._COMMIT_FAILURE_CLOSE_NOTE
+        )
+        assert all(repr(obj).endswith(', outdated)') for obj in created)
+        assert captured_session is not None
+        with pytest.raises(SgalchemyError, match='is outdated: SG saved your change'):
+            AsyncSession(engine).add(created[0])
+        with pytest.raises(SgalchemyError, match='is outdated: SG saved your change'):
+            await captured_session.refresh(created[1])
+        for obj in created:
+            with pytest.raises(SgalchemyError, match='is outdated: SG saved your change'):
+                _ = obj.code
+            with pytest.raises(SgalchemyError, match='is outdated: SG saved your change'):
+                captured_session.delete(obj)
+            with pytest.raises(SgalchemyError, match='is outdated: SG saved your change'):
+                captured_session.revive(obj)
+            entity_id = entity_state(obj).id
+            assert entity_id is not None
+            fake_async_sg.find_results = [
+                [{'type': 'Sequence', 'id': entity_id, 'code': 'server'}]
+            ]
+            fresh = await captured_session.get(type(obj), entity_id)
+            assert fresh is not obj
+            assert fresh is not None
+            assert fresh.code == 'server'
 
     asyncio.run(scenario())
 
 
 def test_commit_on_success_commit_base_exception_stays_raw_and_quarantines(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
         engine, factory = await _make_factory(fake_async_sg, tmp_path)
         fault = SystemExit('commit interrupted')
-        fake_async_sg._errors['batch'] = [fault]
+        fake_async_sg.errors['batch'] = [fault]
         pending = engine.entities.Shot.new(code='interrupted')
         sessions: list[AsyncSession] = []
 
@@ -771,26 +961,35 @@ def test_commit_on_success_commit_base_exception_stays_raw_and_quarantines(
 
         assert excinfo.value is fault
         assert excinfo.value.__cause__ is None
-        assert [name for name, _args, _kwargs in fake_async_sg._calls].count('batch') == 1
+        assert [name for name, _args, _kwargs in fake_async_sg.calls].count('batch') == 1
         assert entity_state(pending).session is None
         assert entity_state(pending).indeterminate
-        assert object.__getattribute__(sessions[0], '_discarded_after_cancel')
+        assert object.__getattribute__(sessions[0], 'discarded_after_cancel')
         assert any('indeterminate' in note for note in fault.__notes__)
         assert any('explicitly restage' in note for note in fault.__notes__)
 
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize('broken_message', [False, True])
 def test_commit_on_success_commit_failure_stays_primary_when_close_fails(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    broken_message: bool,
 ) -> None:
     async def scenario() -> None:
         engine, factory = await _make_factory(fake_async_sg, tmp_path)
         commit_fault = RuntimeError('commit failed')
-        close_fault = RuntimeError('close failed')
-        fake_async_sg._errors['batch'] = [commit_fault]
+
+        class CloseError(RuntimeError):
+            def __str__(self) -> str:
+                if broken_message:
+                    raise ValueError('cannot format close failure')
+                return super().__str__()
+
+        close_fault = CloseError('close failed')
+        fake_async_sg.errors['batch'] = [commit_fault]
         original_close = AsyncSession.close
         close_calls = 0
 
@@ -813,15 +1012,17 @@ def test_commit_on_success_commit_failure_stays_primary_when_close_fails(
         assert error.__cause__ is commit_fault
         assert close_calls == 1
         assert entity_state(pending).session is None
-        assert [name for name, _args, _kwargs in fake_async_sg._calls].count('batch') == 1
-        assert any('explicitly restage' in note for note in error.__notes__)
-        assert any('close failed' in note for note in error.__notes__)
+        assert [name for name, _args, _kwargs in fake_async_sg.calls].count('batch') == 1
+        assert _async_scoping._CLOSE_UNFINISHED_RESTAGE_NOTE in error.__notes__
+        assert _async_scoping._COMMIT_FAILURE_CLOSE_NOTE not in error.__notes__
+        expected_detail = 'details unavailable' if broken_message else 'CloseError: close failed'
+        assert any(expected_detail in note for note in error.__notes__)
 
     asyncio.run(scenario())
 
 
 def test_commit_on_success_commits_once_and_closes(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -841,14 +1042,14 @@ def test_commit_on_success_commits_once_and_closes(
 
         assert pending.id is not None
         assert entity_state(pending).session is None
-        assert [name for name, _args, _kwargs in fake_async_sg._calls].count('batch') == 1
+        assert [name for name, _args, _kwargs in fake_async_sg.calls].count('batch') == 1
         assert close_calls == [session]
 
     asyncio.run(scenario())
 
 
 def test_commit_on_success_does_not_claim_to_undo_inner_commit(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -867,14 +1068,14 @@ def test_commit_on_success_does_not_claim_to_undo_inner_commit(
         assert excinfo.value is fault
         assert pending.id is not None
         assert entity_state(pending).session is None
-        assert [name for name, _args, _kwargs in fake_async_sg._calls].count('batch') == 1
+        assert [name for name, _args, _kwargs in fake_async_sg.calls].count('batch') == 1
         assert not any('rollback' in note.lower() for note in getattr(fault, '__notes__', ()))
 
     asyncio.run(scenario())
 
 
 def test_commit_on_success_keeps_multi_step_failure_partitions(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -887,7 +1088,7 @@ def test_commit_on_success_keeps_multi_step_failure_partitions(
         async def fail_second_batch(requests: list[dict[str, Any]]) -> list[Any]:
             nonlocal calls
             if calls == 1:
-                fake_async_sg._errors['batch'] = [fault]
+                fake_async_sg.errors['batch'] = [fault]
             calls += 1
             return await original_batch(requests)
 
@@ -923,7 +1124,7 @@ def test_commit_on_success_keeps_multi_step_failure_partitions(
 
 
 def test_commit_on_success_preserves_existing_commit_error(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -940,7 +1141,7 @@ def test_commit_on_success_preserves_existing_commit_error(
             attempts += 1
             raise existing
 
-        monkeypatch.setattr(AsyncSession, '_plan_commit', fail_plan)
+        monkeypatch.setattr(AsyncSession, 'plan_commit', fail_plan)
 
         async def stage(session: AsyncSession) -> None:
             session.add(pending)
@@ -962,7 +1163,7 @@ def test_commit_on_success_preserves_existing_commit_error(
 
 
 def test_commit_on_success_propagates_close_failure_when_it_is_sole_failure(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -991,13 +1192,49 @@ def test_commit_on_success_propagates_close_failure_when_it_is_sole_failure(
         assert close_calls == 1
         assert pending.id is not None
         assert entity_state(pending).session is None
-        assert [name for name, _args, _kwargs in fake_async_sg._calls].count('batch') == 1
+        assert [name for name, _args, _kwargs in fake_async_sg.calls].count('batch') == 1
+        assert _async_scoping._CLOSE_UNFINISHED_NOTE not in getattr(fault, '__notes__', ())
+        assert _async_scoping._CLOSE_UNFINISHED_RESTAGE_NOTE not in getattr(fault, '__notes__', ())
+
+    asyncio.run(scenario())
+
+
+def test_commit_on_success_reports_unfinished_close(
+    fake_async_sg: FakeAsyncShotgun,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        engine, factory = await _make_factory(fake_async_sg, tmp_path)
+        monkeypatch.setattr(
+            _uow,
+            '_install_accepted_identities',
+            inject_faults(_uow._install_accepted_identities, repeat(RuntimeError('persistent'))),
+        )
+        monkeypatch.setattr(
+            _uow,
+            '_mark_outdated',
+            inject_faults(_uow._mark_outdated, [RuntimeError('release failed')]),
+        )
+        created = [engine.entities.Sequence.new(code=f'created-{index}') for index in range(2)]
+
+        async def stage(session: AsyncSession) -> None:
+            for obj in created:
+                session.add(obj)
+
+        with pytest.raises(CommitError) as excinfo:
+            await _run_commit_on_success(factory, stage)
+
+        notes = excinfo.value.__notes__
+        assert 'sgalchemy: AsyncSession.close() also failed: RuntimeError: release failed' in notes
+        assert _async_scoping._CLOSE_UNFINISHED_RESTAGE_NOTE in notes
+        assert _async_scoping._COMMIT_FAILURE_CLOSE_NOTE not in notes
 
     asyncio.run(scenario())
 
 
 def test_commit_on_success_wraps_schema_preparation_failure_without_replanning(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -1019,7 +1256,7 @@ def test_commit_on_success_wraps_schema_preparation_failure_without_replanning(
         factory = async_sessionmaker(destination)
         pending = source.entities.Shot.new(code='cold staged intent')
         fault = RuntimeError('schema preparation failed')
-        destination_sg._errors['schema_read'] = [fault]
+        destination_sg.errors['schema_read'] = [fault]
 
         async def stage(session: AsyncSession) -> None:
             session.add(pending)
@@ -1034,15 +1271,15 @@ def test_commit_on_success_wraps_schema_preparation_failure_without_replanning(
         assert error.indeterminate == []
         assert error.withdrawn == []
         assert_disjoint_commit_outcome(error)
-        assert [name for name, _args, _kwargs in destination_sg._calls].count('schema_read') == 1
-        assert not any(name == 'batch' for name, _args, _kwargs in destination_sg._calls)
+        assert [name for name, _args, _kwargs in destination_sg.calls].count('schema_read') == 1
+        assert not any(name == 'batch' for name, _args, _kwargs in destination_sg.calls)
         assert entity_state(pending).session is None
 
     asyncio.run(scenario())
 
 
 def test_commit_on_success_wraps_sole_batch_failure_reports_unsent(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1064,8 +1301,12 @@ def test_commit_on_success_wraps_sole_batch_failure_reports_unsent(
 
         error = excinfo.value
         assert error.__cause__ is fault
-        assert error.__notes__.count(_uow._BATCH_UNSENT_NOTE) == 1
-        assert _uow.SOLE_BATCH_STAGED_NOTE not in error.__notes__
+        assert error.__notes__ == [
+            STAGED_RETRY_NOTE,
+            'sgalchemy: failed during batch wave 1 chunk 1',
+            _uow._BATCH_UNSENT_NOTE,
+            _async_scoping._COMMIT_FAILURE_CLOSE_NOTE,
+        ]
         assert error.committed == []
         assert len(error.staged) == 1
         staged = error.staged[0]
@@ -1074,26 +1315,21 @@ def test_commit_on_success_wraps_sole_batch_failure_reports_unsent(
         assert error.indeterminate == []
         assert error.withdrawn == []
         assert_disjoint_commit_outcome(error)
-        assert [name for name, _args, _kwargs in fake_async_sg._calls].count('batch') == 0
+        assert [name for name, _args, _kwargs in fake_async_sg.calls].count('batch') == 0
         assert entity_state(pending).session is None
         assert not entity_state(pending).dirty
-        assert any(
-            'if this session remains open and usable, a later commit may retry' in note
-            for note in error.__notes__
-        )
-        assert any('explicitly restage' in note for note in error.__notes__)
 
     asyncio.run(scenario())
 
 
 def test_commit_on_success_wraps_sole_batch_failure_with_failure_time_evidence(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
         engine, factory = await _make_factory(fake_async_sg, tmp_path)
         fault = RuntimeError('sole batch fault')
-        fake_async_sg._errors['batch'] = [fault]
+        fake_async_sg.errors['batch'] = [fault]
         pending = engine.entities.Shot.new(code='unsent')
 
         async def stage(session: AsyncSession) -> None:
@@ -1104,8 +1340,16 @@ def test_commit_on_success_wraps_sole_batch_failure_with_failure_time_evidence(
 
         error = excinfo.value
         assert error.__cause__ is fault
-        assert error.__notes__.count(_uow._BATCH_OUTCOME_UNKNOWN_NOTE) == 1
-        assert _uow.SOLE_BATCH_STAGED_NOTE not in error.__notes__
+        assert error.__notes__ == [
+            STAGED_RETRY_NOTE,
+            'sgalchemy: failed during batch wave 1 chunk 1',
+            _uow._BATCH_OUTCOME_UNKNOWN_NOTE,
+            _async_scoping._COMMIT_FAILURE_CLOSE_NOTE,
+        ]
+        cause_notes = getattr(fault, '__notes__', [])
+        assert _uow.SOLE_BATCH_STAGED_NOTE not in cause_notes
+        assert 'sgalchemy: failed during batch wave 1 chunk 1' not in cause_notes
+        assert _uow._BATCH_OUTCOME_UNKNOWN_NOTE not in cause_notes
         assert error.committed == []
         assert len(error.staged) == 1
         staged = error.staged[0]
@@ -1114,21 +1358,16 @@ def test_commit_on_success_wraps_sole_batch_failure_with_failure_time_evidence(
         assert error.indeterminate == []
         assert error.withdrawn == []
         assert_disjoint_commit_outcome(error)
-        assert [name for name, _args, _kwargs in fake_async_sg._calls].count('batch') == 1
+        assert [name for name, _args, _kwargs in fake_async_sg.calls].count('batch') == 1
         assert entity_state(pending).session is None
         assert not entity_state(pending).dirty
-        assert any(
-            'if this session remains open and usable, a later commit may retry' in note
-            for note in error.__notes__
-        )
-        assert any('explicitly restage' in note for note in error.__notes__)
 
     asyncio.run(scenario())
 
 
 @pytest.mark.parametrize('cleanup', ['close', 'context', 'rollback'])
 def test_explicit_cleanup_does_not_emit_automatic_warning(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
     cleanup: str,
@@ -1170,7 +1409,7 @@ def test_explicit_cleanup_does_not_emit_automatic_warning(
 
 
 def test_remove_is_early_idempotent_and_recreation_gets_fresh_cleanup(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -1186,7 +1425,7 @@ def test_remove_is_early_idempotent_and_recreation_gets_fresh_cleanup(
             current_task = asyncio.current_task()
             assert current_task is not None
             entries = object.__getattribute__(scoped, '_sessions')
-            stale_callback = entries[current_task]._callback
+            stale_callback = entries[current_task].callback
             await scoped.remove()
             await scoped.remove()
             second = scoped()
@@ -1240,7 +1479,7 @@ def test_scoped_remove_forgets_before_awaiting_close() -> None:
 
 
 def test_scoped_session_dynamic_fallback_delegates_unknown_public_method(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1352,7 +1591,7 @@ def test_scoped_session_underscore_probes_do_not_allocate() -> None:
     assert factory_calls == 0
 
 
-def test_scoped_sessions_are_task_local(fake_async_sg: _FakeAsyncShotgun, tmp_path: Path) -> None:
+def test_scoped_sessions_are_task_local(fake_async_sg: FakeAsyncShotgun, tmp_path: Path) -> None:
     async def scenario() -> None:
         engine = isolated_async_engine(fake_async_sg, tmp_path)
         scoped = async_scoped_session(async_sessionmaker(engine))
@@ -1379,11 +1618,45 @@ def test_scoped_sessions_are_task_local(fake_async_sg: _FakeAsyncShotgun, tmp_pa
         await asyncio.sleep(0)
         await engine.dispose()
 
+    run_async(scenario())
+
+
+def test_scoped_writes_forward_operations_and_batch_size(
+    fake_async_sg: FakeAsyncShotgun, tmp_path: Path
+) -> None:
+    async def scenario() -> None:
+        engine = isolated_async_engine(fake_async_sg, tmp_path)
+        await engine.load_schema()
+        scoped = async_scoped_session(async_sessionmaker(engine))
+        first = scoped.merge_dict({'type': 'Shot', 'id': 1})
+        second = scoped.merge_dict({'type': 'Shot', 'id': 2})
+        try:
+            scoped.delete(first)
+            scoped.delete(second)
+            await scoped.commit(batch_size=1)
+
+            assert [args[0] for name, args, _ in fake_async_sg.calls if name == 'batch'] == [
+                [{'request_type': 'delete', 'entity_type': 'Shot', 'entity_id': 1}],
+                [{'request_type': 'delete', 'entity_type': 'Shot', 'entity_id': 2}],
+            ]
+            assert entity_state(first).deleted is True
+            assert entity_state(second).deleted is True
+
+            scoped.revive(first)
+            await scoped.commit()
+
+            assert ('revive', ('Shot', 1), {}) in fake_async_sg.calls
+            assert entity_state(first).deleted is False
+            assert entity_state(second).deleted is True
+        finally:
+            await scoped.remove()
+            await engine.dispose()
+
     asyncio.run(scenario())
 
 
 def test_sessionmaker_has_no_begin_and_probe_does_not_allocate_or_perform_io(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     engine = create_async_engine(
@@ -1393,14 +1666,14 @@ def test_sessionmaker_has_no_begin_and_probe_does_not_allocate_or_perform_io(
         bind_default=False,
     )
     factory = async_sessionmaker(engine)
-    calls_before = list(fake_async_sg._calls)
+    calls_before = list(fake_async_sg.calls)
 
     assert not hasattr(factory, 'begin')
-    assert fake_async_sg._calls == calls_before
+    assert fake_async_sg.calls == calls_before
 
 
 def test_sessionmaker_rejects_defaults_and_creates_independent_sessions(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     engine = create_async_engine(
@@ -1417,30 +1690,6 @@ def test_sessionmaker_rejects_defaults_and_creates_independent_sessions(
     assert first is not second
     assert first.engine is engine
     assert second.engine is engine
-    assert first._state is not second._state
+    assert first.state is not second.state
     with pytest.raises(TypeError):
         cast('Any', async_sessionmaker)(engine, unsupported=True)
-
-
-def test_task_completion_reverts_and_detaches_without_remove(
-    fake_async_sg: _FakeAsyncShotgun,
-    tmp_path: Path,
-) -> None:
-    async def scenario() -> None:
-        engine = isolated_async_engine(fake_async_sg, tmp_path)
-        await engine.load_schema()
-        scoped = async_scoped_session(async_sessionmaker(engine))
-
-        async def worker() -> Entity:
-            shot = scoped().merge_dict({'type': 'Shot', 'id': 1, 'code': 'old'})
-            shot.code = 'new'
-            return shot
-
-        task = asyncio.create_task(worker(), name='dirty-worker')
-        shot = await task
-        await asyncio.sleep(0)
-
-        assert entity_state(shot).session is None
-        assert entity_state(shot).loaded['code'] == 'old'
-
-    asyncio.run(scenario())

@@ -1,5 +1,4 @@
 import pytest
-from _support import mapped_entity
 
 from sgalchemy._core import _expressions as ex
 from sgalchemy._core._compiler import SummarizeCall, compile_statement
@@ -8,6 +7,7 @@ from sgalchemy._core._registry import Entity
 from sgalchemy._core._statement import Select, select
 from sgalchemy._errors import CompilationError
 from sgalchemy.schema import _model
+from tests._support import mapped_entity
 
 
 @mapped_entity('Asset')

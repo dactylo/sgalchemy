@@ -9,30 +9,22 @@ from pathlib import Path
 
 from sgalchemy._core._registry import entity_reserved_attribute_names
 from sgalchemy._errors import SgalchemyError
+from sgalchemy._shotgun import THUMBNAIL_COUPLED_CLEAR_FIELD, THUMBNAIL_UPLOAD_METHODS
 from sgalchemy._stubgen_registry import render_registry_stub
 from sgalchemy.schema import _aliases, _model
 from sgalchemy.schema._cache import SchemaCache
 
 _HASH_PREFIX = '# sgalchemy-stubs schema-hash: '
-_IMAGE_READ_TYPE = 'str | os.PathLike[str] | os.PathLike[bytes] | None'
-_IMAGE_WRITE_TYPES = {
-    'image': 'str | os.PathLike[str] | os.PathLike[bytes] | None',
-    'filmstrip_image': 'str | os.PathLike[str] | os.PathLike[bytes]',
-}
+_IMAGE_PATH_TYPE = 'str | os.PathLike[str] | os.PathLike[bytes]'
+_IMAGE_READ_TYPE = f'{_IMAGE_PATH_TYPE} | None'
 
 
 @dataclass(frozen=True)
-class StubReport:
-    """Result of generating one complete stub package.
-
-    Attributes:
-        written: Paths to generated stub files.
-        skipped_aliases: Reports for aliases that could not be generated.
-    """
+class _StubReport:
+    """Record the files written and aliases skipped during stub generation."""
 
     written: list[Path]
     skipped_aliases: list[str]
-    _hash: str
 
 
 def _header(digest: str) -> str:
@@ -58,7 +50,7 @@ def _render_field_type(
     schemas: dict[str, _model.EntitySchema],
 ) -> tuple[str, str | None]:
     """Render a field value annotation and its optional entity import."""
-    if field.code in _IMAGE_WRITE_TYPES:
+    if field.code in THUMBNAIL_UPLOAD_METHODS:
         return _IMAGE_READ_TYPE, None
     if field.data_type in {'entity', 'multi_entity'}:
         target = field.valid_types[0] if len(field.valid_types) == 1 else None
@@ -82,7 +74,7 @@ def _render_types_stub(header: str) -> str:
         "_WriteT_contra = TypeVar('_WriteT_contra', contravariant=True)\n"
         '\n'
         '\n'
-        'class _SGField(Generic[_ReadT_co, _WriteT_contra]):\n'
+        'class SGField(Generic[_ReadT_co, _WriteT_contra]):\n'
         '    @overload\n'
         '    def __get__(self, obj: None, owner: type) -> FieldExpr: ...\n'
         '    @overload\n'
@@ -92,10 +84,15 @@ def _render_types_stub(header: str) -> str:
 
 
 def _render_write_type(field: _model.FieldSchema, read_type: str) -> str:
-    """Render the statically supported field assignment type."""
-    if field.code == 'id' or (field.data_type == 'image' and field.code not in _IMAGE_WRITE_TYPES):
+    """Render the field assignment type that runtime validation accepts."""
+    if field.code in THUMBNAIL_UPLOAD_METHODS:
+        # Clearing the coupled filmstrip alone is rejected; image=None clears both.
+        if field.code == THUMBNAIL_COUPLED_CLEAR_FIELD:
+            return _IMAGE_PATH_TYPE
+        return _IMAGE_READ_TYPE
+    if field.code == 'id' or field.data_type == 'image' or not field.editable:
         return 'Never'
-    return _IMAGE_WRITE_TYPES.get(field.code, read_type)
+    return read_type
 
 
 def _render_annotations(
@@ -209,7 +206,7 @@ def _render_entity_stub(
         f'from sgalchemy.entities._{_snake_type_name(target)} import {target}'
         for target in sorted(referenced_types)
     )
-    imports.append('from sgalchemy.entities._types import _SGField')
+    imports.append('from sgalchemy.entities._types import SGField as _SGField')
 
     body = [f'class {schema.type_name}(Entity):']
     body.extend(
@@ -242,6 +239,8 @@ def _render_init_stub(
     if aliases:
         lines.append('')
         lines.extend(f'{alias} = {target}' for alias, target in sorted(aliases.items()))
+    lines.append('')
+    lines.append(f'__all__ = {[*sorted(schemas), *sorted(aliases)]!r}')
     return f'{header}\n' + '\n'.join(lines) + '\n'
 
 
@@ -252,7 +251,7 @@ def _render_stubs(
     entity_aliases: bool,
     field_aliases: bool,
     permissive: bool,
-) -> tuple[dict[Path, str], list[str], str]:
+) -> tuple[dict[Path, str], list[str]]:
     """Render one complete deterministic stub package without writing it."""
     digest = _schema_hash(
         cache,
@@ -286,7 +285,7 @@ def _render_stubs(
         )
         rendered[entity_paths[type_name]] = text
         skipped_aliases.extend(field_reports)
-    return rendered, skipped_aliases, digest
+    return rendered, skipped_aliases
 
 
 def check_stubs(
@@ -307,13 +306,13 @@ def check_stubs(
         permissive: Whether generated classes should accept unknown attributes.
 
     Returns:
-        True when every expected entity and registry stub matches the rendered
-        tree byte for byte, with no obsolete entity stubs. Read or render
-        failures return False.
+        `True` when every expected entity and registry stub matches the
+        rendered tree byte for byte, with no obsolete entity stubs. Read or
+        render failures return `False`.
     """
     entities_dir = out / 'sgalchemy' / 'entities'
     try:
-        rendered, _skipped_aliases, _digest = _render_stubs(
+        rendered, _skipped_aliases = _render_stubs(
             cache,
             entities_dir,
             entity_aliases=entity_aliases,
@@ -338,7 +337,7 @@ def generate_stubs(
     entity_aliases: bool = True,
     field_aliases: bool = True,
     permissive: bool = False,
-) -> StubReport:
+) -> _StubReport:
     """Generate a complete deterministic entity stub package.
 
     Generation owns every `.pyi` beneath `out/sgalchemy/entities` and the
@@ -362,7 +361,7 @@ def generate_stubs(
         OSError: If generated files cannot be created, removed, or written.
     """
     entities_dir = out / 'sgalchemy' / 'entities'
-    rendered, skipped_aliases, digest = _render_stubs(
+    rendered, skipped_aliases = _render_stubs(
         cache,
         entities_dir,
         entity_aliases=entity_aliases,
@@ -378,4 +377,4 @@ def generate_stubs(
     for path in written:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(rendered[path].encode('utf-8'))
-    return StubReport(written=written, skipped_aliases=skipped_aliases, _hash=digest)
+    return _StubReport(written=written, skipped_aliases=skipped_aliases)

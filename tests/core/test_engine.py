@@ -1,5 +1,6 @@
 import copy
 import gc
+import logging
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -11,12 +12,10 @@ from typing import Any, Never, cast
 from unittest.mock import MagicMock, Mock
 
 import pytest
-from _fakes import _FakeAsyncShotgun, _FakeShotgun, _FakeShotgunFactory
-from _support import AUTHENTICATION_FAULT, STATIC_FORMS
 
 from sgalchemy._core import _engine
 from sgalchemy._core._compiler import FindCall, SummarizeCall
-from sgalchemy._core._engine import Engine, create_engine
+from sgalchemy._core._engine import Engine, _ThreadSlot, create_engine
 from sgalchemy._core._engine_common import AUTH_RECOVERY_NOTE, CallProgress
 from sgalchemy._core._registry import Registry, default_registry, entity_type
 from sgalchemy._errors import SgalchemyError
@@ -24,7 +23,13 @@ from sgalchemy._shotgun import AsyncClosableShotgunLike, ClosableShotgunLike
 from sgalchemy.schema._cache import SchemaCache, load_cache, store_cache
 from sgalchemy.schema._cachedir import cache_file
 from sgalchemy.schema._policy import TTLPolicy
+from tests._fakes import FakeAsyncShotgun, FakeShotgun, FakeShotgunFactory
+from tests._support import AUTHENTICATION_FAULT, STATIC_FORMS, break_provider_import
 
+_NOT_CACHED = (
+    '; using the fetched schema without caching it. Set SGALCHEMY_SCHEMA_CACHE or pass '
+    'cache_root= to use a writable directory'
+)
 _PROVIDER_AUTH_ERROR: type[Exception] = type('ProviderAuthError', (AUTHENTICATION_FAULT,), {})
 _SCHEMA_FAULT_CASES: list[tuple[str, Exception, tuple[Any, ...], bool]] = [
     ('find', RuntimeError('unknown field'), ('Shot', [], ['id']), True),
@@ -36,7 +41,7 @@ _SCHEMA_FAULT_CASES: list[tuple[str, Exception, tuple[Any, ...], bool]] = [
 ]
 
 
-class _CountingShotgun(_FakeShotgun):
+class _CountingShotgun(FakeShotgun):
     def __init__(self) -> None:
         super().__init__()
         self._close_calls = 0
@@ -48,7 +53,18 @@ class _CountingShotgun(_FakeShotgun):
             close_call = self._close_calls
         if close_call == 1:
             raise RuntimeError('close failed')
-        self._closed = True
+        self.closed = True
+
+
+class _InfoShotgun(FakeShotgun):
+    def __init__(self, server_info: object) -> None:
+        super().__init__()
+        self._server_info = server_info
+        self.info_calls = 0
+
+    def info(self) -> object:
+        self.info_calls += 1
+        return self._server_info
 
 
 class _SequencedLock:
@@ -87,8 +103,32 @@ class _SequencedLock:
                 self._retry_scanned.set()
 
 
+def _blocked_root(tmp_path: Path) -> Path:
+    blocker = tmp_path / 'not-a-directory'
+    blocker.write_text('')
+    return blocker
+
+
+def test_auth_fault_while_loading_schema_carries_one_recovery_note(tmp_path: Path) -> None:
+    def creator() -> ClosableShotgunLike:
+        raise AUTHENTICATION_FAULT('expired')
+
+    engine = create_engine(
+        'https://fake.example.com', creator=creator, cache_root=tmp_path, bind_default=False
+    )
+    with pytest.raises(AUTHENTICATION_FAULT) as excinfo:
+        engine.load_schema()
+    assert getattr(excinfo.value, '__notes__', []).count(AUTH_RECOVERY_NOTE) == 1
+
+
+def test_cache_serialization_errors_still_propagate(tmp_path: Path) -> None:
+    connection = _InfoShotgun({'opaque': object()})
+    with pytest.raises(TypeError, match='is not JSON serializable'):
+        create_engine(connection=connection, cache_root=tmp_path, bind_default=False).load_schema()
+
+
 def test_call_progress_excludes_echo_failure(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     engine = create_engine(connection=fake_sg, echo=True, bind_default=False)
@@ -103,11 +143,11 @@ def test_call_progress_excludes_echo_failure(
         engine.call_with_progress('upload_thumbnail', ('Shot', 90, 'image.jpg'), {}, observation)
     assert excinfo.value is fault
     assert not observation.invoked.is_set()
-    assert fake_sg._calls == []
+    assert fake_sg.calls == []
 
 
 def test_call_progress_marks_only_resolved_provider_entry(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     engine = create_engine(connection=fake_sg, bind_default=False)
@@ -137,7 +177,7 @@ def test_concurrent_close_retry_does_not_retain_closed_slot() -> None:
     client = _CountingShotgun()
 
     def creator() -> ClosableShotgunLike:
-        return cast('ClosableShotgunLike', client)
+        return client
 
     engine = create_engine('https://fake.example.com', creator=creator)
     _ = engine.connection
@@ -166,7 +206,7 @@ def test_concurrent_close_retry_does_not_retain_closed_slot() -> None:
     assert not retrying.is_alive()
     assert len(failures) == 1
     assert str(failures[0]) == 'close failed'
-    assert client._closed is True
+    assert client.closed is True
     assert client._close_calls == 2
     engine.dispose()
     assert vars(engine)['_retired_slots'] == set()
@@ -190,18 +230,18 @@ def test_connection_property_attaches_auth_note_when_creator_rejects() -> None:
 
 
 def test_connection_property_returns_fresh_client_after_dispose() -> None:
-    factory: Any = _FakeShotgunFactory()
+    factory = FakeShotgunFactory()
     engine = create_engine('https://fake.example.com', creator=factory)
     first = engine.connection
     engine.dispose()
     second = engine.connection
     assert second is not first
-    assert factory._instances[0]._closed is True
-    assert factory._instances[1]._closed is False
+    assert factory.instances[0].closed is True
+    assert factory.instances[1].closed is False
 
 
 def test_construction_and_properties_are_lazy(
-    fake_sg: _FakeShotgun, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    fake_sg: FakeShotgun, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delitem(sys.modules, 'shotgun_api3', raising=False)
     created = create_engine(
@@ -212,28 +252,28 @@ def test_construction_and_properties_are_lazy(
     with pytest.raises(SgalchemyError, match='load_schema'):
         _ = created.schema
     assert 'shotgun_api3' not in sys.modules
-    assert fake_sg._calls == []
+    assert fake_sg.calls == []
 
 
 def test_create_engine_accepts_creator_with_url() -> None:
-    fake: Any = _FakeShotgun()
+    fake = FakeShotgun()
     engine = create_engine('https://fake.example.com', creator=lambda: fake)
     assert engine.connection is fake
 
 
 def test_create_engine_accepts_http_for_caller_owned_sources(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
 ) -> None:
     fake_sg.base_url = 'http://caller.example.com'
     supplied = create_engine(connection=fake_sg)
-    created = _FakeShotgun()
+    created = FakeShotgun()
     created.base_url = 'http://caller.example.com'
     creator_calls = 0
 
     def creator() -> ClosableShotgunLike:
         nonlocal creator_calls
         creator_calls += 1
-        return cast('ClosableShotgunLike', created)
+        return created
 
     owned = create_engine('http://caller.example.com', creator=creator)
 
@@ -265,15 +305,24 @@ def test_create_engine_accepts_session_token(monkeypatch: pytest.MonkeyPatch) ->
     assert recorded == {'base_url': 'https://x.example.com', 'session_token': 'tok'}
 
 
+def test_create_engine_rejects_an_async_connection(fake_async_sg: FakeAsyncShotgun) -> None:
+    with pytest.raises(TypeError) as excinfo:
+        create_engine(connection=fake_async_sg)  # pyright: ignore[reportArgumentType]
+    assert str(excinfo.value) == (
+        'connection= received an async client; pass it to create_async_engine(connection=...) '
+        'instead'
+    )
+
+
 def test_create_engine_rejects_connection_with_creator() -> None:
-    connection: Any = _FakeShotgun()
-    creator: Any = _FakeShotgun
+    connection: Any = FakeShotgun()
+    creator: Any = FakeShotgun
     with pytest.raises(ValueError, match='combined'):
         create_engine(connection=connection, creator=creator)
 
 
 def test_create_engine_rejects_creator_without_url_or_with_credentials() -> None:
-    creator: Any = _FakeShotgun
+    creator: Any = FakeShotgun
     value = 'tok'
     with pytest.raises(ValueError, match='exactly one'):
         create_engine(creator=creator)
@@ -324,8 +373,6 @@ def test_create_engine_static_credentials_require_https(
     [
         {'session_token': 'tok', 'script_name': 'a', 'api_key': 'b'},
         {'session_token': ''},
-        {'script_name': 'a'},
-        {},
     ],
 )
 def test_create_engine_rejects_invalid_url_credentials(kwargs: dict[str, Any]) -> None:
@@ -336,12 +383,12 @@ def test_create_engine_rejects_invalid_url_credentials(kwargs: dict[str, Any]) -
 def test_creator_rejects_async_client_before_publication(
     recwarn: pytest.WarningsRecorder,
 ) -> None:
-    created: list[_FakeAsyncShotgun] = []
+    created: list[FakeAsyncShotgun] = []
 
     def make() -> AsyncClosableShotgunLike:
-        client = _FakeAsyncShotgun()
+        client = FakeAsyncShotgun()
         created.append(client)
-        return cast('AsyncClosableShotgunLike', client)
+        return client
 
     engine = create_engine('https://fake.example.com', creator=cast('Any', make))
 
@@ -351,8 +398,8 @@ def test_creator_rejects_async_client_before_publication(
 
     gc.collect()
     assert len(created) == 2
-    assert all(client._closed is False for client in created)
-    assert all(client._calls == [] for client in created)
+    assert all(client.closed is False for client in created)
+    assert all(client.calls == [] for client in created)
     assert not [warning for warning in recwarn if issubclass(warning.category, RuntimeWarning)]
     engine.dispose()
 
@@ -366,16 +413,16 @@ def test_credential_connections_are_owned_and_reused_per_thread(
     class RecordingShotgun:
         def __init__(self, base_url: str, *, script_name: str | None, api_key: str | None) -> None:
             self.base_url = base_url
-            self._credentials = script_name, api_key
-            self._thread_ids: list[int] = []
+            self.credentials = script_name, api_key
+            self.thread_ids: list[int] = []
             instances.append(self)
 
         def schema_entity_read(self) -> dict[str, Any]:
-            self._thread_ids.append(get_ident())
+            self.thread_ids.append(get_ident())
             return {}
 
         def schema_read(self) -> dict[str, Any]:
-            self._thread_ids.append(get_ident())
+            self.thread_ids.append(get_ident())
             barrier.wait(timeout=2)
             return {}
 
@@ -393,13 +440,13 @@ def test_credential_connections_are_owned_and_reused_per_thread(
         for future in futures:
             future.result(timeout=2)
     assert len(instances) == 2
-    assert all(instance._credentials == ('s', 'k') for instance in instances)
-    assert all(len(instance._thread_ids) == 2 for instance in instances)
-    assert all(len(set(instance._thread_ids)) == 1 for instance in instances)
+    assert all(instance.credentials == ('s', 'k') for instance in instances)
+    assert all(len(instance.thread_ids) == 2 for instance in instances)
+    assert all(len(set(instance.thread_ids)) == 1 for instance in instances)
 
 
 def test_dead_thread_slot_finalizer_closes_owned_client() -> None:
-    factory: Any = _FakeShotgunFactory()
+    factory = FakeShotgunFactory()
     engine = create_engine('https://fake.example.com', creator=factory)
 
     def worker() -> None:
@@ -408,58 +455,58 @@ def test_dead_thread_slot_finalizer_closes_owned_client() -> None:
     thread = threading.Thread(target=worker)
     thread.start()
     thread.join(timeout=5)
-    client = factory._instances[0]
+    client = factory.instances[0]
     del thread
     gc.collect()
-    assert client._closed is True
+    assert client.closed is True
 
 
 def test_dead_thread_slot_finalizer_failure_is_retained_for_dispose_retry() -> None:
-    factory: Any = _FakeShotgunFactory()
+    factory = FakeShotgunFactory()
     engine = create_engine('https://fake.example.com', creator=factory)
 
     def worker() -> None:
         engine.call('schema_read')
-        factory._instances[0]._close_errors.append(RuntimeError('finalizer close failed'))
+        factory.instances[0].close_errors.append(RuntimeError('finalizer close failed'))
 
     thread = threading.Thread(target=worker)
     thread.start()
     thread.join(timeout=5)
-    client = factory._instances[0]
+    client = factory.instances[0]
     del thread
     gc.collect()
-    assert client._close_errors == []
-    assert client._closed is False
+    assert client.close_errors == []
+    assert client.closed is False
     engine.dispose()
-    assert client._closed is True
+    assert client.closed is True
 
 
 def test_dispose_close_failure_propagates_and_retry_closes_the_rest() -> None:
-    factory: Any = _FakeShotgunFactory()
+    factory = FakeShotgunFactory()
     engine = create_engine('https://fake.example.com', creator=factory)
     engine.call('schema_read')
-    failing = factory._instances[0]
-    failing._close_errors.append(RuntimeError('close failed'))
+    failing = factory.instances[0]
+    failing.close_errors.append(RuntimeError('close failed'))
     with pytest.raises(RuntimeError, match='close failed'):
         engine.dispose()
     engine.dispose()
-    assert failing._closed is True
+    assert failing.closed is True
 
 
 def test_dispose_closes_idle_owned_clients_and_engine_stays_usable() -> None:
-    factory: Any = _FakeShotgunFactory()
+    factory = FakeShotgunFactory()
     engine = create_engine('https://fake.example.com', creator=factory)
     engine.call('schema_read')
-    first = factory._instances[0]
+    first = factory.instances[0]
     engine.dispose()
-    assert first._closed is True
+    assert first.closed is True
     engine.call('schema_read')
-    assert len(factory._instances) == 2
-    assert factory._instances[1]._closed is False
+    assert len(factory.instances) == 2
+    assert factory.instances[1].closed is False
 
 
 def test_dispose_defers_close_of_active_client_without_altering_outcome() -> None:
-    factory: Any = _FakeShotgunFactory()
+    factory = FakeShotgunFactory()
     engine = create_engine('https://fake.example.com', creator=factory)
     entered = threading.Event()
     release = threading.Event()
@@ -467,18 +514,18 @@ def test_dispose_defers_close_of_active_client_without_altering_outcome() -> Non
 
     def worker() -> None:
         engine.call('schema_read')
-        worker_client = factory._instances[0]
-        worker_client._block_next('find', entered=entered, release=release)
+        worker_client = factory.instances[0]
+        worker_client.block_next('find', entered=entered, release=release)
         result.append(engine.call('find', 'Shot', []))
 
     thread = threading.Thread(target=worker)
     try:
         thread.start()
         assert entered.wait(timeout=5)
-        client = factory._instances[0]
+        client = factory.instances[0]
         engine.dispose()
-        assert client._closed is False
-        client._close_errors.append(RuntimeError('deferred close failed'))
+        assert client.closed is False
+        client.close_errors.append(RuntimeError('deferred close failed'))
     finally:
         release.set()
         if thread.ident is not None:
@@ -486,22 +533,22 @@ def test_dispose_defers_close_of_active_client_without_altering_outcome() -> Non
         engine.dispose()
     assert not thread.is_alive()
     assert result == [[]]
-    assert client._closed is True
+    assert client.closed is True
 
 
 def test_dispose_is_idempotent_and_never_closes_supplied_connections(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
 ) -> None:
     engine = create_engine(connection=fake_sg)
     engine.dispose()
     engine.dispose()
-    assert fake_sg._closed is False
+    assert fake_sg.closed is False
 
 
-def test_engine_call_attaches_auth_note_for_direct_users(fake_sg: _FakeShotgun) -> None:
+def test_engine_call_attaches_auth_note_for_direct_users(fake_sg: FakeShotgun) -> None:
     engine = create_engine(connection=fake_sg)
     fault = _PROVIDER_AUTH_ERROR('rejected')
-    fake_sg._errors.setdefault('find', []).append(fault)
+    fake_sg.errors.setdefault('find', []).append(fault)
 
     with pytest.raises(_PROVIDER_AUTH_ERROR) as excinfo:
         engine.call('find', 'Shot', [])
@@ -549,7 +596,7 @@ def test_engine_call_does_not_mark_schema_stale_when_creator_setup_looks_schema_
     assert not marked
 
 
-def test_engine_registry_is_read_only(fake_sg: _FakeShotgun) -> None:
+def test_engine_registry_is_read_only(fake_sg: FakeShotgun) -> None:
     created = create_engine(
         connection=fake_sg,
         registry=Registry(),
@@ -588,7 +635,7 @@ def test_engine_rejects_invalid_connection_and_credential_combinations(
     ],
 )
 def test_engine_rejects_malformed_live_schema_without_publication_or_cache_update(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     malformed_shape: str,
     monkeypatch: pytest.MonkeyPatch,
     schema_fixture: dict[str, Any],
@@ -630,7 +677,7 @@ def test_engine_rejects_malformed_live_schema_without_publication_or_cache_updat
 
 
 def test_engine_schema_reads_through_shared_registry_refresh(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     schema_fixture: dict[str, Any],
     tmp_path: Path,
@@ -668,12 +715,12 @@ def test_engine_schema_reads_through_shared_registry_refresh(
 
 
 def test_engine_schema_refresh_normalizes_non_dictionary_server_info(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     def info() -> list[str]:
-        fake_sg._record('info')
+        fake_sg.record('info')
         return ['8.64.0']
 
     monkeypatch.setattr(fake_sg, 'info', info, raising=False)
@@ -689,10 +736,10 @@ def test_engine_schema_refresh_normalizes_non_dictionary_server_info(
     cached = load_cache(cache_file(fake_sg.base_url, root=tmp_path))
     assert cached is not None
     assert cached.server_info is None
-    assert [name for name, _, _ in fake_sg._calls] == [
+    assert [name for name, _, _ in fake_sg.calls] == [
+        'info',
         'schema_read',
         'schema_entity_read',
-        'info',
     ]
 
 
@@ -704,7 +751,7 @@ def test_engine_schema_refresh_normalizes_non_dictionary_server_info(
     ],
 )
 def test_engine_schema_refresh_normalizes_unavailable_server_info(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     info_value: object | None,
@@ -723,21 +770,21 @@ def test_engine_schema_refresh_normalizes_unavailable_server_info(
     cached = load_cache(cache_file(fake_sg.base_url, root=tmp_path))
     assert cached is not None
     assert cached.server_info is None
-    assert [name for name, _, _ in fake_sg._calls] == [
+    assert [name for name, _, _ in fake_sg.calls] == [
         'schema_read',
         'schema_entity_read',
     ]
 
 
 def test_engine_schema_refresh_records_callable_server_info(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     server_info = {'version': [8, 64, 0]}
 
     def info() -> dict[str, Any]:
-        fake_sg._record('info')
+        fake_sg.record('info')
         return server_info
 
     monkeypatch.setattr(fake_sg, 'info', info, raising=False)
@@ -753,15 +800,15 @@ def test_engine_schema_refresh_records_callable_server_info(
     cached = load_cache(cache_file(fake_sg.base_url, root=tmp_path))
     assert cached is not None
     assert cached.server_info == server_info
-    assert [name for name, _, _ in fake_sg._calls] == [
+    assert [name for name, _, _ in fake_sg.calls] == [
+        'info',
         'schema_read',
         'schema_entity_read',
-        'info',
     ]
 
 
 def test_engine_valid_live_schema_publishes_and_updates_cache(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
     registry = Registry()
@@ -782,7 +829,7 @@ def test_engine_valid_live_schema_publishes_and_updates_cache(
 
 
 def test_execute_call_passes_exact_find_kwargs_and_echoes(
-    fake_sg: _FakeShotgun, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    fake_sg: FakeShotgun, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     created = create_engine(
         connection=fake_sg,
@@ -802,7 +849,7 @@ def test_execute_call_passes_exact_find_kwargs_and_echoes(
     )
     with caplog.at_level('INFO', logger='sgalchemy.engine'):
         created.execute_call(compiled)
-    assert fake_sg._calls[-1] == (
+    assert fake_sg.calls[-1] == (
         'find',
         ('Shot', [['code', 'is', 'AB']], ['id', 'code']),
         {
@@ -816,7 +863,7 @@ def test_execute_call_passes_exact_find_kwargs_and_echoes(
 
 
 def test_execute_call_preserves_summary_grouping_presence(
-    engine: Engine, fake_sg: _FakeShotgun, monkeypatch: pytest.MonkeyPatch
+    engine: Engine, fake_sg: FakeShotgun, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     summarize = Mock(wraps=fake_sg.summarize)
     monkeypatch.setattr(fake_sg, 'summarize', summarize)
@@ -849,23 +896,23 @@ def test_explicit_serialize_is_rejected_without_supplied_connection() -> None:
 
 
 def test_failed_close_is_retained_across_paths_until_disposal_retry() -> None:
-    factory: Any = _FakeShotgunFactory()
+    factory = FakeShotgunFactory()
     engine = create_engine('https://fake.example.com', creator=factory)
     engine.call('schema_read')
-    failing = factory._instances[0]
-    failing._close_errors.append(RuntimeError('close failed'))
-    failing._close_errors.append(RuntimeError('close failed again'))
+    failing = factory.instances[0]
+    failing.close_errors.append(RuntimeError('close failed'))
+    failing.close_errors.append(RuntimeError('close failed again'))
     with pytest.raises(RuntimeError, match='close failed'):
         engine.dispose()
     engine.call('schema_read')  # discards the stale slot quietly; failure retained
-    assert failing._closed is False
+    assert failing.closed is False
     engine.dispose()
-    assert failing._closed is True
-    assert len(factory._instances) == 2
+    assert failing.closed is True
+    assert len(factory.instances) == 2
 
 
 def test_failed_registry_bind_does_not_publish_schema(
-    fake_sg: _FakeShotgun, tmp_path: Path
+    fake_sg: FakeShotgun, tmp_path: Path
 ) -> None:
     registry = Registry()
     first = create_engine(
@@ -891,14 +938,14 @@ def test_failed_registry_bind_does_not_publish_schema(
 
 
 def test_fresh_disk_cache_uses_policy_without_backend(
-    fake_sg: _FakeShotgun, tmp_path: Path
+    fake_sg: FakeShotgun, tmp_path: Path
 ) -> None:
     cached = SchemaCache(
         fields=fake_sg.schema_read(),
         entities=fake_sg.schema_entity_read(),
         fetched_at=datetime.now(UTC),
     )
-    fake_sg._calls.clear()
+    fake_sg.calls.clear()
     store_cache(cache_file(fake_sg.base_url, root=tmp_path), cached)
     created = create_engine(
         connection=fake_sg,
@@ -908,10 +955,106 @@ def test_fresh_disk_cache_uses_policy_without_backend(
         bind_default=False,
     )
     assert 'Shot' in created.load_schema()
-    assert fake_sg._calls == []
+    assert fake_sg.calls == []
 
 
-def test_registry_selection(fake_sg: _FakeShotgun) -> None:
+def test_load_schema_probes_info_through_call_accounting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    connection = _InfoShotgun({'version': [8, 0, 0]})
+    engine = create_engine(
+        connection.base_url, creator=lambda: connection, cache_root=tmp_path, bind_default=False
+    )
+    acquired: list[_ThreadSlot] = []
+    released: list[_ThreadSlot] = []
+    acquire, release = Engine._acquire, Engine._release
+
+    def counting_acquire(self: Engine) -> _ThreadSlot:
+        slot = acquire(self)
+        acquired.append(slot)
+        return slot
+
+    def counting_release(self: Engine, slot: _ThreadSlot) -> None:
+        released.append(slot)
+        release(self, slot)
+
+    monkeypatch.setattr(Engine, '_acquire', counting_acquire)
+    monkeypatch.setattr(Engine, '_release', counting_release)
+    monkeypatch.setattr(Engine, 'connection', property(lambda _self: pytest.fail('raw read')))
+    engine.load_schema()
+    assert connection.info_calls == 1
+    assert len(acquired) == len(released) == 4
+    assert acquired == released
+    assert not connection.closed
+    engine.dispose()
+    assert connection.closed
+
+
+def test_load_schema_with_source_reports_fetch_reuse_and_write_failure(
+    fake_sg: FakeShotgun, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    load_schema_with_source = _engine.load_schema_with_source
+
+    def fresh(root: Path) -> Engine:
+        return create_engine(connection=fake_sg, cache_root=root, bind_default=False)
+
+    prepared = fresh(tmp_path)
+    first = load_schema_with_source(prepared, force=False)
+    assert (first.fetched, first.store_error) == (True, None)
+    assert first.path == cache_file('https://fake.example.com', root=tmp_path)
+    reused = load_schema_with_source(fresh(tmp_path), force=False)
+    assert reused.fetched is False
+    assert reused.cache.fetched_at == first.cache.fetched_at
+    with pytest.raises(RuntimeError, match='no schema load happened'):
+        load_schema_with_source(prepared, force=False)
+    forced = load_schema_with_source(prepared, force=True)
+    assert forced.fetched is True
+    with caplog.at_level(logging.WARNING, logger='sgalchemy.engine'):
+        failed = load_schema_with_source(fresh(_blocked_root(tmp_path)), force=False)
+    assert failed.fetched is True
+    assert isinstance(failed.store_error, OSError)
+    assert [r for r in caplog.records if r.name == 'sgalchemy.engine'] == []
+
+
+def test_missing_provider_dependency_keeps_its_original_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    break_provider_import(monkeypatch, 'provider_dependency')
+    engine = create_engine(
+        'https://fake.example.com',
+        session_token=tmp_path.name,
+        cache_root=tmp_path,
+        bind_default=False,
+    )
+    with pytest.raises(ModuleNotFoundError) as excinfo:
+        engine.load_schema()
+    assert excinfo.value.name == 'provider_dependency'
+    assert str(excinfo.value) == "No module named 'provider_dependency'"
+    assert excinfo.value.__cause__ is None
+
+
+def test_missing_provider_names_the_extras(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setitem(sys.modules, 'shotgun_api3', None)
+    engine = create_engine(
+        'https://fake.example.com',
+        session_token=tmp_path.name,
+        cache_root=tmp_path,
+        bind_default=False,
+    )
+    with pytest.raises(ModuleNotFoundError) as excinfo:
+        engine.load_schema()
+    assert excinfo.value.name == 'shotgun_api3'
+    assert str(excinfo.value) == (
+        'no SG API provider is installed; install sgalchemy with the official, api, or async '
+        'extra, or pass connection= or creator='
+    )
+    assert isinstance(excinfo.value.__cause__, ModuleNotFoundError)
+    assert excinfo.value.__cause__.name == 'shotgun_api3'
+
+
+def test_registry_selection(fake_sg: FakeShotgun) -> None:
     explicit = Registry()
     assert (
         create_engine(connection=fake_sg, registry=explicit, bind_default=False).registry
@@ -928,7 +1071,7 @@ def test_registry_selection(fake_sg: _FakeShotgun) -> None:
 )
 def test_schema_fault_classification(
     engine: Engine,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     case: tuple[str, Exception, tuple[Any, ...], bool],
 ) -> None:
@@ -940,14 +1083,14 @@ def test_schema_fault_classification(
         marked = True
 
     monkeypatch.setattr(engine, 'mark_schema_stale', mark)
-    fake_sg._errors[method] = [error]
+    fake_sg.errors[method] = [error]
     with pytest.raises(type(error), match=r'exist|field|entity'):
         engine.call(method, *args)
     assert marked is stale
 
 
 def test_schema_fault_marks_stale_after_serialization_unlock(
-    fake_sg: _FakeShotgun, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    fake_sg: FakeShotgun, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     owned = False
     marked = False
@@ -977,14 +1120,14 @@ def test_schema_fault_marks_stale_after_serialization_unlock(
     )
     created._call_lock = tracking_lock
     monkeypatch.setattr(created, 'mark_schema_stale', mark_stale)
-    fake_sg._find_error = RuntimeError('API read() Shot.made_up does not exist')
+    fake_sg.find_error = RuntimeError('API read() Shot.made_up does not exist')
     with pytest.raises(RuntimeError, match='made_up'):
         created.call('find', 'Shot', [], ['id'])
     assert marked
 
 
 def test_schema_load_cache_force_policy_and_stale_lifecycle(
-    engine: Engine, fake_sg: _FakeShotgun
+    engine: Engine, fake_sg: FakeShotgun
 ) -> None:
     first = engine.load_schema()
     assert first is engine.registry.schema_snapshot()
@@ -994,14 +1137,14 @@ def test_schema_load_cache_force_policy_and_stale_lifecycle(
     assert engine.load_binding() is engine.registry.binding_snapshot()
     assert entity_type(engine.entities.Shot) == 'Shot'
     engine.load_schema()
-    assert [name for name, _, _ in fake_sg._calls].count('schema_read') == 1
+    assert [name for name, _, _ in fake_sg.calls].count('schema_read') == 1
     engine.load_schema(force=True)
     engine.mark_schema_stale()
     engine.load_schema()
-    assert [name for name, _, _ in fake_sg._calls].count('schema_read') == 3
+    assert [name for name, _, _ in fake_sg.calls].count('schema_read') == 3
 
 
-def test_serialize_defaults_to_locked_for_supplied_connection(fake_sg: _FakeShotgun) -> None:
+def test_serialize_defaults_to_locked_for_supplied_connection(fake_sg: FakeShotgun) -> None:
     engine = create_engine(connection=fake_sg)
     assert engine._call_lock is not None
     relaxed = create_engine(connection=fake_sg, serialize=False)
@@ -1009,7 +1152,7 @@ def test_serialize_defaults_to_locked_for_supplied_connection(fake_sg: _FakeShot
 
 
 def test_stale_mark_is_not_lost_during_schema_load(
-    engine: Engine, fake_sg: _FakeShotgun, monkeypatch: pytest.MonkeyPatch
+    engine: Engine, fake_sg: FakeShotgun, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     entered = Event()
     release = Event()
@@ -1029,12 +1172,18 @@ def test_stale_mark_is_not_lost_during_schema_load(
         loading.result(timeout=2)
         marking.result(timeout=2)
     engine.load_schema()
-    assert [name for name, _, _ in fake_sg._calls].count('schema_read') == 2
+    assert [name for name, _, _ in fake_sg.calls].count('schema_read') == 2
+
+
+def test_string_cache_root_is_accepted(fake_sg: FakeShotgun, tmp_path: Path) -> None:
+    engine = create_engine(connection=fake_sg, cache_root=str(tmp_path), bind_default=False)
+    engine.load_schema()
+    assert cache_file(engine.site, root=tmp_path).exists()
 
 
 @pytest.mark.parametrize(('serialize', 'expected'), [(False, 2), (True, 1)])
 def test_supplied_connection_serialization(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -1083,14 +1232,14 @@ def test_supplied_connection_serialization(
 
 @pytest.mark.parametrize('invalid', [False, True])
 def test_call_progress_excludes_acquisition_and_validation_failure(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     invalid: bool,
 ) -> None:
     def creator() -> ClosableShotgunLike:
         if not invalid:
             raise RuntimeError('creation failed')
         fake_sg.base_url = 'https://different.example.com'
-        return cast('ClosableShotgunLike', fake_sg)
+        return fake_sg
 
     engine = create_engine('https://fake.example.com', creator=creator, bind_default=False)
     progress = CallProgress()
@@ -1098,3 +1247,18 @@ def test_call_progress_excludes_acquisition_and_validation_failure(
         engine.call_with_progress('schema_read', (), {}, progress)
     assert not progress.invoked.is_set()
     assert not progress.dispatched.is_set()
+
+
+def test_unwritable_cache_warns_and_publishes_the_fetched_schema(
+    fake_sg: FakeShotgun, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    root = _blocked_root(tmp_path)
+    engine = create_engine(connection=fake_sg, cache_root=root, bind_default=False)
+    with caplog.at_level(logging.WARNING, logger='sgalchemy.engine'):
+        schemas = engine.load_schema()
+    assert 'Shot' in schemas
+    assert engine.schema == schemas
+    path = cache_file(engine.site, root=root)
+    [message] = [r.getMessage() for r in caplog.records if r.name == 'sgalchemy.engine']
+    assert message.startswith(f'could not write the schema cache {path}: ')
+    assert message.endswith(_NOT_CACHED)

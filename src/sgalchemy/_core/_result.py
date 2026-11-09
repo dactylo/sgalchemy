@@ -22,7 +22,10 @@ class Row(Mapping[str, Any]):
         try:
             return self._values[name]
         except KeyError:
-            raise AttributeError(name) from None
+            keys = ', '.join(map(repr, self._values)) or 'none'
+            raise AttributeError(
+                f'row has no key {name!r}; available keys: {keys}', name=name
+            ) from None
 
     def __getitem__(self, key: str) -> Any:  # noqa: ANN401 - Projection keys select heterogeneous values dynamically.
         """Return a projected value by key."""

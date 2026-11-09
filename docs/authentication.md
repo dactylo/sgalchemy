@@ -4,9 +4,34 @@ This page helps you choose how sgalchemy connects to SG and what to do when SG r
 credential. If you have not run a first query yet, start with the
 [README quick start](../README.md#quick-start).
 
-An engine, created by `create_engine()`, holds the API provider clients, the credentials, and the
-reflected site schema. Sessions make every provider call through their engine, so the way you build
-the engine decides who owns the clients and how a credential can be replaced.
+An engine holds the API clients, credentials, and reflected schema. Sessions call SG through their
+engine. Start with a [session token](#connect-with-a-session-token), or
+[choose another construction path](#choose-a-construction-path) if your application manages
+clients. For an existing connection failure, go to
+[credential recovery](#recover-from-a-rejected-credential).
+
+## Connect with a session token
+
+Supply a token issued by your application's authentication service, then load the schema:
+
+```python
+import os
+
+from sgalchemy import create_engine
+
+engine = create_engine(
+    'https://example.shotgunstudio.com',
+    session_token=os.environ['SHOTGUN_SESSION_TOKEN'],
+)
+try:
+    engine.load_schema()
+    Shot = engine.entities.Shot
+finally:
+    engine.dispose()
+```
+
+After `load_schema()`, the engine exposes the site's entity classes. See the
+[README quick start](../README.md#quick-start) to query them with a session.
 
 ## Choose a construction path
 
@@ -27,27 +52,44 @@ create_engine(site, creator=make_client)
 | `connection`             | Your application                   | Repair your client, or replace it and create a new engine |
 | `creator`                | The engine, built by your callable | Refresh your credential source, then call `dispose()`     |
 
-- **Session token** (`session_token`) is the preferred credential: a JSON-RPC session token issued
-  outside sgalchemy, by any issuer. It is still a bearer secret with a sliding server-side lifetime
-  and no per-token revocation, so keep it out of code and logs.
-- **Script key** (`script_name` with `api_key`) is the long-lived script identity for deployments
-  that manage keys directly. Rotate keys through your studio's normal process.
-- **Supplied client** (`connection`) uses a client your application already owns; the engine never
-  closes it. The engine serializes its calls through that client by default. Pass `serialize=False`
-  only when your client documents that one instance is safe to share between threads.
-- **Creator** (`creator`) is a callable that builds one fresh engine-owned client per thread. Use
-  it for proxies, custom CA bundles, custom providers, or credentials that your application
-  refreshes. Every client it returns must belong to the same site and the same logical identity for
-  the life of the engine; sgalchemy rejects a client for a different site. Have each call read the
-  currently valid credential from your refreshed source. Clients built for different threads may
-  share the same credential.
+### Static credentials
 
-The two static-credential paths require an `https://` site URL, because the engine itself sends
-those credentials and refuses to send them in plain text. With either one, the engine builds one
-client per thread from the installed provider.
+A **session token** (`session_token`) is the preferred credential: a JSON-RPC session token issued
+outside sgalchemy, by any issuer. It is a bearer secret with a sliding server-side lifetime and no
+per-token revocation, so keep it out of code and logs. The CLI reads it from
+`SGALCHEMY_SESSION_TOKEN` when `--script-name` is omitted.
+
+A **script key** (`script_name` with `api_key`) provides a long-lived script identity for
+deployments that manage keys directly. Rotate keys through your studio's normal process.
+
+Both paths require an `https://` site URL: the engine refuses to send credentials in plain text.
+The engine builds one client per thread from the installed provider.
 
 `create_async_engine()` accepts the same static credentials. Its supplied-client and creator
-options depend on the async strategy; see [Async usage](async.md#create-an-async-engine).
+options depend on the async strategy; see [Async usage](async.md#engine-strategies-and-lifetime).
+
+## Use an existing client
+
+Pass `connection=existing_client` when your application owns the client. The engine never closes it
+and serializes its calls through that client by default. Pass `serialize=False` only when your
+client documents that one instance is safe to share between threads.
+
+## Build clients with a creator
+
+Pass `creator=make_client` for proxies, custom CA bundles, custom providers, or credentials your
+application refreshes. The callable builds one fresh engine-owned client per thread. Have each call
+read the currently valid credential from your refreshed source; clients on different threads may
+share the same credential.
+
+Every returned client must meet these requirements:
+
+- It belongs to the same site and logical identity for the engine's lifetime. sgalchemy rejects a
+  client for a different site.
+- It provides a string `base_url`, a `close()` method, and the provider methods sgalchemy calls,
+  such as `find` and `batch`. When the engine first builds a client, it raises `TypeError` if any
+  are missing.
+
+See [Recovery examples](#examples) for a creator that reads a refreshed token.
 
 ## Dispose of clients
 

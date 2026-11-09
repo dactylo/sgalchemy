@@ -15,6 +15,7 @@ from sgalchemy._core._expressions import (
     Ordering,
     RawFilters,
     Summary,
+    require_conditions,
 )
 from sgalchemy._core._options import Defer, JoinedLoad, LazyLoad, LoadOnly, SelectinLoad
 from sgalchemy._core._registry import Entity
@@ -25,11 +26,6 @@ from sgalchemy.schema._model import EntitySchema
 _EntityT = TypeVar('_EntityT', bound=Entity)
 _LoaderOption = Defer | JoinedLoad | LazyLoad | LoadOnly | SelectinLoad
 _SelectT_co = TypeVar('_SelectT_co', bound=Entity | None, covariant=True)
-
-
-def _empty_exec_options() -> dict[str, object]:
-    """Create an empty execution-option mapping."""
-    return {}
 
 
 @dataclass(frozen=True, eq=False)
@@ -61,7 +57,7 @@ class Select(Generic[_SelectT_co]):
     limit_value: int = 0
     page_value: int = 0
     loader_options: tuple[_LoaderOption, ...] = ()
-    exec_options: Mapping[str, object] = field(default_factory=_empty_exec_options)
+    exec_options: Mapping[str, object] = field(default_factory=dict[str, object])
 
     def __post_init__(self) -> None:
         """Freeze execution options into deterministic read-only storage."""
@@ -112,17 +108,11 @@ class Select(Generic[_SelectT_co]):
 
         Returns:
             Statement copy containing the accumulated groupings.
+
+        Raises:
+            TypeError: If an item is neither a field nor a grouping.
         """
-        resolved = tuple(
-            grouping
-            if isinstance(grouping, Grouping)
-            else Grouping(
-                grouping.filter_field,
-                'exact',
-                entity_type=grouping.root_type,
-            )
-            for grouping in groupings
-        )
+        resolved = tuple(_grouping(grouping) for grouping in groupings)
         return dataclasses.replace(self, groupings=(*self.groupings, *resolved))
 
     def limit(self, n: int) -> Self:
@@ -144,19 +134,27 @@ class Select(Generic[_SelectT_co]):
 
         Returns:
             Statement copy containing the accumulated loader options.
-        """
-        return dataclasses.replace(self, loader_options=(*self.loader_options, *opts))
 
-    def order_by(self, *orderings: Ordering) -> Self:
+        Raises:
+            TypeError: If an item is not a loader option.
+        """
+        resolved = tuple(_loader_option(option) for option in opts)
+        return dataclasses.replace(self, loader_options=(*self.loader_options, *resolved))
+
+    def order_by(self, *orderings: Ordering | FieldExpr) -> Self:
         """Add order-by items.
 
         Args:
-            *orderings: Ordering expressions to append.
+            *orderings: Explicit orderings or bare fields to sort ascending.
 
         Returns:
             Statement copy containing the accumulated orderings.
+
+        Raises:
+            TypeError: If an item is neither a field nor an ordering.
         """
-        return dataclasses.replace(self, orderings=(*self.orderings, *orderings))
+        resolved = tuple(_ordering(ordering) for ordering in orderings)
+        return dataclasses.replace(self, orderings=(*self.orderings, *resolved))
 
     def page(self, n: int) -> Self:
         """Set the SG-native result page.
@@ -177,8 +175,51 @@ class Select(Generic[_SelectT_co]):
 
         Returns:
             Statement copy containing the accumulated conditions.
+
+        Raises:
+            TypeError: If an item is not a filter condition.
         """
+        require_conditions('where()', conds)
         return dataclasses.replace(self, conditions=(*self.conditions, *conds))
+
+
+def _grouping(value: object) -> Grouping:
+    """Resolve a field or grouping to a provider grouping descriptor."""
+    if isinstance(value, Grouping):
+        return value
+    if isinstance(value, FieldExpr):
+        return Grouping(value.filter_field, 'exact', entity_type=value.root_type)
+    raise TypeError(
+        'group_by() takes fields or groupings from field.by_() and its shortcuts, '
+        f'not {type(value).__name__}'
+    )
+
+
+def _loader_option(value: object) -> _LoaderOption:
+    """Validate a loader option and guide bare fields to a loader."""
+    if isinstance(value, _LoaderOption):
+        return value
+    if isinstance(value, FieldExpr):
+        raise TypeError(
+            'options() takes loader options, not a bare field; wrap the field in a loader such as '
+            'selectinload() or load_only()'
+        )
+    raise TypeError(
+        'options() takes loader options such as selectinload() or load_only(), '
+        f'not {type(value).__name__}'
+    )
+
+
+def _ordering(value: object) -> Ordering:
+    """Resolve a field or ordering to a provider sort descriptor."""
+    if isinstance(value, Ordering):
+        return value
+    if isinstance(value, FieldExpr):
+        return value.asc()
+    raise TypeError(
+        'order_by() takes fields or orderings from field.asc() and field.desc(), '
+        f'not {type(value).__name__}'
+    )
 
 
 @overload

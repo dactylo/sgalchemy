@@ -7,12 +7,19 @@ from collections.abc import Callable, Generator, Iterable, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from dataclasses import field as dc_field
+from difflib import get_close_matches
 from threading import Lock
 from types import MappingProxyType
 from typing import Any, Protocol, Self, cast
 
 from sgalchemy._core import _entity
-from sgalchemy._core._expressions import FieldExpr, Filter, FilterGroup, RawFilters
+from sgalchemy._core._expressions import (
+    FieldExpr,
+    Filter,
+    FilterGroup,
+    RawFilters,
+    require_conditions,
+)
 from sgalchemy._errors import (
     RefreshRequiredError,
     SchemaUnavailableError,
@@ -37,7 +44,7 @@ REGISTRY_SITE_MISMATCH_MESSAGE: str = (
 _DEFAULT_REGISTRIES: list[Registry] = []
 _DEFAULT_REGISTRY_LOCK = Lock()
 _DEFAULT_SESSION_REGISTRIES: list[Registry] = []
-_DEFAULT_TRANSITION: dict[str, object] = {'reserved': False}
+_DEFAULT_TRANSITION_OWNER: list[object] = []
 _ENTITY_FINDERS: list[
     Callable[
         [type[Entity], tuple[Filter | FilterGroup | RawFilters, ...], dict[str, object]],
@@ -70,7 +77,11 @@ class _EntityMeta(type):
             name if name in schema.fields else binding.field_aliases.get(type_name, {}).get(name)
         )
         if code is None:
-            raise AttributeError(f'{type_name} has no field or field alias {name!r}')
+            aliases = binding.field_aliases.get(type_name, {})
+            suggestion = _field_suggestion(name, schema, aliases)
+            raise AttributeError(
+                f'{type_name} has no field or field alias {name!r}{suggestion}', name=name
+            )
         field_schema = schema.fields[code]
         if not field_schema.api_readable:
             raise AttributeError(
@@ -139,26 +150,6 @@ class _LazyResolver(Protocol):
         """Resolve the deferred field identified by its provider code."""
 
 
-def _new_field_set() -> set[str]:
-    """Return one independently mutable field-code set."""
-    return set()
-
-
-def _new_lazy_dict() -> dict[str, _LazyResolver]:
-    """Return one independently mutable deferred-loader mapping."""
-    return {}
-
-
-def _new_state_dict() -> dict[str, Any]:
-    """Return one independently mutable field-state mapping."""
-    return {}
-
-
-def _new_type_dict() -> dict[str, str]:
-    """Return one independently mutable dirty-field type mapping."""
-    return {}
-
-
 @dataclass
 class EntityState:
     """Hold mutable identity, field values, and write provenance for an entity.
@@ -179,6 +170,7 @@ class EntityState:
         expired: Whether ordinary field access requires refresh.
         deleted: Locally observed retired state.
         indeterminate: Whether an ambiguous entity-level outcome forbids use.
+        outdated: Accepted type and ID of a copy that cannot be updated.
         dirty_types: Reflected data types captured when fields were assigned.
         refresh_required: Fields without trustworthy readable values.
         unverified_writes: Readable fields with uncertain write provenance.
@@ -188,31 +180,21 @@ class EntityState:
 
     entity_type: str
     id: int | None
-    loaded: dict[str, Any] = dc_field(default_factory=_new_state_dict)
-    dirty: dict[str, Any] = dc_field(default_factory=_new_state_dict)
-    clean: dict[str, Any] = dc_field(default_factory=_new_state_dict)
-    lazy: dict[str, _LazyResolver] = dc_field(default_factory=_new_lazy_dict)
+    loaded: dict[str, Any] = dc_field(default_factory=dict[str, Any])
+    dirty: dict[str, Any] = dc_field(default_factory=dict[str, Any])
+    clean: dict[str, Any] = dc_field(default_factory=dict[str, Any])
+    lazy: dict[str, _LazyResolver] = dc_field(default_factory=dict[str, _LazyResolver])
     session: object | None = None
     access_guard: Callable[[EntityState], None] | None = None
     expired: bool = False
     deleted: bool = False
     indeterminate: bool = False
-    dirty_types: dict[str, str] = dc_field(default_factory=_new_type_dict)
-    refresh_required: set[str] = dc_field(default_factory=_new_field_set)
-    unverified_writes: set[str] = dc_field(default_factory=_new_field_set)
-    clean_refresh_required: set[str] = dc_field(default_factory=_new_field_set)
-    clean_unverified_writes: set[str] = dc_field(default_factory=_new_field_set)
-
-    def _capture_assignment_snapshot(self, field_code: str) -> None:
-        """Capture one field's clean value and trust markers before its first write."""
-        if field_code in self.dirty:
-            return
-        if field_code in self.loaded:
-            self.clean[field_code] = self.loaded[field_code]
-        if field_code in self.refresh_required:
-            self.clean_refresh_required.add(field_code)
-        if field_code in self.unverified_writes:
-            self.clean_unverified_writes.add(field_code)
+    outdated: tuple[str, int] | None = None
+    dirty_types: dict[str, str] = dc_field(default_factory=dict[str, str])
+    refresh_required: set[str] = dc_field(default_factory=set[str])
+    unverified_writes: set[str] = dc_field(default_factory=set[str])
+    clean_refresh_required: set[str] = dc_field(default_factory=set[str])
+    clean_unverified_writes: set[str] = dc_field(default_factory=set[str])
 
     def accept_field_value(self, field_code: str, value: object) -> None:
         """Store a readable field value and replace its trust markers.
@@ -237,6 +219,17 @@ class EntityState:
         self.accept_field_value(field_code, value)
         self.clean_refresh_required.discard(field_code)
         self.clean_unverified_writes.discard(field_code)
+
+    def capture_assignment_snapshot(self, field_code: str) -> None:
+        """Capture one field's clean value and trust markers before its first write."""
+        if field_code in self.dirty:
+            return
+        if field_code in self.loaded:
+            self.clean[field_code] = self.loaded[field_code]
+        if field_code in self.refresh_required:
+            self.clean_refresh_required.add(field_code)
+        if field_code in self.unverified_writes:
+            self.clean_unverified_writes.add(field_code)
 
     def discard_field_provenance(self, field_code: str) -> None:
         """Discard one field's clean snapshot and staged write.
@@ -272,6 +265,17 @@ class EntityState:
             field_codes: Provider field codes from a confirmed readback.
         """
         self.unverified_writes.update(code for code in field_codes if code not in self.dirty)
+
+    def rebase_field_snapshot(self, field_code: str, value: object) -> None:
+        """Use a confirmed value when a staged field is later restored.
+
+        Args:
+            field_code: Provider field code with a pending staged write.
+            value: Confirmed value to restore if that write is discarded.
+        """
+        self.clean[field_code] = value
+        self.clean_refresh_required.discard(field_code)
+        self.clean_unverified_writes.discard(field_code)
 
     def restore_field_from_snapshot(self, field_code: str) -> None:
         """Restore one field's clean value and trust markers, then retire its write.
@@ -423,6 +427,9 @@ class Entity(metaclass=_EntityMeta):
         state = self.__dict__.get('_sg_state')
         if state is None:
             return f'{type(self).__name__}(uninitialized)'
+        if state.outdated is not None:
+            entity_type, entity_id = state.outdated
+            return f'{entity_type}(id={entity_id}, outdated)'
         if state.indeterminate:
             return f'{state.entity_type}(indeterminate)'
         binding = self._sg_binding()
@@ -458,6 +465,8 @@ class Entity(metaclass=_EntityMeta):
             UnfetchedFieldError: If a known readable field was not loaded.
             SgalchemyError: If entity ownership or outcome state forbids
                 access, or the configured relationship load cannot proceed.
+            Exception: Original schema-preparation or provider failure from an
+                explicitly configured synchronous lazy load, unwrapped.
         """
         if name.startswith('_'):
             raise AttributeError(name)
@@ -481,8 +490,7 @@ class Entity(metaclass=_EntityMeta):
             )
         if code in state.loaded:
             return state.loaded[code]
-        schema = None if binding is None else binding.schemas.get(state.entity_type)
-        if schema is None:
+        if binding is None or (schema := binding.schemas.get(state.entity_type)) is None:
             raise SchemaUnavailableError(
                 f'{state.entity_type}(id={state.id}) schema is unavailable; call '
                 'engine.load_schema(force=True) before reading fields'
@@ -493,12 +501,22 @@ class Entity(metaclass=_EntityMeta):
                     f'{state.entity_type}.{code} is a UI-only query/summary field; it '
                     'returns no usable data through the API'
                 )
+            if state.id is None:
+                raise UnfetchedFieldError(
+                    f'{state.entity_type}.{code} has no value on this unsaved entity; '
+                    'assign it before reading it'
+                )
             raise UnfetchedFieldError(
-                f'{state.entity_type}.{code} was not loaded by this query; add '
-                f'load_only({state.entity_type}.{code}) to load it, or '
-                'joinedload()/selectinload() if it is a relationship'
+                f'{state.entity_type}(id={state.id}) field {code!r} was not loaded; load it '
+                f'with load_only({state.entity_type}.{code}) on a {state.entity_type} query '
+                f'without defer({state.entity_type}.{code}), or with '
+                'joinedload()/selectinload() when this object is a linked target'
             )
-        raise AttributeError(name)
+        aliases = binding.field_aliases.get(state.entity_type, {})
+        suggestion = _field_suggestion(name, schema, aliases)
+        raise AttributeError(
+            f'{state.entity_type} has no field or field alias {name!r}{suggestion}', name=name
+        )
 
     def _sg_assign(self, name: str, value: object, binding: RegistryBinding | None) -> None:
         """Validate and stage one field through one captured binding."""
@@ -527,7 +545,7 @@ class Entity(metaclass=_EntityMeta):
             )
         if not self._sg_prepare_assignment(field_schema, code, value, state):
             return
-        state._capture_assignment_snapshot(code)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        state.capture_assignment_snapshot(code)
         state.refresh_required.discard(code)
         state.unverified_writes.discard(code)
         state.dirty[code] = value
@@ -552,13 +570,21 @@ class Entity(metaclass=_EntityMeta):
             AttributeError: If a public field is unknown, API-unreadable, or
                 the server-assigned identity.
             SchemaUnavailableError: If the entity schema is unavailable.
-            SgalchemyError: If access is unsafe, the field is noneditable, or
-                the thumbnail assignment is unsupported.
+            SgalchemyError: If access is unsafe, the entity is persistent and
+                detached, the field is noneditable, or the thumbnail assignment
+                is unsupported.
         """
         if name.startswith('_'):
             object.__setattr__(self, name, value)
             return
         assert_entity_access(self)
+        state = entity_state(self)
+        if state.id is not None and state.session is None:
+            raise SgalchemyError(
+                f'{state.entity_type}(id={state.id}) is not in an open session, so this '
+                'change would never be sent; call session.add(obj) on an open session first, '
+                'then assign'
+            )
         binding = self._sg_binding()
         self._sg_assign(name, value, binding)
 
@@ -578,7 +604,7 @@ class Entity(metaclass=_EntityMeta):
         assert_entity_access(self)
         binding = self._sg_binding()
 
-        def wire_value(value: object, active: set[int]) -> object:
+        def wire_leaf(value: object) -> object:
             if isinstance(value, Entity):
                 assert_entity_access(value)
                 linked_state = entity_state(value)
@@ -596,30 +622,20 @@ class Entity(metaclass=_EntityMeta):
                 elif 'name' in linked_state.loaded and 'name' not in linked_state.refresh_required:
                     link['name'] = linked_state.loaded['name']
                 return link
-            children = container_children(value)
-            if children is None:
-                return value
-            container = cast('WireTraversalContainer', value)
-            container_id = id(container)
-            if container_id in active:
-                raise SgalchemyError(
-                    'container value contains a reference cycle; cyclic containers '
-                    'cannot be serialized by as_dict()'
-                )
-            active.add(container_id)
-            try:
-                if isinstance(container, Mapping):
-                    return {key: wire_value(item, active) for key, item in container.items()}
-                if isinstance(container, list):
-                    return [wire_value(item, active) for item in children]
-                return tuple(wire_value(item, active) for item in children)
-            finally:
-                active.discard(container_id)
+            return value
 
         state = self._sg_state
         result: dict[str, Any] = {'type': state.entity_type, 'id': state.id}
         result.update(
-            (key, wire_value(value, set()))
+            (
+                key,
+                rebuild_wire_container(
+                    value,
+                    wire_leaf,
+                    'container value contains a reference cycle; cyclic containers '
+                    'cannot be serialized by as_dict()',
+                ),
+            )
             for key, value in state.loaded.items()
             if key != 'id' and key not in state.refresh_required
         )
@@ -641,9 +657,15 @@ class Entity(metaclass=_EntityMeta):
             Hydrated entities from the default session.
 
         Raises:
-            SgalchemyError: If no default session is configured, or the ORM
-                finder has not been installed.
+            TypeError: If a positional condition is not a filter condition.
+            AttributeError: If an equality name is not a field or field alias.
+            CompilationError: If the resulting statement cannot compile.
+            SgalchemyError: If no default finder or session is configured, or
+                session access, ownership, or returned entity data is invalid.
+            Exception: Original schema-preparation or provider failure,
+                annotated and unwrapped.
         """
+        require_conditions('find()', conditions)
         if not _ENTITY_FINDERS:
             raise SgalchemyError(
                 'no default session is configured; call sgalchemy.connect(...) first'
@@ -678,6 +700,17 @@ class Entity(metaclass=_EntityMeta):
         return obj
 
 
+def _field_suggestion(name: str, schema: EntitySchema, aliases: Mapping[str, str]) -> str:
+    """Suggest a close API-readable field code or alias when one exists."""
+    readable_codes = {code for code, field in schema.fields.items() if field.api_readable}
+    candidates = [
+        *(code for code in schema.fields if code in readable_codes),
+        *(alias for alias, code in aliases.items() if code in readable_codes),
+    ]
+    matches = get_close_matches(name, candidates, n=1)
+    return f'; did you mean {matches[0]!r}?' if matches else ''
+
+
 def container_children(value: object) -> Iterable[object] | None:
     """Return children for a supported recursive container, or `None`.
 
@@ -706,6 +739,47 @@ def entity_reserved_attribute_names() -> frozenset[str]:
     return frozenset(dir(Entity)) | frozenset(dir(_EntityMeta))
 
 
+def rebuild_wire_container(
+    value: object, leaf_transform: Callable[[object], object], cycle_message: str
+) -> object:
+    """Rebuild wire containers while transforming leaves and rejecting cycles.
+
+    Args:
+        value: Mapping, list, tuple, entity, or scalar to rebuild.
+        leaf_transform: Transform for entities and other non-container leaves.
+            Transformed leaves are returned without further traversal.
+        cycle_message: SgalchemyError message for an active container cycle.
+
+    Returns:
+        Fresh dict, list, or tuple containers with transformed leaves. Mapping
+        keys are unchanged, and shared acyclic containers are rebuilt per use.
+
+    Raises:
+        SgalchemyError: If an active container reference cycle is found.
+    """
+    active: set[int] = set()
+
+    def rebuild(item: object) -> object:
+        children = None if isinstance(item, Entity) else container_children(item)
+        if children is None:
+            return leaf_transform(item)
+        container = cast('WireTraversalContainer', item)
+        container_id = id(container)
+        if container_id in active:
+            raise SgalchemyError(cycle_message)
+        active.add(container_id)
+        try:
+            if isinstance(container, Mapping):
+                return {key: rebuild(child) for key, child in container.items()}
+            if isinstance(container, list):
+                return [rebuild(child) for child in children]
+            return tuple(rebuild(child) for child in children)
+        finally:
+            active.discard(container_id)
+
+    return rebuild(value)
+
+
 # Registry
 # --------
 
@@ -726,14 +800,14 @@ class Registry:
         """Create an unbound registry."""
         self._bind_lock = Lock()
         self._binding: RegistryBinding | None = None
-        self._class_lock = Lock()
-        self._classes: dict[str, type[Entity]] = {}
+        self.class_lock = Lock()
+        self.classes: dict[str, type[Entity]] = {}
 
     def _build(self, canonical: str) -> type[Entity]:
         """Create, cache, and return one canonical entity class."""
         cls = cast('type[Entity]', _EntityMeta(canonical, (Entity,), {}))
         _entity.register_entity_class(cls, canonical, self)
-        self._classes[canonical] = cls
+        self.classes[canonical] = cls
         return cls
 
     def _make_binding(
@@ -839,8 +913,8 @@ class Registry:
             canonical = name if name in binding.schemas else binding.entity_aliases.get(name)
             if canonical is None:
                 raise AttributeError(f'unknown entity type or alias {name!r}')
-        with self._class_lock:
-            return self._classes.get(canonical) or self._build(canonical)
+        with self.class_lock:
+            return self.classes.get(canonical) or self._build(canonical)
 
     def entity_class(self, name: str) -> type[Entity]:
         """Return one cached class resolved through the current binding.
@@ -873,9 +947,9 @@ class Registry:
             Detached canonical and alias names when bound, or cached symbolic
             names when unbound.
         """
-        with self._class_lock:
+        with self.class_lock:
             binding = self._binding
-            class_names = set(self._classes)
+            class_names = set(self.classes)
         if binding is None:
             return class_names
         return set(binding.schemas) | set(binding.entity_aliases)
@@ -902,8 +976,8 @@ def _entity_classes_locked(
     registry: Registry,
 ) -> Generator[dict[str, type[Entity]], None, None]:
     """Yield one Registry's classes while its class lock is held."""
-    with registry._class_lock:  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
-        yield registry._classes  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
+    with registry.class_lock:
+        yield registry.classes
 
 
 def can_replace_default_registry(registry: Registry) -> bool:
@@ -940,7 +1014,7 @@ def commit_default_registry_transition(
     """
     with _DEFAULT_REGISTRY_LOCK:
         current = _default_registry_locked()
-        if not _DEFAULT_TRANSITION['reserved']:
+        if not _DEFAULT_TRANSITION_OWNER:
             raise SgalchemyError('no default registry transition is reserved')
         if default_bound and registry is not current:
             with _entity_classes_locked(current) as classes:
@@ -953,8 +1027,7 @@ def commit_default_registry_transition(
                 _DEFAULT_REGISTRIES[0] = registry
         _DEFAULT_SESSION_REGISTRIES[:] = [registry]
         publish()
-        _DEFAULT_TRANSITION['reserved'] = False
-        _DEFAULT_TRANSITION.pop('owner', None)
+        _DEFAULT_TRANSITION_OWNER[:] = []
 
 
 def default_registry() -> Registry:
@@ -975,7 +1048,7 @@ def entity_registry(cls: type[object]) -> Registry | None:
         cls: Reflected or symbolic entity class.
 
     Returns:
-        Owning registry, or `None` for a compiler-only target.
+        Owning registry, or `None` for an unregistered class.
     """
     return cast('Registry | None', _entity.entity_registry(cls))
 
@@ -992,30 +1065,11 @@ def entity_state(obj: Entity) -> EntityState:
     return obj._sg_state  # pyright: ignore[reportPrivateUsage]  # noqa: SLF001
 
 
-def assert_entity_access(obj: Entity) -> None:
-    """Reject indeterminate or session-conflicting entity access.
-
-    Args:
-        obj: Entity whose direct state is about to be read or mutated.
-
-    Raises:
-        SgalchemyError: If the entity has an indeterminate server outcome.
-    """
-    state = entity_state(obj)
-    if state.indeterminate:
-        raise SgalchemyError(
-            f'{state.entity_type} has an indeterminate server outcome; discard this object '
-            'and reconcile through a fresh query in a new session'
-        )
-    if state.access_guard is not None:
-        state.access_guard(state)
-
-
 def entity_type(cls: type[object]) -> str:
     """Return one entity class's registered API type.
 
     Args:
-        cls: Reflected, symbolic, or compiler-only entity class.
+        cls: Reflected or symbolic entity class.
 
     Returns:
         Canonical or symbolic API entity type.
@@ -1031,6 +1085,59 @@ def initialize_entity(obj: Entity, state: EntityState) -> None:
         state: Initial session and field state.
     """
     object.__setattr__(obj, '_sg_state', state)
+
+
+def install_entity_finder(
+    callback: Callable[
+        [type[Entity], tuple[Filter | FilterGroup | RawFilters, ...], dict[str, object]],
+        list[Entity],
+    ],
+) -> None:
+    """Install the ORM-owned implementation used by `Entity.find()`.
+
+    Args:
+        callback: Finder that resolves the current default session.
+    """
+    _ENTITY_FINDERS[:] = [callback]
+
+
+def reject_outdated(obj: Entity) -> None:
+    """Reject use of a copy that could not be updated after SG saved it.
+
+    Args:
+        obj: Entity to check before any other access or ownership check.
+
+    Raises:
+        SgalchemyError: If the entity copy is outdated.
+    """
+    marker = entity_state(obj).outdated
+    if marker is not None:
+        entity_type, entity_id = marker
+        raise SgalchemyError(
+            f'{entity_type}(id={entity_id}) is outdated: SG saved your change, but '
+            'sgalchemy could not update this copy; discard it and query the record again'
+        )
+
+
+def assert_entity_access(obj: Entity) -> None:
+    """Reject outdated, indeterminate, or session-conflicting entity access.
+
+    Args:
+        obj: Entity whose direct state is about to be read or mutated.
+
+    Raises:
+        SgalchemyError: If the entity is outdated or has an indeterminate
+            outcome.
+    """
+    reject_outdated(obj)
+    state = entity_state(obj)
+    if state.indeterminate:
+        raise SgalchemyError(
+            f'{state.entity_type} has an indeterminate server outcome; discard this object '
+            'and reconcile through a fresh query in a new session'
+        )
+    if state.access_guard is not None:
+        state.access_guard(state)
 
 
 def inspect(obj: Entity) -> InspectionInfo:
@@ -1060,20 +1167,6 @@ def inspect(obj: Entity) -> InspectionInfo:
     )
 
 
-def install_entity_finder(
-    callback: Callable[
-        [type[Entity], tuple[Filter | FilterGroup | RawFilters, ...], dict[str, object]],
-        list[Entity],
-    ],
-) -> None:
-    """Install the ORM-owned implementation used by `Entity.find()`.
-
-    Args:
-        callback: Finder that resolves the current default session.
-    """
-    _ENTITY_FINDERS[:] = [callback]
-
-
 def release_default_registry_transition(owner: object) -> None:
     """Release a failed default Registry transition reservation.
 
@@ -1081,9 +1174,8 @@ def release_default_registry_transition(owner: object) -> None:
         owner: Private reservation identity that may release the transition.
     """
     with _DEFAULT_REGISTRY_LOCK:
-        if _DEFAULT_TRANSITION.get('owner') is owner:
-            _DEFAULT_TRANSITION['reserved'] = False
-            _DEFAULT_TRANSITION.pop('owner', None)
+        if _DEFAULT_TRANSITION_OWNER and _DEFAULT_TRANSITION_OWNER[0] is owner:
+            _DEFAULT_TRANSITION_OWNER[:] = []
 
 
 def reserve_default_registry_transition(owner: object) -> Registry:
@@ -1099,14 +1191,13 @@ def reserve_default_registry_transition(owner: object) -> Registry:
         SgalchemyError: If another transition is already reserved.
     """
     with _DEFAULT_REGISTRY_LOCK:
-        if _DEFAULT_TRANSITION['reserved']:
+        if _DEFAULT_TRANSITION_OWNER:
             raise SgalchemyError(
                 'a connection is establishing the default registry; '
                 'retry after connect() completes'
             )
         registry = _default_registry_locked()
-        _DEFAULT_TRANSITION['owner'] = owner
-        _DEFAULT_TRANSITION['reserved'] = True
+        _DEFAULT_TRANSITION_OWNER[:] = [owner]
         return registry
 
 
@@ -1149,7 +1240,7 @@ def set_default_registry(registry: Registry) -> None:
     # Lock order is always module default lock, then the current registry's class lock.
     with _DEFAULT_REGISTRY_LOCK:
         current = _default_registry_locked()
-        if _DEFAULT_TRANSITION['reserved']:
+        if _DEFAULT_TRANSITION_OWNER:
             raise SgalchemyError(
                 'a connection is establishing the default registry; '
                 'retry after connect() completes'

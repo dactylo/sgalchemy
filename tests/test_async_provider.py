@@ -4,14 +4,14 @@ from pathlib import Path
 from typing import Protocol, cast
 
 import pytest
-from _fakes import _FakeShotgun
-from _support import fetch_schema
 
 from sgalchemy._core._async_engine import create_async_engine
 from sgalchemy._core._registry import Registry
 from sgalchemy._core._statement import select
 from sgalchemy._orm._async_session import AsyncSession
 from sgalchemy.testing import async_mockgun_connection
+from tests._fakes import FakeShotgun
+from tests._support import fetch_schema
 
 
 class _AsyncMockgunModule(Protocol):
@@ -23,7 +23,7 @@ class _AsyncProviderModule(Protocol):
 
 
 @pytest.mark.native_async
-def test_native_provider_async_mockgun_round_trip(fake_sg: _FakeShotgun, tmp_path: Path) -> None:
+def test_native_provider_async_mockgun_round_trip(fake_sg: FakeShotgun, tmp_path: Path) -> None:
     required = os.environ.get('SGALCHEMY_REQUIRE_NATIVE_ASYNC') == '1'
     try:
         import shotgun_api3  # noqa: PLC0415 - Optional provider may be absent.

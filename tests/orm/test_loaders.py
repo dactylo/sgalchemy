@@ -5,7 +5,6 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
 
 import pytest
-from _support import YieldCountingEntities
 
 from sgalchemy._core._engine import Engine, create_engine
 from sgalchemy._core._expressions import FieldExpr
@@ -18,7 +17,6 @@ from sgalchemy._core._registry import (
     entity_state,
     initialize_entity,
 )
-from sgalchemy._core._schema_drift import SchemaDrift
 from sgalchemy._core._statement import Select, select
 from sgalchemy._errors import (
     CompilationError,
@@ -30,23 +28,23 @@ from sgalchemy._errors import (
 from sgalchemy._orm import _session as session_module
 from sgalchemy._orm._loaders import LazyContext
 from sgalchemy._orm._session import Session
+from tests._support import YieldCountingEntities, publish_on_drift
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
     from pathlib import Path
 
-    from _fakes import _FakeShotgun
-    from _support import _SyncCallback
-
     from sgalchemy._core._compiler import FindCall, SummarizeCall
     from sgalchemy.schema._model import EntitySchema
+    from tests._fakes import FakeShotgun
+    from tests._support import SyncCallback
 
 _P = ParamSpec('_P')
 _R = TypeVar('_R')
 
 
-def _find_calls(fake_sg: _FakeShotgun) -> list[tuple[str, tuple[Any, ...], dict[str, Any]]]:
-    return [call for call in fake_sg._calls if call[0] == 'find']
+def _find_calls(fake_sg: FakeShotgun) -> list[tuple[str, tuple[Any, ...], dict[str, Any]]]:
+    return [call for call in fake_sg.calls if call[0] == 'find']
 
 
 def _publish_without(engine: Engine, type_name: str) -> tuple[RegistryBinding, RegistryBinding]:
@@ -60,8 +58,8 @@ def _publish_without(engine: Engine, type_name: str) -> tuple[RegistryBinding, R
     return complete, stale
 
 
-def test_close_clears_every_lazy_context_without_io(engine: Engine, fake_sg: _FakeShotgun) -> None:
-    fake_sg._find_results = [
+def test_close_clears_every_lazy_context_without_io(engine: Engine, fake_sg: FakeShotgun) -> None:
+    fake_sg.find_results = [
         [
             {'type': 'Shot', 'id': 4, 'code': 'D', 'assets': [{'type': 'Asset', 'id': 103}]},
             {'type': 'Shot', 'id': 5, 'code': 'E', 'assets': [{'type': 'Asset', 'id': 104}]},
@@ -71,7 +69,7 @@ def test_close_clears_every_lazy_context_without_io(engine: Engine, fake_sg: _Fa
     shot_cls = engine.registry.entity_class('Shot')
     shots = session.scalars(select(shot_cls).options(lazyload(shot_cls.assets)))
     linked_assets = [entity_state(shot).loaded['assets'][0] for shot in shots]
-    calls_before = len(fake_sg._calls)
+    calls_before = len(fake_sg.calls)
 
     session.close()
 
@@ -79,11 +77,11 @@ def test_close_clears_every_lazy_context_without_io(engine: Engine, fake_sg: _Fa
     assert all(entity_state(shot).session is None for shot in shots)
     assert all(entity_state(asset).session is None for asset in linked_assets)
     assert linked_assets[0].as_dict() == {'type': 'Asset', 'id': 103}
-    assert len(fake_sg._calls) == calls_before
+    assert len(fake_sg.calls) == calls_before
 
 
 def test_conflicting_relationship_loaders_raise_before_io(
-    engine: Engine, fake_sg: _FakeShotgun
+    engine: Engine, fake_sg: FakeShotgun
 ) -> None:
     session = Session(engine)
     shot_cls = engine.registry.entity_class('Shot')
@@ -98,14 +96,14 @@ def test_conflicting_relationship_loaders_raise_before_io(
     ):
         session.scalars(statement)
 
-    assert fake_sg._calls == []
+    assert fake_sg.calls == []
 
 
 @pytest.mark.parametrize('deep_only', [False, True])
 def test_deep_load_hydrates_fields_without_post_query(
-    engine: Engine, fake_sg: _FakeShotgun, deep_only: bool
+    engine: Engine, fake_sg: FakeShotgun, deep_only: bool
 ) -> None:
-    fake_sg._find_results = [
+    fake_sg.find_results = [
         [
             {
                 'type': 'Shot',
@@ -127,14 +125,14 @@ def test_deep_load_hydrates_fields_without_post_query(
     shot = session.scalars(select(shot_cls).options(option))[0]
 
     assert shot.sg_sequence.code == 'SEQ'
-    assert len([call for call in fake_sg._calls if call[0] == 'find']) == 1
+    assert len([call for call in fake_sg.calls if call[0] == 'find']) == 1
 
 
 def test_dirty_relationship_rehydration_preserves_value_and_context(
     engine: Engine,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
 ) -> None:
-    fake_sg._find_results = [
+    fake_sg.find_results = [
         [{'type': 'Shot', 'id': 1, 'assets': [{'type': 'Asset', 'id': 100}]}],
         [{'type': 'Shot', 'id': 1, 'assets': [{'type': 'Asset', 'id': 101}]}],
     ]
@@ -156,19 +154,19 @@ def test_dirty_relationship_rehydration_preserves_value_and_context(
 
 def test_dirty_selectin_fault_retains_lazy_context_and_value(
     engine: Engine,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     error = RuntimeError('eager relationship load failed')
     original_find = fake_sg.find
     call_count = 0
 
-    def track_call(call: _SyncCallback[_P, _R]) -> _SyncCallback[_P, _R]:
+    def track_call(call: SyncCallback[_P, _R]) -> SyncCallback[_P, _R]:
         def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
             nonlocal call_count
             call_count += 1
             if call_count == 3:
-                fake_sg._find_error = error
+                fake_sg.find_error = error
             return call(*args, **kwargs)
 
         return wrapper
@@ -176,7 +174,7 @@ def test_dirty_selectin_fault_retains_lazy_context_and_value(
     find = track_call(original_find)
 
     monkeypatch.setattr(fake_sg, 'find', find)
-    fake_sg._find_results = [
+    fake_sg.find_results = [
         [{'type': 'Shot', 'id': 1, 'assets': [{'type': 'Asset', 'id': 100}]}],
         [{'type': 'Shot', 'id': 1, 'assets': [{'type': 'Asset', 'id': 101}]}],
         [{'type': 'Asset', 'id': 200, 'code': 'retried'}],
@@ -208,9 +206,9 @@ def test_dirty_selectin_fault_retains_lazy_context_and_value(
 
 def test_dirty_selectin_retires_only_participating_lazy_entries(
     engine: Engine,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
 ) -> None:
-    fake_sg._find_results = [
+    fake_sg.find_results = [
         [
             {'type': 'Shot', 'id': 1, 'assets': [{'type': 'Asset', 'id': 100}]},
             {'type': 'Shot', 'id': 2, 'assets': [{'type': 'Asset', 'id': 102}]},
@@ -245,8 +243,8 @@ def test_dirty_selectin_retires_only_participating_lazy_entries(
     assert _find_calls(fake_sg)[-1][1][1] == [['id', 'in', [102]]]
 
 
-def test_duplicate_lazyload_executes_once(engine: Engine, fake_sg: _FakeShotgun) -> None:
-    fake_sg._find_results = [
+def test_duplicate_lazyload_executes_once(engine: Engine, fake_sg: FakeShotgun) -> None:
+    fake_sg.find_results = [
         [{'type': 'Shot', 'id': 1, 'assets': [{'type': 'Asset', 'id': 100}]}],
         [{'type': 'Asset', 'id': 100, 'code': 'loaded'}],
     ]
@@ -263,8 +261,8 @@ def test_duplicate_lazyload_executes_once(engine: Engine, fake_sg: _FakeShotgun)
     assert len(_find_calls(fake_sg)) == 2
 
 
-def test_duplicate_selectinload_executes_once(engine: Engine, fake_sg: _FakeShotgun) -> None:
-    fake_sg._find_results = [
+def test_duplicate_selectinload_executes_once(engine: Engine, fake_sg: FakeShotgun) -> None:
+    fake_sg.find_results = [
         [{'type': 'Shot', 'id': 1, 'assets': [{'type': 'Asset', 'id': 100}]}],
         [{'type': 'Asset', 'id': 100, 'code': 'loaded'}],
     ]
@@ -283,7 +281,7 @@ def test_duplicate_selectinload_executes_once(engine: Engine, fake_sg: _FakeShot
 
 def test_empty_lazyload_on_unprepared_engine_stays_local(
     engine: Engine,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
     session = Session(engine)
@@ -303,14 +301,14 @@ def test_empty_lazyload_on_unprepared_engine_stays_local(
 
     assert state.lazy == {}
     assert engine.prepared_binding() is None
-    assert fake_sg._calls == []
+    assert fake_sg.calls == []
     assert list(tmp_path.iterdir()) == []
 
 
 def test_expired_lazy_relationship_raises_before_resolving(
-    engine: Engine, fake_sg: _FakeShotgun
+    engine: Engine, fake_sg: FakeShotgun
 ) -> None:
-    fake_sg._find_results = [[{'type': 'Shot', 'id': 1, 'assets': [{'type': 'Asset', 'id': 100}]}]]
+    fake_sg.find_results = [[{'type': 'Shot', 'id': 1, 'assets': [{'type': 'Asset', 'id': 100}]}]]
     session = Session(engine)
     shot_cls = engine.registry.entity_class('Shot')
     shot = session.scalars(select(shot_cls).options(lazyload(shot_cls.assets)))[0]
@@ -327,10 +325,10 @@ def test_expired_lazy_relationship_raises_before_resolving(
 
 def test_failed_lazy_target_refresh_memo_uses_binding_identity(
     engine: Engine,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
 ) -> None:
     engine.load_schema()
-    fake_sg._find_results = [
+    fake_sg.find_results = [
         [
             {
                 'type': 'Shot',
@@ -354,7 +352,7 @@ def test_failed_lazy_target_refresh_memo_uses_binding_identity(
             _ = shot.sg_vendor
         assert entity_state(shot).lazy['sg_vendor'] is context
 
-    assert [name for name, _, _ in fake_sg._calls].count('schema_read') == 2
+    assert [name for name, _, _ in fake_sg.calls].count('schema_read') == 2
     assert [call[1][0] for call in _find_calls(fake_sg)] == ['Shot']
 
     failed = engine.prepared_binding()
@@ -377,7 +375,7 @@ def test_failed_lazy_target_refresh_memo_uses_binding_identity(
 
 def test_invalid_joinedloads_and_opaque_root_never_refresh_schema(
     engine: Engine,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
 ) -> None:
     engine.load_schema()
     session = Session(engine)
@@ -396,13 +394,13 @@ def test_invalid_joinedloads_and_opaque_root_never_refresh_schema(
         with pytest.raises(CompilationError):
             session.scalars(statement)
 
-    assert [name for name, _, _ in fake_sg._calls].count('schema_read') == 1
+    assert [name for name, _, _ in fake_sg.calls].count('schema_read') == 1
     assert _find_calls(fake_sg) == []
 
 
 def test_joinedload_chain_reports_first_missing_intermediate_after_refresh(
     engine: Engine,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     schema_fixture: dict[str, Any],
 ) -> None:
@@ -414,7 +412,7 @@ def test_joinedload_chain_reports_first_missing_intermediate_after_refresh(
     }
 
     def stale_schema_read() -> dict[str, Any]:
-        fake_sg._record('schema_read')
+        fake_sg.record('schema_read')
         return stale_raw
 
     monkeypatch.setattr(fake_sg, 'schema_read', stale_schema_read)
@@ -430,19 +428,19 @@ def test_joinedload_chain_reports_first_missing_intermediate_after_refresh(
     assert 'Shot.sg_sequence' in message
     assert 'Sequence' in message
     assert 'Sequence.episode' not in message
-    assert [name for name, _, _ in fake_sg._calls].count('schema_read') == 2
+    assert [name for name, _, _ in fake_sg.calls].count('schema_read') == 2
     assert _find_calls(fake_sg) == []
 
 
 def test_joinedload_force_refreshes_once_then_runs_one_primary_query(
     engine: Engine,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     _publish_without(engine, 'Sequence')
     session = Session(engine)
     shot_cls = engine.registry.entity_class('Shot')
-    fake_sg._find_results = [
+    fake_sg.find_results = [
         [
             {
                 'type': 'Shot',
@@ -457,21 +455,21 @@ def test_joinedload_force_refreshes_once_then_runs_one_primary_query(
         shot = session.scalars(select(shot_cls).options(joinedload(shot_cls.sg_sequence)))[0]
 
     assert shot.sg_sequence.code == 'SEQ'
-    assert [name for name, _, _ in fake_sg._calls].count('schema_read') == 2
+    assert [name for name, _, _ in fake_sg.calls].count('schema_read') == 2
     assert len(_find_calls(fake_sg)) == 1
     assert 'refreshing schema' in caplog.text
 
 
 def test_joinedload_recompiles_after_concurrent_binding_publication_without_io(
     engine: Engine,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     complete, stale = _publish_without(engine, 'Sequence')
     session = Session(engine)
     shot_cls = engine.registry.entity_class('Shot')
     statement = select(shot_cls).options(joinedload(shot_cls.sg_sequence))
-    fake_sg._find_results = [
+    fake_sg.find_results = [
         [
             {
                 'type': 'Shot',
@@ -481,40 +479,28 @@ def test_joinedload_recompiles_after_concurrent_binding_publication_without_io(
             }
         ]
     ]
-    compile_statement: _SyncCallback[
+    compile_statement: SyncCallback[
         [Select[Entity | None], Mapping[str, EntitySchema]],
         FindCall | SummarizeCall,
     ] = session_module.compile_statement
-    publications = 0
-
-    def publish_on_drift(call: _SyncCallback[_P, _R]) -> _SyncCallback[_P, _R]:
-        def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
-            try:
-                return call(*args, **kwargs)
-            except SchemaDrift:
-                nonlocal publications
-                publications += 1
-                engine.registry.bind(dict(complete.schemas), key=complete.key)
-                raise
-
-        return wrapper
-
-    publish_during_failed_compile = publish_on_drift(compile_statement)
+    publish_during_failed_compile, publications = publish_on_drift(
+        compile_statement, engine.registry, complete
+    )
 
     monkeypatch.setattr(session_module, 'compile_statement', publish_during_failed_compile)
 
     shot = session.scalars(statement)[0]
 
     assert shot.sg_sequence.code == 'SEQ'
-    assert publications == 1
+    assert publications == [1]
     assert stale is not engine.prepared_binding()
-    assert [name for name, _, _ in fake_sg._calls].count('schema_read') == 1
+    assert [name for name, _, _ in fake_sg.calls].count('schema_read') == 1
     assert len(_find_calls(fake_sg)) == 1
 
 
 def test_joinedload_remaining_drift_raises_after_one_force_without_query(
     engine: Engine,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     schema_fixture: dict[str, Any],
 ) -> None:
@@ -522,7 +508,7 @@ def test_joinedload_remaining_drift_raises_after_one_force_without_query(
     stale_raw = {name: schema for name, schema in schema_fixture.items() if name != 'Sequence'}
 
     def stale_schema_read() -> dict[str, Any]:
-        fake_sg._record('schema_read')
+        fake_sg.record('schema_read')
         return stale_raw
 
     monkeypatch.setattr(fake_sg, 'schema_read', stale_schema_read)
@@ -535,15 +521,15 @@ def test_joinedload_remaining_drift_raises_after_one_force_without_query(
     ):
         session.scalars(select(shot_cls).options(joinedload(shot_cls.sg_sequence)))
 
-    assert [name for name, _, _ in fake_sg._calls].count('schema_read') == 2
+    assert [name for name, _, _ in fake_sg.calls].count('schema_read') == 2
     assert _find_calls(fake_sg) == []
 
 
 def test_lazy_then_joined_reuse_keeps_eager_data_without_post_query(
     engine: Engine,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
 ) -> None:
-    fake_sg._find_results = [
+    fake_sg.find_results = [
         [{'type': 'Shot', 'id': 1, 'sg_sequence': {'type': 'Sequence', 'id': 7}}],
         [
             {
@@ -568,9 +554,9 @@ def test_lazy_then_joined_reuse_keeps_eager_data_without_post_query(
 
 
 def test_lazy_then_plain_rehydration_clears_stale_context(
-    engine: Engine, fake_sg: _FakeShotgun
+    engine: Engine, fake_sg: FakeShotgun
 ) -> None:
-    fake_sg._find_results = [
+    fake_sg.find_results = [
         [{'type': 'Shot', 'id': 1, 'assets': [{'type': 'Asset', 'id': 100}]}],
         [{'type': 'Shot', 'id': 1, 'assets': [{'type': 'Asset', 'id': 101}]}],
     ]
@@ -586,8 +572,8 @@ def test_lazy_then_plain_rehydration_clears_stale_context(
     assert 'assets' not in entity_state(reused).lazy
 
 
-def test_lazy_then_refresh_clears_stale_context(engine: Engine, fake_sg: _FakeShotgun) -> None:
-    fake_sg._find_results = [
+def test_lazy_then_refresh_clears_stale_context(engine: Engine, fake_sg: FakeShotgun) -> None:
+    fake_sg.find_results = [
         [{'type': 'Shot', 'id': 1, 'assets': [{'type': 'Asset', 'id': 100}]}],
         [{'type': 'Shot', 'id': 1, 'assets': [{'type': 'Asset', 'id': 101}]}],
     ]
@@ -604,9 +590,9 @@ def test_lazy_then_refresh_clears_stale_context(engine: Engine, fake_sg: _FakeSh
 
 def test_lazy_then_selectin_reuse_keeps_eager_data_without_post_query(
     engine: Engine,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
 ) -> None:
-    fake_sg._find_results = [
+    fake_sg.find_results = [
         [{'type': 'Shot', 'id': 1, 'assets': [{'type': 'Asset', 'id': 100}]}],
         [{'type': 'Shot', 'id': 1, 'assets': [{'type': 'Asset', 'id': 100}]}],
         [{'type': 'Asset', 'id': 100, 'code': 'eager'}],
@@ -626,10 +612,10 @@ def test_lazy_then_selectin_reuse_keeps_eager_data_without_post_query(
 
 def test_lazyload_batches_on_first_touch_and_respects_budget(
     engine: Engine,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    fake_sg._find_results = [
+    fake_sg.find_results = [
         [
             {'type': 'Shot', 'id': 1, 'code': 'A', 'assets': [{'type': 'Asset', 'id': 100}]},
             {'type': 'Shot', 'id': 2, 'code': 'B', 'assets': [{'type': 'Asset', 'id': 101}]},
@@ -639,32 +625,32 @@ def test_lazyload_batches_on_first_touch_and_respects_budget(
     session = Session(engine, max_implicit_queries=1)
     shot_cls = engine.registry.entity_class('Shot')
     shots = session.scalars(select(shot_cls).options(lazyload(shot_cls.assets)))
-    primary_find = next(call for call in fake_sg._calls if call[0] == 'find')
-    calls_before = len(fake_sg._calls)
+    primary_find = next(call for call in fake_sg.calls if call[0] == 'find')
+    calls_before = len(fake_sg.calls)
 
     assert 'assets' in primary_find[1][2]
     with caplog.at_level('INFO', logger='sgalchemy.session'):
         first_assets = shots[0].assets
 
     assert first_assets[0].code == 'a'
-    assert len(fake_sg._calls) == calls_before + 1
+    assert len(fake_sg.calls) == calls_before + 1
     assert any('lazy load: Shot.assets' in record.message for record in caplog.records)
     assert shots[1].assets[0].code == 'b'
-    assert len(fake_sg._calls) == calls_before + 1
+    assert len(fake_sg.calls) == calls_before + 1
 
     session2 = Session(engine, max_implicit_queries=0)
-    fake_sg._find_results = [
+    fake_sg.find_results = [
         [{'type': 'Shot', 'id': 3, 'code': 'C', 'assets': [{'type': 'Asset', 'id': 102}]}]
     ]
     shot3 = session2.scalars(select(shot_cls).options(lazyload(shot_cls.assets)))[0]
-    calls_before = len(fake_sg._calls)
+    calls_before = len(fake_sg.calls)
     with pytest.raises(SgalchemyError, match=r'max_implicit_queries.*Shot\.assets'):
         _ = shot3.assets
-    assert len(fake_sg._calls) == calls_before
+    assert len(fake_sg.calls) == calls_before
 
 
-def test_lazyload_counts_actual_target_type_calls(engine: Engine, fake_sg: _FakeShotgun) -> None:
-    fake_sg._find_results = [
+def test_lazyload_counts_actual_target_type_calls(engine: Engine, fake_sg: FakeShotgun) -> None:
+    fake_sg.find_results = [
         [
             {
                 'type': 'Note',
@@ -692,22 +678,22 @@ def test_lazyload_counts_actual_target_type_calls(engine: Engine, fake_sg: _Fake
     assert [link.code for link in first.note_links] == ['A', 'v1']
 
     empty = session.scalars(select(note_cls).options(lazyload(note_cls.note_links)))[0]
-    calls_before_empty = len(fake_sg._calls)
+    calls_before_empty = len(fake_sg.calls)
     assert empty.note_links == []
-    assert len(fake_sg._calls) == calls_before_empty
+    assert len(fake_sg.calls) == calls_before_empty
 
     last = session.scalars(select(note_cls).options(lazyload(note_cls.note_links)))[0]
-    calls_before_budget_error = len(fake_sg._calls)
+    calls_before_budget_error = len(fake_sg.calls)
     with pytest.raises(SgalchemyError, match='needs 1 implicit query'):
         _ = last.note_links
-    assert len(fake_sg._calls) == calls_before_budget_error
+    assert len(fake_sg.calls) == calls_before_budget_error
 
 
 def test_lazyload_overlapping_results_preserve_newer_context(
     engine: Engine,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
 ) -> None:
-    fake_sg._find_results = [
+    fake_sg.find_results = [
         [
             {'type': 'Shot', 'id': 1, 'assets': [{'type': 'Asset', 'id': 101}]},
             {'type': 'Shot', 'id': 2, 'assets': [{'type': 'Asset', 'id': 102}]},
@@ -742,7 +728,7 @@ def test_lazyload_overlapping_results_preserve_newer_context(
 
 
 def test_lazyload_pending_only_targets_use_no_budget_or_io(
-    engine: Engine, fake_sg: _FakeShotgun
+    engine: Engine, fake_sg: FakeShotgun
 ) -> None:
     engine.load_schema()
     session = Session(engine, max_implicit_queries=0)
@@ -753,19 +739,19 @@ def test_lazyload_pending_only_targets_use_no_budget_or_io(
     state = entity_state(shot)
     context = LazyContext(session, [shot], lazyload(shot_cls.assets))
     state.lazy['assets'] = context
-    calls_before = list(fake_sg._calls)
+    calls_before = list(fake_sg.calls)
 
     assert shot.assets == [pending_asset]
 
     assert state.lazy == {}
     assert state.dirty == {'assets': [pending_asset]}
-    assert fake_sg._calls == calls_before
+    assert fake_sg.calls == calls_before
 
 
 def test_lazyload_reserves_all_target_type_calls_before_io(
-    engine: Engine, fake_sg: _FakeShotgun
+    engine: Engine, fake_sg: FakeShotgun
 ) -> None:
-    fake_sg._find_results = [
+    fake_sg.find_results = [
         [
             {
                 'type': 'Note',
@@ -780,17 +766,17 @@ def test_lazyload_reserves_all_target_type_calls_before_io(
     session = Session(engine, max_implicit_queries=1)
     note_cls = engine.registry.entity_class('Note')
     note = session.scalars(select(note_cls).options(lazyload(note_cls.note_links)))[0]
-    calls_before = len(fake_sg._calls)
+    calls_before = len(fake_sg.calls)
 
     with pytest.raises(SgalchemyError, match=r'2 implicit queries.*Note\.note_links'):
         _ = note.note_links
 
-    assert len(fake_sg._calls) == calls_before
+    assert len(fake_sg.calls) == calls_before
 
 
 def test_lazyload_schema_preparation_fault_has_session_context(
     engine: Engine,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
 ) -> None:
     session = Session(engine)
     asset_cls = engine.registry.entity_class('Asset')
@@ -808,7 +794,7 @@ def test_lazyload_schema_preparation_fault_has_session_context(
     context = LazyContext(session, [shot], lazyload(shot_cls.assets))
     state.lazy['assets'] = context
     error = RuntimeError('schema unavailable')
-    fake_sg._errors['schema_read'] = [error]
+    fake_sg.errors['schema_read'] = [error]
 
     with pytest.raises(RuntimeError) as excinfo:
         _ = shot.assets
@@ -816,13 +802,13 @@ def test_lazyload_schema_preparation_fault_has_session_context(
     assert excinfo.value is error
     assert error.__notes__ == ['sgalchemy: raised while lazy-loading Shot.assets']
     assert state.lazy['assets'] is context
-    assert [name for name, _, _ in fake_sg._calls] == ['schema_read']
+    assert [name for name, _, _ in fake_sg.calls] == ['schema_read']
 
 
 def test_lazyload_single_option_keeps_its_target_read(
-    engine: Engine, fake_sg: _FakeShotgun
+    engine: Engine, fake_sg: FakeShotgun
 ) -> None:
-    fake_sg._find_results = [
+    fake_sg.find_results = [
         [{'type': 'Version', 'id': 1, 'user': {'type': 'HumanUser', 'id': 2}}],
         [{'type': 'HumanUser', 'id': 2, 'name': 'B'}],
     ]
@@ -836,17 +822,17 @@ def test_lazyload_single_option_keeps_its_target_read(
 
 
 @pytest.mark.parametrize('lazy', [False, True])
-def test_loader_response_has_its_own_staged_identity_scope(
-    engine: Engine, fake_sg: _FakeShotgun, lazy: bool
+def test_loader_responses_skip_staged_list_scans(
+    engine: Engine, fake_sg: FakeShotgun, lazy: bool
 ) -> None:
     engine.load_schema()
     session = Session(engine)
     staged = [session.merge_dict({'type': 'Shot', 'id': 1000 + i}) for i in range(20)]
     for obj in staged:
         session.delete(obj)
-    queue = YieldCountingEntities(session.unit_of_work._deleted)
-    session.unit_of_work._deleted = queue
-    fake_sg._find_results = [
+    queue = YieldCountingEntities(session.unit_of_work.deleted)
+    session.unit_of_work.deleted = queue
+    fake_sg.find_results = [
         [
             {'type': 'Shot', 'id': i + 1, 'assets': [{'type': 'Asset', 'id': i + 1}]}
             for i in range(20)
@@ -859,17 +845,14 @@ def test_loader_response_has_its_own_staged_identity_scope(
         select(engine.entities.Shot).options(loader(engine.entities.Shot.assets))
     )
 
-    if lazy:
-        assert queue._visits == 20
     assert objects[0].assets[0].code == 'asset-0'
     assert objects[-1].assets[0].code == 'asset-19'
-    assert queue._visits == 40
-    assert session._state._hydration_index is None
+    assert queue.visits == 0
 
 
 def test_multiple_selectins_fail_union_preflight_before_any_secondary_find(
     engine: Engine,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     schema_fixture: dict[str, Any],
 ) -> None:
@@ -878,11 +861,11 @@ def test_multiple_selectins_fail_union_preflight_before_any_secondary_find(
     refreshed_raw['FutureA'] = copy.deepcopy(refreshed_raw['Sequence'])
 
     def refreshed_schema_read() -> dict[str, Any]:
-        fake_sg._record('schema_read')
+        fake_sg.record('schema_read')
         return refreshed_raw
 
     monkeypatch.setattr(fake_sg, 'schema_read', refreshed_schema_read)
-    fake_sg._find_results = [
+    fake_sg.find_results = [
         [
             {
                 'type': 'Shot',
@@ -906,15 +889,15 @@ def test_multiple_selectins_fail_union_preflight_before_any_secondary_find(
             )
         )
 
-    assert [name for name, _, _ in fake_sg._calls].count('schema_read') == 2
+    assert [name for name, _, _ in fake_sg.calls].count('schema_read') == 2
     assert [call[1][0] for call in _find_calls(fake_sg)] == ['Shot']
 
 
 def test_multiple_selectins_preserve_distinct_target_order(
     engine: Engine,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
 ) -> None:
-    fake_sg._find_results = [
+    fake_sg.find_results = [
         [
             {
                 'type': 'Version',
@@ -946,19 +929,19 @@ def test_multiple_selectins_preserve_distinct_target_order(
 
 def test_multiple_selectins_retire_completed_lazy_marker_before_later_failure(
     engine: Engine,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     error = RuntimeError('later target failed')
     original_find = fake_sg.find
     call_count = 0
 
-    def track_call(call: _SyncCallback[_P, _R]) -> _SyncCallback[_P, _R]:
+    def track_call(call: SyncCallback[_P, _R]) -> SyncCallback[_P, _R]:
         def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
             nonlocal call_count
             call_count += 1
             if call_count == 4:
-                fake_sg._find_error = error
+                fake_sg.find_error = error
             return call(*args, **kwargs)
 
         return wrapper
@@ -972,7 +955,7 @@ def test_multiple_selectins_retire_completed_lazy_marker_before_later_failure(
         'sg_sequence': {'type': 'Sequence', 'id': 7},
         'assets': [{'type': 'Asset', 'id': 100}],
     }
-    fake_sg._find_results = [
+    fake_sg.find_results = [
         [parent],
         [parent],
         [{'type': 'Sequence', 'id': 7, 'code': 'loaded'}],
@@ -1015,7 +998,7 @@ def test_multiple_selectins_retire_completed_lazy_marker_before_later_failure(
 
 def test_multiple_selectins_union_preflight_once_and_share_refreshed_binding(
     engine: Engine,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     schema_fixture: dict[str, Any],
 ) -> None:
@@ -1025,11 +1008,11 @@ def test_multiple_selectins_union_preflight_once_and_share_refreshed_binding(
     refreshed_raw['FutureB'] = copy.deepcopy(refreshed_raw['CustomEntity03'])
 
     def refreshed_schema_read() -> dict[str, Any]:
-        fake_sg._record('schema_read')
+        fake_sg.record('schema_read')
         return refreshed_raw
 
     monkeypatch.setattr(fake_sg, 'schema_read', refreshed_schema_read)
-    fake_sg._find_results = [
+    fake_sg.find_results = [
         [
             {
                 'type': 'Shot',
@@ -1052,7 +1035,7 @@ def test_multiple_selectins_union_preflight_once_and_share_refreshed_binding(
     )[0]
 
     assert (shot.sg_sequence.code, shot.sg_vendor.code) == ('A', 'B')
-    assert [name for name, _, _ in fake_sg._calls].count('schema_read') == 2
+    assert [name for name, _, _ in fake_sg.calls].count('schema_read') == 2
     assert [call[1][0] for call in _find_calls(fake_sg)] == [
         'Shot',
         'FutureA',
@@ -1061,7 +1044,7 @@ def test_multiple_selectins_union_preflight_once_and_share_refreshed_binding(
 
 
 def test_multiple_selectins_union_shared_target_reads(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     schema_fixture: dict[str, Any],
     tmp_path: Path,
@@ -1069,11 +1052,11 @@ def test_multiple_selectins_union_shared_target_reads(
     schema_fixture['Version']['reviewer'] = copy.deepcopy(schema_fixture['Version']['user'])
 
     def schema_read() -> dict[str, Any]:
-        fake_sg._record('schema_read')
+        fake_sg.record('schema_read')
         return copy.deepcopy(schema_fixture)
 
     monkeypatch.setattr(fake_sg, 'schema_read', schema_read)
-    fake_sg._find_results = [
+    fake_sg.find_results = [
         [
             {
                 'type': 'Version',
@@ -1119,21 +1102,21 @@ def test_multiple_selectins_union_shared_target_reads(
 
 
 def test_selectin_empty_results_and_refs_issue_no_post_find(
-    engine: Engine, fake_sg: _FakeShotgun
+    engine: Engine, fake_sg: FakeShotgun
 ) -> None:
     session = Session(engine)
     note_cls = engine.registry.entity_class('Note')
-    fake_sg._find_results = [[], [{'type': 'Note', 'id': 1, 'note_links': []}]]
+    fake_sg.find_results = [[], [{'type': 'Note', 'id': 1, 'note_links': []}]]
 
     assert session.scalars(select(note_cls).options(selectinload(note_cls.note_links))) == []
     empty_links = session.scalars(select(note_cls).options(selectinload(note_cls.note_links)))[0]
 
     assert empty_links.note_links == []
-    assert len([call for call in fake_sg._calls if call[0] == 'find']) == 2
+    assert len([call for call in fake_sg.calls if call[0] == 'find']) == 2
 
 
-def test_selectin_is_one_find_per_target_type(engine: Engine, fake_sg: _FakeShotgun) -> None:
-    fake_sg._find_results = [
+def test_selectin_is_one_find_per_target_type(engine: Engine, fake_sg: FakeShotgun) -> None:
+    fake_sg.find_results = [
         [
             {
                 'type': 'Note',
@@ -1159,7 +1142,7 @@ def test_selectin_is_one_find_per_target_type(engine: Engine, fake_sg: _FakeShot
 
     notes = session.scalars(select(note_cls).options(selectinload(note_cls.note_links)))
 
-    find_calls = [call for call in fake_sg._calls if call[0] == 'find']
+    find_calls = [call for call in fake_sg.calls if call[0] == 'find']
     assert len(find_calls) == 3
     assert find_calls[1][1][0] == 'Shot'
     assert find_calls[1][1][1] == [['id', 'in', [10, 11]]]
@@ -1171,10 +1154,10 @@ def test_selectin_is_one_find_per_target_type(engine: Engine, fake_sg: _FakeShot
 
 def test_selectin_preflights_all_observed_targets_before_secondary_query(
     engine: Engine,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
 ) -> None:
     engine.load_schema()
-    fake_sg._find_results = [
+    fake_sg.find_results = [
         [
             {
                 'type': 'Note',
@@ -1202,20 +1185,20 @@ def test_selectin_preflights_all_observed_targets_before_secondary_query(
         engine.registry.entity_class_for('FutureB', binding=None),
         engine.registry.entity_class_for('FutureA', binding=None),
     ]
-    assert [name for name, _, _ in fake_sg._calls].count('schema_read') == 2
+    assert [name for name, _, _ in fake_sg.calls].count('schema_read') == 2
     assert [call[1][0] for call in _find_calls(fake_sg)] == ['Note']
 
 
 def test_selectin_preserves_secondary_provider_fault(
     engine: Engine,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     error = RuntimeError('secondary find failed')
     original_find = fake_sg.find
     call_count = 0
 
-    def track_call(call: _SyncCallback[_P, _R]) -> _SyncCallback[_P, _R]:
+    def track_call(call: SyncCallback[_P, _R]) -> SyncCallback[_P, _R]:
         def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
             nonlocal call_count
             call_count += 1
@@ -1228,7 +1211,7 @@ def test_selectin_preserves_secondary_provider_fault(
     find = track_call(original_find)
 
     monkeypatch.setattr(fake_sg, 'find', find)
-    fake_sg._find_results = [[{'type': 'Shot', 'id': 1, 'assets': [{'type': 'Asset', 'id': 100}]}]]
+    fake_sg.find_results = [[{'type': 'Shot', 'id': 1, 'assets': [{'type': 'Asset', 'id': 100}]}]]
     session = Session(engine)
     shot_cls = engine.registry.entity_class('Shot')
 
@@ -1241,7 +1224,7 @@ def test_selectin_preserves_secondary_provider_fault(
 
 def test_selectin_recovers_exact_observed_opaque_target_for_secondary_phase(
     engine: Engine,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     schema_fixture: dict[str, Any],
 ) -> None:
@@ -1250,11 +1233,11 @@ def test_selectin_recovers_exact_observed_opaque_target_for_secondary_phase(
     refreshed_raw['FutureVendor'] = copy.deepcopy(refreshed_raw['CustomEntity03'])
 
     def refreshed_schema_read() -> dict[str, Any]:
-        fake_sg._record('schema_read')
+        fake_sg.record('schema_read')
         return refreshed_raw
 
     monkeypatch.setattr(fake_sg, 'schema_read', refreshed_schema_read)
-    fake_sg._find_results = [
+    fake_sg.find_results = [
         [
             {
                 'type': 'Shot',
@@ -1272,15 +1255,15 @@ def test_selectin_recovers_exact_observed_opaque_target_for_secondary_phase(
     opaque = shot.sg_vendor
     assert opaque.code == 'FV-9'
     assert session.merge_dict({'type': 'FutureVendor', 'id': 9}) is opaque
-    assert [name for name, _, _ in fake_sg._calls].count('schema_read') == 2
+    assert [name for name, _, _ in fake_sg.calls].count('schema_read') == 2
     assert [call[1][0] for call in _find_calls(fake_sg)] == ['Shot', 'FutureVendor']
 
 
 def test_selectin_rejects_corrupt_non_entity_link_values_before_secondary_query(
     engine: Engine,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
 ) -> None:
-    fake_sg._find_results = [
+    fake_sg.find_results = [
         [{'type': 'Shot', 'id': 1, 'assets': [{'type': 'Asset', 'id': 2}, 'corrupt']}]
     ]
     session = Session(engine)
@@ -1292,15 +1275,15 @@ def test_selectin_rejects_corrupt_non_entity_link_values_before_secondary_query(
     assert [call[1][0] for call in _find_calls(fake_sg)] == ['Shot']
 
 
-def test_unloaded_relationship_raises_not_queries(engine: Engine, fake_sg: _FakeShotgun) -> None:
-    fake_sg._find_results = [[{'type': 'Shot', 'id': 1, 'code': 'A'}]]
+def test_unloaded_relationship_raises_not_queries(engine: Engine, fake_sg: FakeShotgun) -> None:
+    fake_sg.find_results = [[{'type': 'Shot', 'id': 1, 'code': 'A'}]]
     session = Session(engine)
     shot_cls = engine.registry.entity_class('Shot')
     shot = session.scalars(select(shot_cls).options(load_only(shot_cls.code)))[0]
-    calls_before = len(fake_sg._calls)
+    calls_before = len(fake_sg.calls)
 
     with pytest.raises(UnfetchedFieldError) as excinfo:
         _ = shot.assets
 
     assert 'selectinload' in str(excinfo.value)
-    assert len(fake_sg._calls) == calls_before
+    assert len(fake_sg.calls) == calls_before

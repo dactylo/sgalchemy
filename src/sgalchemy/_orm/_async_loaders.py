@@ -46,9 +46,8 @@ async def _execute_selectin_refs(
             raised = error is not None
             completed = error if error is not None else result
         records = session.finish_execute_call_result(call, completed, raised=raised)
-        with session.hydration_scope():
-            for record in records:
-                session.hydrate_record(call.entity_type, record, binding)
+        for record in records:
+            session.hydrate_record(call.entity_type, record, binding)
 
 
 def _require_complete_parent_response(
@@ -163,10 +162,9 @@ async def load_relationship(
             fields=[field.filter_field],
             extra={'retired_only': True} if retired else {},
         )
-        records = await session.execute_call(call, binding)
-        with session.hydration_scope():
-            for record in records:
-                session.hydrate_record(field.root_type, record, binding)
+        records = await session.execute_call(call)
+        for record in records:
+            session.hydrate_record(field.root_type, record, binding)
         _require_complete_parent_response(objects, field, parent_ids)
     await execute_selectins(
         session,

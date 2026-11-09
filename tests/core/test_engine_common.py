@@ -1,20 +1,16 @@
-from typing import Any
-
 import pytest
-from _support import AUTHENTICATION_FAULT, BrokenNoteError
 
 from sgalchemy._core._engine_common import add_auth_note, add_note_once
+from tests._support import (
+    AUTHENTICATION_FAULT,
+    BrokenNoteError,
+    InterruptingNoteAccess,
+    UnclassifiableError,
+)
 
 
 class _DiagnosticSignal(BaseException):
     pass
-
-
-class _InterruptingNoteAccess(BaseException):
-    def __getattribute__(self, name: str) -> Any:  # noqa: ANN401 - Delegate BaseException attributes while interrupting note access.
-        if name == '__notes__':
-            raise KeyboardInterrupt
-        return super().__getattribute__(name)
 
 
 def test_add_auth_note_annotates_only_authentication_faults() -> None:
@@ -28,9 +24,15 @@ def test_add_auth_note_annotates_only_authentication_faults() -> None:
     assert target.__notes__ == [note]
 
 
+def test_add_auth_note_skips_unclassifiable_failure() -> None:
+    target = RuntimeError('target')
+    add_auth_note(UnclassifiableError('cleanup'), target, 'note')
+    assert getattr(target, '__notes__', []) == []
+
+
 def test_add_note_once_propagates_note_access_interruption() -> None:
     with pytest.raises(KeyboardInterrupt):
-        add_note_once(_InterruptingNoteAccess('interrupted'), 'diagnostic context')
+        add_note_once(InterruptingNoteAccess('interrupted'), 'diagnostic context')
 
 
 def test_add_note_once_returns_false_for_ordinary_annotation_failure() -> None:

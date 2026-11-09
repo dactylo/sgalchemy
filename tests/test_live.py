@@ -63,30 +63,30 @@ class _LiveSession:
         commit_error: Exception | None = None,
         rows: list[_LiveRecord] | None = None,
     ) -> None:
-        self._added: _LiveRecord | None = None
+        self.added: _LiveRecord | None = None
         self._assigned_id_before_error = assigned_id_before_error
-        self._closed = False
+        self.closed = False
         self._commit_error = commit_error
-        self._committed = False
-        self._deleted: _LiveRecord | None = None
-        self.engine = object()
+        self.committed = False
+        self.deleted: _LiveRecord | None = None
+        self._engine = object()
         self._rows = rows or []
 
     def add(self, obj: _LiveRecord) -> None:
-        self._added = obj
+        self.added = obj
 
     def close(self) -> None:
-        self._closed = True
+        self.closed = True
 
     def commit(self) -> None:
         if self._commit_error is not None:
-            if self._added is not None and self._assigned_id_before_error is not None:
-                self._added.id = self._assigned_id_before_error
+            if self.added is not None and self._assigned_id_before_error is not None:
+                self.added.id = self._assigned_id_before_error
             raise self._commit_error
-        self._committed = True
+        self.committed = True
 
     def delete(self, obj: _LiveRecord) -> None:
-        self._deleted = obj
+        self.deleted = obj
 
     def scalars(self, _statement: _LiveStatement) -> list[_LiveRecord]:
         return self._rows
@@ -161,6 +161,9 @@ def _run_live_contract(engine: Engine) -> None:
     persisted: Entity | None = None
     try:
         session.commit()
+        assert session.scalars(
+            select(entity_cls).where(field.in_([first_name, f'{first_name}-absent']))
+        ) == [obj]
         found = session.scalars(select(entity_cls).where(field == first_name))[0]
         setattr(found, name_field, second_name)
         session.commit()
@@ -237,14 +240,14 @@ def test_live_create_failure_attempts_fresh_cleanup(
     with pytest.raises(RuntimeError, match='create reconciliation failed'):
         _run_live_contract(engine)
 
-    assert original._closed
-    assert original._added is not None
-    assert original._added.id == assigned_id_before_error
-    assert lookup._closed
-    assert cleanup._deleted is discovered
-    assert cleanup._deleted is not original._added
-    assert cleanup._committed
-    assert cleanup._closed
+    assert original.closed
+    assert original.added is not None
+    assert original.added.id == assigned_id_before_error
+    assert lookup.closed
+    assert cleanup.deleted is discovered
+    assert cleanup.deleted is not original.added
+    assert cleanup.committed
+    assert cleanup.closed
 
 
 @pytest.mark.live
@@ -253,6 +256,30 @@ def test_live_create_query_update_cleanup(
 ) -> None:
     try:
         _run_live_contract(live_case)
+    finally:
+        live_case.dispose()
+
+
+@pytest.mark.live
+def test_live_relative_date_units_are_accepted(live_case: Engine) -> None:
+    try:
+        required = os.environ.get('SGALCHEMY_REQUIRE_LIVE') == '1'
+        try:
+            live_case.load_schema(force=True)
+        except ImportError as err:
+            if required:
+                pytest.fail(f'required live provider is unavailable: {err}')
+            pytest.skip(f'live provider is unavailable: {err}')
+        entity_type = os.environ['SGALCHEMY_LIVE_ENTITY_TYPE']
+        entity_cls = live_case.registry.entity_class(entity_type)
+        created_at = entity_cls.created_at
+        session = Session(live_case)
+        try:
+            # LIVE-PIN: relative-date units
+            for unit in ('HOUR', 'DAY', 'WEEK', 'MONTH', 'YEAR'):
+                session.scalars(select(entity_cls).where(created_at.in_last(1, unit)).limit(1))
+        finally:
+            session.close()
     finally:
         live_case.dispose()
 

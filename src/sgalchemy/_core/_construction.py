@@ -28,9 +28,9 @@ class StaticCredentials:
     the provider's original keyword names.
     """
 
-    _script_name: str | None = None
-    _api_key: str | None = dataclasses.field(default=None, repr=False)
-    _session_token: str | None = dataclasses.field(default=None, repr=False)
+    script_name: str | None = None
+    api_key: str | None = dataclasses.field(default=None, repr=False)
+    session_token: str | None = dataclasses.field(default=None, repr=False)
 
     def provider_kwargs(self) -> dict[str, str]:
         """Return the exact provider constructor keywords for this selection.
@@ -42,11 +42,11 @@ class StaticCredentials:
         Raises:
             RuntimeError: If the validated credential selection is incomplete.
         """
-        if self._session_token is not None:
-            return {'session_token': self._session_token}
-        if self._script_name is None or self._api_key is None:
+        if self.session_token is not None:
+            return {'session_token': self.session_token}
+        if self.script_name is None or self.api_key is None:
             raise RuntimeError('validated credentials are incomplete')
-        return {'script_name': self._script_name, 'api_key': self._api_key}
+        return {'script_name': self.script_name, 'api_key': self.api_key}
 
 
 def _is_async_callable(value: Callable[..., object]) -> bool:
@@ -190,6 +190,23 @@ def ensure_awaitable(result: object) -> Awaitable[object]:
     )
 
 
+def has_mismatched_methods(connection: object, *, asynchronous: bool) -> bool:
+    """Return whether any present provider call has the opposite call kind.
+
+    Args:
+        connection: Caller-supplied client to inspect.
+        asynchronous: Whether provider calls must be awaitable.
+
+    Returns:
+        True if a present required method declares the opposite call kind.
+    """
+    return any(
+        callable(member := getattr(connection, name, None))
+        and _is_async_callable(member) != asynchronous
+        for name in REQUIRED_SHOTGUN_METHODS
+    )
+
+
 def require_static_credential_https(site: str) -> None:
     """Reject plaintext transport for library-owned static credentials.
 
@@ -272,6 +289,4 @@ def validate_static_credentials(
         raise ValueError('pass either script_name with api_key or session_token, not both')
     if session_token is None and not has_script:
         raise ValueError('url requires script_name with api_key or session_token')
-    return StaticCredentials(
-        _script_name=script_name, _api_key=api_key, _session_token=session_token
-    )
+    return StaticCredentials(script_name=script_name, api_key=api_key, session_token=session_token)

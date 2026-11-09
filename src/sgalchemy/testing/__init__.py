@@ -9,7 +9,11 @@ It must not be used to assert production batch atomicity.
 
 import copy
 import pickle
+import shutil
+import tempfile
+import weakref
 from importlib import import_module
+from os import PathLike
 from pathlib import Path
 from typing import Any, Protocol, TypedDict, Unpack, cast
 
@@ -119,7 +123,7 @@ def _reset_mockgun_schema_factory(mockgun_module: _MockgunModule) -> None:
 
 def async_mockgun_connection(
     schema_cache: SchemaCache,
-    cache_root: Path,
+    cache_root: str | PathLike[str],
 ) -> AsyncShotgunLike:
     """Build the selected provider's configured async Mockgun client.
 
@@ -130,13 +134,15 @@ def async_mockgun_connection(
 
     Args:
         schema_cache: Raw field/entity schema payloads to install in Mockgun.
-        cache_root: Directory for the fixed Mockgun schema pickle files.
+        cache_root: Schema cache directory override, as a path or string.
 
     Returns:
         Configured `mockgun.AsyncShotgun` through the consumed async protocol.
 
     Raises:
         SgalchemyError: If the selected provider lacks async Mockgun support.
+        OSError: If the schema directory or pickle files cannot be created or
+            written.
     """
     try:
         mockgun = cast('_AsyncMockgunModule', import_module('shotgun_api3.lib.mockgun'))
@@ -150,7 +156,7 @@ def async_mockgun_connection(
         raise SgalchemyError(
             'selected provider lacks mockgun.AsyncShotgun; use sg-python-api[async]'
         ) from err
-    schema_path, entity_path = _prepare_mockgun_schema(schema_cache, cache_root)
+    schema_path, entity_path = _prepare_mockgun_schema(schema_cache, Path(cache_root))
     mockgun.Shotgun.set_schema_paths(schema_path, entity_path)
     return async_cls('https://mockgun.example.com')
 
@@ -158,19 +164,20 @@ def async_mockgun_connection(
 def engine_over(
     connection: ShotgunLike,
     *,
-    cache_root: Path | None = None,
+    cache_root: str | PathLike[str] | None = None,
     **kw: Unpack[_EngineOverOptions],
 ) -> Engine:
     """Create an isolated engine over a caller-provided test connection.
 
-    Each call defaults to a fresh `Registry` with `bind_default=False`.
+    Each call defaults to a fresh `Registry`, `bind_default=False`, and a
+    temporary schema cache removed when the engine is collected.
     Caller-supplied engine arguments override these isolation defaults;
     `bind_default=True` without `registry` opts into the process default.
 
     Args:
         connection: Fake or test provider implementing the synchronous Shotgun
             API surface.
-        cache_root: Schema cache directory override.
+        cache_root: Schema cache directory override, as a path or string.
         **kw: Additional arguments forwarded to `create_engine()`.
 
     Returns:
@@ -178,15 +185,29 @@ def engine_over(
 
     Raises:
         ValueError: If `connection.base_url` is not a valid site URL.
+        OSError: If the default temporary cache directory cannot be created.
     """
     engine_kw: _EngineOverOptions = {'registry': Registry(), 'bind_default': False}
     engine_kw.update(kw)
     if kw.get('bind_default') is True and 'registry' not in kw:
         engine_kw.pop('registry')
-    return create_engine(connection=connection, cache_root=cache_root, **engine_kw)
+    root = (
+        Path(cache_root)
+        if cache_root is not None
+        else Path(tempfile.mkdtemp(prefix='sgalchemy-engine-over-'))
+    )
+    try:
+        engine = create_engine(connection=connection, cache_root=root, **engine_kw)
+    except Exception:
+        if cache_root is None:
+            shutil.rmtree(root, ignore_errors=True)
+        raise
+    if cache_root is None:
+        weakref.finalize(engine, shutil.rmtree, root, ignore_errors=True)
+    return engine
 
 
-def mockgun_engine(schema_cache: SchemaCache, cache_root: Path) -> Engine:
+def mockgun_engine(schema_cache: SchemaCache, cache_root: str | PathLike[str]) -> Engine:
     """Create an isolated prepared engine backed by the selected Mockgun.
 
     Replaces Mockgun's process-global schema paths and clears legacy schema
@@ -195,31 +216,35 @@ def mockgun_engine(schema_cache: SchemaCache, cache_root: Path) -> Engine:
 
     Args:
         schema_cache: Schema snapshot used to initialize Mockgun.
-        cache_root: Directory for Mockgun schema pickles and the engine cache.
+        cache_root: Schema cache directory override, as a path or string.
 
     Returns:
         Prepared synchronous engine backed by an in-memory Mockgun connection.
 
     Raises:
         SgalchemyError: If the selected provider's Mockgun module is
-            unavailable.
+            unavailable or schema preparation rejects its payload.
+        OSError: If the schema directory or pickle files cannot be created or
+            written.
+        Exception: Other provider setup or schema-preparation failures,
+            unwrapped.
     """
     try:
-        from shotgun_api3.lib import mockgun  # noqa: PLC0415
+        mockgun = cast('_MockgunModule', import_module('shotgun_api3.lib.mockgun'))
     except ImportError as err:
         raise SgalchemyError(
             "Mockgun is unavailable; install the 'sgalchemy[official]' extra"
         ) from err
 
-    schema_path, entity_path = _prepare_mockgun_schema(schema_cache, cache_root)
-    mockgun_module = cast('_MockgunModule', mockgun)
-    _reset_mockgun_schema_factory(mockgun_module)
-    mockgun_factory = mockgun_module.Shotgun
+    root = Path(cache_root)
+    schema_path, entity_path = _prepare_mockgun_schema(schema_cache, root)
+    _reset_mockgun_schema_factory(mockgun)
+    mockgun_factory = mockgun.Shotgun
     mockgun_factory.set_schema_paths(schema_path, entity_path)
     connection = mockgun_factory('https://mockgun.example.com')
     engine = create_engine(
         connection=connection,
-        cache_root=cache_root,
+        cache_root=root,
         registry=Registry(),
         bind_default=False,
     )

@@ -11,8 +11,6 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-from _fakes import _FakeShotgun
-from _support import fetch_schema, reset_default_registry_state
 
 import sgalchemy
 from sgalchemy import _errors, _shotgun
@@ -36,6 +34,8 @@ from sgalchemy._errors import SgalchemyError, StaleObjectError, UnfetchedFieldEr
 from sgalchemy._orm._session import Session
 from sgalchemy.schema import _model
 from sgalchemy.schema._model import EntitySchema
+from tests._fakes import FakeShotgun
+from tests._support import SyncSessionBundle, fetch_schema, reset_default_registry_state
 
 
 class _LazyContext:
@@ -58,7 +58,24 @@ def _assert_field_provenance_containers(
     assert state.clean_unverified_writes == expected.clean_unverified_writes
 
 
-def _connect(fake_sg: _FakeShotgun, tmp_path: Path) -> Session:
+def _attach_for_assignment(obj: Entity, fake_sg: FakeShotgun, tmp_path: Path) -> Session:
+    state = entity_state(obj)
+    access_guard = state.access_guard
+    state.access_guard = None
+    engine = sgalchemy.create_engine(
+        connection=fake_sg,
+        cache_root=tmp_path,
+        registry=entity_registry(type(obj)),
+        bind_default=False,
+    )
+    session = Session(engine)
+    session.add(obj)
+    # Keep the fixture's access hook so binding and guard assertions remain exact.
+    state.access_guard = access_guard
+    return session
+
+
+def _connect(fake_sg: FakeShotgun, tmp_path: Path) -> Session:
     engine = sgalchemy.create_engine(
         connection=fake_sg,
         cache_root=tmp_path,
@@ -92,7 +109,7 @@ def _field_provenance_state(
     return state, field_code, clean_value, dirty_value, lazy_context
 
 
-def _serializable_registry(fake_sg: _FakeShotgun) -> Registry:
+def _serializable_registry(fake_sg: FakeShotgun) -> Registry:
     cache = fetch_schema(fake_sg)
     cache.fields['Shot']['description']['data_type']['value'] = 'serializable'
     registry = Registry()
@@ -105,25 +122,20 @@ def _stage_field_provenance(
     field_code: str,
     dirty_value: Path,
 ) -> None:
-    if field_code in state.loaded:
-        state.clean[field_code] = state.loaded[field_code]
-    if field_code in state.refresh_required:
-        state.clean_refresh_required.add(field_code)
-    if field_code in state.unverified_writes:
-        state.clean_unverified_writes.add(field_code)
+    state.capture_assignment_snapshot(field_code)
     state.loaded[field_code] = dirty_value
     state.dirty[field_code] = dirty_value
     state.dirty_types[field_code] = 'image'
 
 
 @pytest.fixture
-def bound(fake_sg: _FakeShotgun) -> Registry:
+def bound(fake_sg: FakeShotgun) -> Registry:
     registry = Registry()
     registry.bind(_model.build_schema(fetch_schema(fake_sg)), key=fake_sg.base_url)
     return registry
 
 
-def test_as_dict_allows_shared_acyclic_containers(fake_sg: _FakeShotgun) -> None:
+def test_as_dict_allows_shared_acyclic_containers(fake_sg: FakeShotgun) -> None:
     registry = _serializable_registry(fake_sg)
     shot_cls = registry.entity_class('Shot')
     shot = shot_cls.__new__(shot_cls)
@@ -138,7 +150,7 @@ def test_as_dict_allows_shared_acyclic_containers(fake_sg: _FakeShotgun) -> None
 
 
 def test_as_dict_converts_entities_nested_in_mappings_and_tuples(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
 ) -> None:
     registry = _serializable_registry(fake_sg)
     sequence_cls = registry.entity_class('Sequence')
@@ -171,7 +183,7 @@ def test_as_dict_converts_entities_nested_in_mappings_and_tuples(
     }
 
 
-def test_as_dict_json_serializes_nested_containers(fake_sg: _FakeShotgun) -> None:
+def test_as_dict_json_serializes_nested_containers(fake_sg: FakeShotgun) -> None:
     registry = _serializable_registry(fake_sg)
     sequence_cls = registry.entity_class('Sequence')
     sequence = sequence_cls.__new__(sequence_cls)
@@ -191,7 +203,7 @@ def test_as_dict_json_serializes_nested_containers(fake_sg: _FakeShotgun) -> Non
     assert encoded['description'] == {'nested': [{'type': 'Sequence', 'id': 7, 'name': 'SQ01'}]}
 
 
-def test_as_dict_rejects_cyclic_containers_with_domain_error(fake_sg: _FakeShotgun) -> None:
+def test_as_dict_rejects_cyclic_containers_with_domain_error(fake_sg: FakeShotgun) -> None:
     registry = _serializable_registry(fake_sg)
     shot_cls = registry.entity_class('Shot')
     shot = shot_cls.__new__(shot_cls)
@@ -208,8 +220,22 @@ def test_as_dict_rejects_cyclic_containers_with_domain_error(fake_sg: _FakeShotg
     )
 
 
+def test_as_dict_rejects_outdated_link(bound: Registry) -> None:
+    sequence = bound.entity_class('Sequence').new(code='SQ01')
+    entity_state(sequence).outdated = ('Sequence', 7)
+    shot = bound.entity_class('Shot').new(sg_sequence=sequence)
+
+    with pytest.raises(SgalchemyError) as exc_info:
+        shot.as_dict()
+
+    assert str(exc_info.value) == (
+        'Sequence(id=7) is outdated: SG saved your change, but sgalchemy could '
+        'not update this copy; discard it and query the record again'
+    )
+
+
 def test_as_dict_uses_one_binding_snapshot(
-    fake_sg: _FakeShotgun, monkeypatch: pytest.MonkeyPatch
+    fake_sg: FakeShotgun, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     registry = Registry()
     schemas = _model.build_schema(fetch_schema(fake_sg))
@@ -258,7 +284,7 @@ def test_base_entity_missing_class_field_uses_attribute_protocol() -> None:
     assert object.__getattribute__(expression, '_schemas') is None
 
 
-def test_binding_detaches_and_freezes_caller_schema(fake_sg: _FakeShotgun) -> None:
+def test_binding_detaches_and_freezes_caller_schema(fake_sg: FakeShotgun) -> None:
     registry = Registry()
     schemas = _model.build_schema(fetch_schema(fake_sg))
     original_shot = schemas['Shot']
@@ -282,7 +308,7 @@ def test_binding_detaches_and_freezes_caller_schema(fake_sg: _FakeShotgun) -> No
         binding.schemas['Shot'].fields['description'] = binding.schemas['Shot'].fields['id']
 
 
-def test_binding_skips_aliases_shadowed_by_entity_api(fake_sg: _FakeShotgun) -> None:
+def test_binding_skips_aliases_shadowed_by_entity_api(fake_sg: FakeShotgun) -> None:
     cache = fetch_schema(fake_sg)
     for code in ('sg_mro', 'sg_new'):
         cache.fields['Shot'][code] = {
@@ -327,8 +353,25 @@ def test_bound_class_expressions_aliases_and_identity(bound: Registry) -> None:
         bound.entity_class('NoSuchType')
 
 
+def test_class_field_typo_suggests_a_match(engine: sgalchemy.Engine) -> None:
+    engine.load_schema()
+    with pytest.raises(AttributeError) as excinfo:
+        _ = engine.entities.Shot.sg_stauts
+    assert str(excinfo.value) == (
+        "Shot has no field or field alias 'sg_stauts'; did you mean 'sg_status_list'?"
+    )
+    assert excinfo.value.name == 'sg_stauts'
+    assert excinfo.value.obj is None
+
+    with pytest.raises(AttributeError) as excinfo:
+        _ = engine.entities.Shot.status_lsit
+    assert str(excinfo.value) == (
+        "Shot has no field or field alias 'status_lsit'; did you mean 'status_list'?"
+    )
+
+
 def test_concurrent_canonical_and_alias_materialization_share_one_class(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry = Registry()
@@ -362,7 +405,7 @@ def test_concurrent_canonical_and_alias_materialization_share_one_class(
 
     tracking_lock.__enter__.side_effect = enter_lock
     tracking_lock.__exit__.side_effect = exit_lock
-    monkeypatch.setattr(registry, '_class_lock', tracking_lock)
+    monkeypatch.setattr(registry, 'class_lock', tracking_lock)
     monkeypatch.setattr(registry, '_build', blocking_build)
 
     def lookup(name: str) -> type[Entity]:
@@ -382,7 +425,7 @@ def test_concurrent_canonical_and_alias_materialization_share_one_class(
 
 
 def test_concurrent_first_bind_rejects_a_different_site(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry = Registry()
@@ -465,17 +508,11 @@ def test_default_registry_replacement_contract(monkeypatch: pytest.MonkeyPatch) 
 def test_default_registry_transition_rechecks_materialization_before_commit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    reset_default_registry_state(monkeypatch)
     current = Registry()
     replacement = Registry()
     owner = object()
     monkeypatch.setattr(registry_module, '_DEFAULT_REGISTRIES', [current])
-    monkeypatch.setattr(registry_module, '_DEFAULT_SESSION_REGISTRIES', [], raising=False)
-    monkeypatch.setattr(
-        registry_module,
-        '_DEFAULT_TRANSITION',
-        {'reserved': False},
-        raising=False,
-    )
     registry_module.reserve_default_registry_transition(owner)
     current.entity_class('Shot')
 
@@ -496,17 +533,11 @@ def test_default_registry_transition_rechecks_materialization_before_commit(
 def test_default_registry_transition_release_allows_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    reset_default_registry_state(monkeypatch)
     current = Registry()
     replacement = Registry()
     owner = object()
     monkeypatch.setattr(registry_module, '_DEFAULT_REGISTRIES', [current])
-    monkeypatch.setattr(registry_module, '_DEFAULT_SESSION_REGISTRIES', [], raising=False)
-    monkeypatch.setattr(
-        registry_module,
-        '_DEFAULT_TRANSITION',
-        {'reserved': False},
-        raising=False,
-    )
 
     assert registry_module.reserve_default_registry_transition(owner) is current
     registry_module.release_default_registry_transition(owner)
@@ -520,18 +551,12 @@ def test_default_registry_transition_release_allows_retry(
 def test_default_registry_transition_release_requires_matching_owner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    reset_default_registry_state(monkeypatch)
     current = Registry()
     replacement = Registry()
     owner = object()
     competitor = object()
     monkeypatch.setattr(registry_module, '_DEFAULT_REGISTRIES', [current])
-    monkeypatch.setattr(registry_module, '_DEFAULT_SESSION_REGISTRIES', [], raising=False)
-    monkeypatch.setattr(
-        registry_module,
-        '_DEFAULT_TRANSITION',
-        {'reserved': False},
-        raising=False,
-    )
 
     assert registry_module.reserve_default_registry_transition(owner) is current
     with pytest.raises(SgalchemyError, match='connection is establishing'):
@@ -548,16 +573,10 @@ def test_default_registry_transition_release_requires_matching_owner(
 def test_default_registry_transition_reserves_setter_and_records_session_pairing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    reset_default_registry_state(monkeypatch)
     current = Registry()
     owner = object()
     monkeypatch.setattr(registry_module, '_DEFAULT_REGISTRIES', [current])
-    monkeypatch.setattr(registry_module, '_DEFAULT_SESSION_REGISTRIES', [], raising=False)
-    monkeypatch.setattr(
-        registry_module,
-        '_DEFAULT_TRANSITION',
-        {'reserved': False},
-        raising=False,
-    )
     reserved = registry_module.reserve_default_registry_transition(owner)
 
     assert reserved is current
@@ -672,7 +691,7 @@ def test_default_replacement_wins_before_old_materialization(
 
     tracking_lock.__enter__.side_effect = enter_lock
     tracking_lock.__exit__.side_effect = exit_lock
-    monkeypatch.setattr(current, '_class_lock', tracking_lock)
+    monkeypatch.setattr(current, 'class_lock', tracking_lock)
     with ThreadPoolExecutor(max_workers=2) as pool:
         replacing = pool.submit(set_default_registry, replacement)
         assert setter_has_class_lock.wait(timeout=2)
@@ -686,7 +705,7 @@ def test_default_replacement_wins_before_old_materialization(
 
 
 def test_editable_nonconventional_image_assignment_remains_unsupported(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun, tmp_path: Path
 ) -> None:
     registry = Registry()
     schemas = _model.build_schema(fetch_schema(fake_sg))
@@ -699,6 +718,7 @@ def test_editable_nonconventional_image_assignment_remains_unsupported(
     shot_cls = registry.entity_class('Shot')
     shot = shot_cls.__new__(shot_cls)
     initialize_entity(shot, EntityState(entity_type='Shot', id=12))
+    _attach_for_assignment(shot, fake_sg, tmp_path)
 
     with pytest.raises(SgalchemyError, match=r'only.*image.*filmstrip_image'):
         shot.description = '/renders/thumbnail.jpg'
@@ -718,13 +738,7 @@ def test_empty_default_registry_can_replace_initializes_default(
 def test_empty_default_registry_reservation_initializes_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(registry_module, '_DEFAULT_REGISTRIES', [])
-    monkeypatch.setattr(
-        registry_module,
-        '_DEFAULT_TRANSITION',
-        {'reserved': False},
-        raising=False,
-    )
+    reset_default_registry_state(monkeypatch)
 
     owner = object()
     reserved = registry_module.reserve_default_registry_transition(owner)
@@ -736,16 +750,10 @@ def test_empty_default_registry_reservation_initializes_default(
 def test_empty_default_registry_transition_commit_replaces_lazy_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    reset_default_registry_state(monkeypatch)
     replacement = Registry()
     published: list[None] = []
-    monkeypatch.setattr(registry_module, '_DEFAULT_REGISTRIES', [])
-    monkeypatch.setattr(registry_module, '_DEFAULT_SESSION_REGISTRIES', [], raising=False)
-    monkeypatch.setattr(
-        registry_module,
-        '_DEFAULT_TRANSITION',
-        {'reserved': True},
-        raising=False,
-    )
+    vars(registry_module)['_DEFAULT_TRANSITION_OWNER'].append(object())
 
     registry_module.commit_default_registry_transition(
         replacement,
@@ -756,6 +764,19 @@ def test_empty_default_registry_transition_commit_replaces_lazy_default(
     assert default_registry() is replacement
     assert vars(registry_module)['_DEFAULT_SESSION_REGISTRIES'] == [replacement]
     assert published == [None]
+
+
+def test_entity_find_rejects_non_conditions_before_session_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(registry_module, '_ENTITY_FINDERS', [])
+    invalid = True
+    with pytest.raises(TypeError) as excinfo:
+        Entity.find(invalid)  # pyright: ignore[reportArgumentType]
+    assert str(excinfo.value) == (
+        "find() takes filter conditions (Filter, FilterGroup, or RawFilters), not bool; Python's "
+        'in, and, and or were already evaluated, so use field.in_(), and_(), or or_() instead'
+    )
 
 
 def test_entity_state_accept_unstaged_value_drops_stale_first_write_markers() -> None:
@@ -791,13 +812,13 @@ def test_entity_state_capture_assignment_snapshot_transition_matrix(
         prior_unverified_write,
     )
 
-    state._capture_assignment_snapshot(field_code)
+    state.capture_assignment_snapshot(field_code)
     state.refresh_required.discard(field_code)
     state.unverified_writes.discard(field_code)
     state.dirty[field_code] = dirty_value
     state.dirty_types[field_code] = 'image'
     state.loaded[field_code] = dirty_value
-    state._capture_assignment_snapshot(field_code)
+    state.capture_assignment_snapshot(field_code)
 
     expected = EntityState(
         entity_type='Shot',
@@ -1061,7 +1082,9 @@ def test_entity_state_retire_upload_field_clears_uncertain_write() -> None:
     assert state.unverified_writes == set()
 
 
-def test_expired_access_guard_and_indeterminate_contracts(bound: Registry) -> None:
+def test_expired_access_guard_and_indeterminate_contracts(
+    bound: Registry, fake_sg: FakeShotgun, tmp_path: Path
+) -> None:
     shot_cls = bound.entity_class('Shot')
     guarded = shot_cls.__new__(shot_cls)
     calls: list[EntityState] = []
@@ -1074,6 +1097,7 @@ def test_expired_access_guard_and_indeterminate_contracts(bound: Registry) -> No
             access_guard=calls.append,
         ),
     )
+    _attach_for_assignment(guarded, fake_sg, tmp_path)
     assert guarded.code == 'AB'
     guarded.description = 'new'
     assert guarded.as_dict()['description'] == 'new'
@@ -1085,6 +1109,14 @@ def test_expired_access_guard_and_indeterminate_contracts(bound: Registry) -> No
     assert repr(guarded) == 'Shot(indeterminate)'
     with pytest.raises(SgalchemyError, match='indeterminate server outcome'):
         assert_entity_access(guarded)
+
+
+def test_field_typo_never_suggests_a_ui_only_field(engine: sgalchemy.Engine) -> None:
+    engine.load_schema()
+    for typo in ('sg_qc_sumary', 'qc_sumary'):
+        with pytest.raises(AttributeError) as excinfo:
+            getattr(engine.entities.Shot, typo)
+        assert str(excinfo.value) == f'Shot has no field or field alias {typo!r}'
 
 
 def test_inspect_enforces_access_guard_and_indeterminate_state() -> None:
@@ -1111,10 +1143,10 @@ def test_inspect_enforces_access_guard_and_indeterminate_state() -> None:
 
 
 def test_inspect_returns_guarded_detached_state_snapshot(
-    fake_sg: _FakeShotgun, tmp_path: Path
+    fake_sg: FakeShotgun, tmp_path: Path
 ) -> None:
     session = _connect(fake_sg, tmp_path)
-    fake_sg._find_results = [[{'type': 'Shot', 'id': 1, 'code': 'A'}]]
+    fake_sg.find_results = [[{'type': 'Shot', 'id': 1, 'code': 'A'}]]
     shot_cls = session.engine.registry.entity_class('Shot')
     shot = session.scalars(sgalchemy.select(shot_cls))[0]
     shot.code = 'B'
@@ -1141,10 +1173,34 @@ def test_inspect_returns_guarded_detached_state_snapshot(
     assert state.unverified_writes == {'sg_status_list'}
 
 
-def test_instance_state_repr_and_assignment_errors(bound: Registry) -> None:
+def test_instance_field_typo_names_the_type_and_suggests_a_match(
+    sess: SyncSessionBundle,
+) -> None:
+    session, engine, _fake = sess
+    engine.load_schema()
+    shot = session.merge_dict({'type': 'Shot', 'id': 1, 'code': 'A'})
+    with pytest.raises(AttributeError) as excinfo:
+        _ = shot.sg_stauts
+    assert str(excinfo.value) == (
+        "Shot has no field or field alias 'sg_stauts'; did you mean 'sg_status_list'?"
+    )
+    assert excinfo.value.name == 'sg_stauts'
+    assert excinfo.value.obj is None
+    with pytest.raises(AttributeError) as excinfo:
+        _ = shot.zzzz
+    assert str(excinfo.value) == "Shot has no field or field alias 'zzzz'"
+    with pytest.raises(AttributeError) as excinfo:
+        _ = shot._missing
+    assert str(excinfo.value) == '_missing'
+
+
+def test_instance_state_repr_and_assignment_errors(
+    bound: Registry, fake_sg: FakeShotgun, tmp_path: Path
+) -> None:
     shot_cls = bound.entity_class('Shot')
     obj = shot_cls.__new__(shot_cls)
     initialize_entity(obj, EntityState(entity_type='Shot', id=12, loaded={'id': 12, 'code': 'AB'}))
+    _attach_for_assignment(obj, fake_sg, tmp_path)
     assert obj.code == 'AB'
     assert repr(obj) == "Shot(id=12, code='AB')"
     with pytest.raises(UnfetchedFieldError, match=r'load_only.*joinedload.*selectinload'):
@@ -1160,7 +1216,9 @@ def test_instance_state_repr_and_assignment_errors(bound: Registry) -> None:
         obj.sg_qc_summary = 'oops'
 
 
-def test_instance_write_captures_binding_after_access_guard(fake_sg: _FakeShotgun) -> None:
+def test_instance_write_captures_binding_after_access_guard(
+    fake_sg: FakeShotgun, tmp_path: Path
+) -> None:
     registry = Registry()
     schemas = _model.build_schema(fetch_schema(fake_sg))
     registry.bind(schemas, key=fake_sg.base_url)
@@ -1177,36 +1235,15 @@ def test_instance_write_captures_binding_after_access_guard(fake_sg: _FakeShotgu
         shot,
         EntityState(entity_type='Shot', id=10, access_guard=refresh),
     )
+    _attach_for_assignment(shot, fake_sg, tmp_path)
     with pytest.raises(AttributeError, match='nothing was staged'):
         shot.description = 'new'
     assert entity_state(shot).dirty == {}
     assert entity_state(shot).loaded == {}
 
 
-def test_instance_write_updates_dirty_type_from_current_binding(fake_sg: _FakeShotgun) -> None:
-    registry = Registry()
-    schemas = _model.build_schema(fetch_schema(fake_sg))
-    registry.bind(schemas, key=fake_sg.base_url)
-    shot_cls = registry.entity_class('Shot')
-    shot = shot_cls.__new__(shot_cls)
-    initialize_entity(shot, EntityState(entity_type='Shot', id=10))
-    shot.description = 'ordinary text'
-    assert entity_state(shot).dirty_types == {'description': 'text'}
-
-    fields = dict(schemas['Shot'].fields)
-    fields['description'] = replace(fields['description'], data_type='image')
-    registry.bind(
-        {**schemas, 'Shot': replace(schemas['Shot'], fields=fields)},
-        key=fake_sg.base_url,
-    )
-    with pytest.raises(SgalchemyError, match=r'only.*image.*filmstrip_image'):
-        shot.description = '/renders/thumbnail.jpg'
-    assert entity_state(shot).dirty_types == {'description': 'text'}
-
-
-def test_instance_write_uses_one_binding_snapshot(
-    fake_sg: _FakeShotgun,
-    monkeypatch: pytest.MonkeyPatch,
+def test_instance_write_updates_dirty_type_from_current_binding(
+    fake_sg: FakeShotgun, tmp_path: Path
 ) -> None:
     registry = Registry()
     schemas = _model.build_schema(fetch_schema(fake_sg))
@@ -1214,6 +1251,41 @@ def test_instance_write_uses_one_binding_snapshot(
     shot_cls = registry.entity_class('Shot')
     shot = shot_cls.__new__(shot_cls)
     initialize_entity(shot, EntityState(entity_type='Shot', id=10))
+    _attach_for_assignment(shot, fake_sg, tmp_path)
+    shot.description = 'ordinary text'
+    assert entity_state(shot).dirty_types == {'description': 'text'}
+
+    fields = dict(schemas['Shot'].fields)
+    fields['description'] = replace(fields['description'], data_type='date')
+    registry.bind(
+        {**schemas, 'Shot': replace(schemas['Shot'], fields=fields)},
+        key=fake_sg.base_url,
+    )
+    shot.description = '2026-11-05'
+    assert entity_state(shot).dirty == {'description': '2026-11-05'}
+    assert entity_state(shot).dirty_types == {'description': 'date'}
+
+    fields['description'] = replace(fields['description'], data_type='image')
+    registry.bind(
+        {**schemas, 'Shot': replace(schemas['Shot'], fields=fields)},
+        key=fake_sg.base_url,
+    )
+    with pytest.raises(SgalchemyError, match=r'only.*image.*filmstrip_image'):
+        shot.description = '/renders/thumbnail.jpg'
+    assert entity_state(shot).dirty_types == {'description': 'date'}
+    assert entity_state(shot).dirty == {'description': '2026-11-05'}
+
+
+def test_instance_write_uses_one_binding_snapshot(
+    fake_sg: FakeShotgun, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    registry = Registry()
+    schemas = _model.build_schema(fetch_schema(fake_sg))
+    registry.bind(schemas, key=fake_sg.base_url)
+    shot_cls = registry.entity_class('Shot')
+    shot = shot_cls.__new__(shot_cls)
+    initialize_entity(shot, EntityState(entity_type='Shot', id=10))
+    _attach_for_assignment(shot, fake_sg, tmp_path)
     fields = dict(schemas['Shot'].fields)
     fields.pop('sg_status_list')
     changed = {**schemas, 'Shot': replace(schemas['Shot'], fields=fields)}
@@ -1264,7 +1336,7 @@ def test_internal_contracts_and_recursive_link_serialization(bound: Registry) ->
     }
 
 
-def test_known_names_returns_detached_snapshots(fake_sg: _FakeShotgun) -> None:
+def test_known_names_returns_detached_snapshots(fake_sg: FakeShotgun) -> None:
     registry = Registry()
     registry.entity_class('Shot')
     unbound_names = registry.known_names()
@@ -1292,9 +1364,7 @@ def test_new_requires_bound_schema() -> None:
 
 @pytest.mark.parametrize('field_code', ['image', 'filmstrip_image'])
 def test_noneditable_conventional_thumbnail_paths_remain_supported(
-    bound: Registry,
-    tmp_path: Path,
-    field_code: str,
+    bound: Registry, tmp_path: Path, field_code: str, fake_sg: FakeShotgun
 ) -> None:
     shot_cls = bound.entity_class('Shot')
     shot = shot_cls.__new__(shot_cls)
@@ -1306,6 +1376,7 @@ def test_noneditable_conventional_thumbnail_paths_remain_supported(
             loaded={'id': 12, 'image': 'old', 'filmstrip_image': 'old-strip'},
         ),
     )
+    _attach_for_assignment(shot, fake_sg, tmp_path)
     path = tmp_path / 'thumb.jpg'
     path.write_bytes(b'image')
 
@@ -1315,27 +1386,35 @@ def test_noneditable_conventional_thumbnail_paths_remain_supported(
     assert state.dirty == {field_code: path}
 
 
-def test_noneditable_filmstrip_clear_keeps_teaching_error(bound: Registry) -> None:
+def test_noneditable_filmstrip_clear_keeps_teaching_error(
+    bound: Registry, fake_sg: FakeShotgun, tmp_path: Path
+) -> None:
     shot_cls = bound.entity_class('Shot')
     shot = shot_cls.__new__(shot_cls)
     initialize_entity(shot, EntityState(entity_type='Shot', id=12))
+    _attach_for_assignment(shot, fake_sg, tmp_path)
 
     with pytest.raises(SgalchemyError, match=r'image=None'):
         shot.filmstrip_image = None
     assert entity_state(shot).dirty == {}
 
 
-def test_noneditable_id_assignment_keeps_specific_error(bound: Registry) -> None:
+def test_noneditable_id_assignment_keeps_specific_error(
+    bound: Registry, fake_sg: FakeShotgun, tmp_path: Path
+) -> None:
     shot_cls = bound.entity_class('Shot')
     shot = shot_cls.__new__(shot_cls)
     initialize_entity(shot, EntityState(entity_type='Shot', id=12))
+    _attach_for_assignment(shot, fake_sg, tmp_path)
 
     with pytest.raises(AttributeError, match='assigned by the server'):
         shot.id = 13
     assert entity_state(shot).dirty == {}
 
 
-def test_noneditable_image_clear_remains_supported(bound: Registry, tmp_path: Path) -> None:
+def test_noneditable_image_clear_remains_supported(
+    bound: Registry, tmp_path: Path, fake_sg: FakeShotgun
+) -> None:
     shot_cls = bound.entity_class('Shot')
     shot = shot_cls.__new__(shot_cls)
     initialize_entity(
@@ -1346,6 +1425,7 @@ def test_noneditable_image_clear_remains_supported(bound: Registry, tmp_path: Pa
             loaded={'id': 12, 'image': 'old', 'filmstrip_image': 'old-strip'},
         ),
     )
+    _attach_for_assignment(shot, fake_sg, tmp_path)
     path = tmp_path / 'strip.jpg'
     path.write_bytes(b'image')
 
@@ -1358,7 +1438,9 @@ def test_noneditable_image_clear_remains_supported(bound: Registry, tmp_path: Pa
     assert state.dirty == {'image': None}
 
 
-def test_noneditable_ordinary_assignment_preserves_state(fake_sg: _FakeShotgun) -> None:
+def test_noneditable_ordinary_assignment_preserves_state(
+    fake_sg: FakeShotgun, tmp_path: Path
+) -> None:
     cache = fetch_schema(fake_sg)
     cache.fields['Shot']['description']['editable'] = {'value': False}
     registry = Registry()
@@ -1373,7 +1455,8 @@ def test_noneditable_ordinary_assignment_preserves_state(fake_sg: _FakeShotgun) 
         unverified_writes={'description'},
     )
     initialize_entity(shot, state)
-    before = copy.deepcopy(state)
+    _attach_for_assignment(shot, fake_sg, tmp_path)
+    before = copy.deepcopy(state, {id(state.session): state.session})
 
     with pytest.raises(SgalchemyError) as excinfo:
         shot.description = 'new'
@@ -1387,7 +1470,9 @@ def test_noneditable_ordinary_assignment_preserves_state(fake_sg: _FakeShotgun) 
     assert state == before
 
 
-def test_opaque_entity_access_mutation_and_protocol_probes(bound: Registry) -> None:
+def test_opaque_entity_access_mutation_and_protocol_probes(
+    bound: Registry, fake_sg: FakeShotgun, tmp_path: Path
+) -> None:
     opaque_cls = bound.entity_class_for('FutureVendor', binding=None)
     opaque = opaque_cls.__new__(opaque_cls)
     initialize_entity(
@@ -1398,6 +1483,7 @@ def test_opaque_entity_access_mutation_and_protocol_probes(bound: Registry) -> N
             loaded={'id': 9, 'name': 'Future Co'},
         ),
     )
+    session = _attach_for_assignment(opaque, fake_sg, tmp_path)
 
     assert repr(opaque) == 'FutureVendor(id=9)'
     assert opaque.name == 'Future Co'
@@ -1418,6 +1504,7 @@ def test_opaque_entity_access_mutation_and_protocol_probes(bound: Registry) -> N
     with pytest.raises(_errors.SchemaUnavailableError, match='FutureVendor'):
         opaque_cls.new(code='blocked')
     assert entity_state(opaque).dirty == {}
+    session.close()
     assert copy.copy(opaque) is not opaque
     assert copy.deepcopy(opaque) is not opaque
     try:
@@ -1428,20 +1515,42 @@ def test_opaque_entity_access_mutation_and_protocol_probes(bound: Registry) -> N
         pass
 
 
+def test_outdated_entity_rejects_access_before_indeterminate(bound: Registry) -> None:
+    shot = bound.entity_class('Shot').new(code='test')
+    state = entity_state(shot)
+    state.outdated = ('Shot', 26)
+    state.indeterminate = True
+    expected = (
+        'Shot(id=26) is outdated: SG saved your change, but sgalchemy could not '
+        'update this copy; discard it and query the record again'
+    )
+    for access in (
+        lambda: shot.code,
+        lambda: setattr(shot, 'code', 'changed'),
+        shot.as_dict,
+        lambda: inspect(shot),
+    ):
+        with pytest.raises(SgalchemyError) as exc_info:
+            access()
+        assert str(exc_info.value) == expected
+        assert 'indeterminate' not in str(exc_info.value)
+
+
+def test_outdated_entity_repr(bound: Registry) -> None:
+    shot = bound.entity_class('Shot').new(code='test')
+    entity_state(shot).outdated = ('Shot', 26)
+
+    assert repr(shot) == 'Shot(id=26, outdated)'
+
+
 def test_private_session_repair_is_gated_by_outgoing_materialization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    reset_default_registry_state(monkeypatch)
     current = Registry()
     private = Registry()
     owner = object()
     monkeypatch.setattr(registry_module, '_DEFAULT_REGISTRIES', [current])
-    monkeypatch.setattr(registry_module, '_DEFAULT_SESSION_REGISTRIES', [], raising=False)
-    monkeypatch.setattr(
-        registry_module,
-        '_DEFAULT_TRANSITION',
-        {'reserved': False},
-        raising=False,
-    )
     registry_module.reserve_default_registry_transition(owner)
     registry_module.commit_default_registry_transition(
         private,
@@ -1457,7 +1566,7 @@ def test_private_session_repair_is_gated_by_outgoing_materialization(
 
 
 def test_rebind_publishes_one_atomic_snapshot(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry = Registry()
@@ -1495,7 +1604,7 @@ def test_rebind_publishes_one_atomic_snapshot(
     assert object.__getattribute__(registry, '_binding') is not old_binding
 
 
-def test_rebind_same_site_refreshes_and_foreign_site_raises(fake_sg: _FakeShotgun) -> None:
+def test_rebind_same_site_refreshes_and_foreign_site_raises(fake_sg: FakeShotgun) -> None:
     registry = Registry()
     schemas = _model.build_schema(fetch_schema(fake_sg))
     registry.bind(schemas, key=fake_sg.base_url)
@@ -1554,7 +1663,7 @@ def test_refresh_required_is_not_attribute_absence(bound: Registry) -> None:
 
 
 def test_registry_binding_snapshot_distinguishes_current_from_captured_absence(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
 ) -> None:
     registry = Registry()
     schemas = _model.build_schema(fetch_schema(fake_sg))
@@ -1606,7 +1715,7 @@ def test_repr_unsaved_unloaded_and_uninitialized(bound: Registry) -> None:
     assert repr(shot_cls.__new__(shot_cls)) == 'Shot(uninitialized)'
 
 
-def test_stale_prebind_alias_class_stays_symbolic(fake_sg: _FakeShotgun) -> None:
+def test_stale_prebind_alias_class_stays_symbolic(fake_sg: FakeShotgun) -> None:
     registry = Registry()
     vendor = registry.entity_class('Vendor')
     registry.bind(_model.build_schema(fetch_schema(fake_sg)), key=fake_sg.base_url)
@@ -1638,3 +1747,19 @@ def test_unbound_instance_write_is_rejected_before_staging() -> None:
     with pytest.raises(SgalchemyError, match='load_schema'):
         shot.code = 'not-validated'
     assert entity_state(shot).dirty == {}
+
+
+def test_unfetched_field_message_names_the_remedy_for_each_object_origin(
+    bound: Registry,
+) -> None:
+    shot_cls = bound.entity_class('Shot')
+    queried = shot_cls.__new__(shot_cls)
+    initialize_entity(queried, EntityState(entity_type='Shot', id=12, loaded={'id': 12}))
+    pending = shot_cls.new()
+
+    with pytest.raises(
+        UnfetchedFieldError, match=r'without defer\(Shot\.description\).*linked target'
+    ):
+        _ = queried.description
+    with pytest.raises(UnfetchedFieldError, match='unsaved entity; assign it before reading it'):
+        _ = pending.description

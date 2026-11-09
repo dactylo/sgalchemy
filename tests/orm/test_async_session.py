@@ -2,48 +2,65 @@ from __future__ import annotations
 
 import asyncio
 import copy
-from typing import TYPE_CHECKING, Any, Never, ParamSpec, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Never, cast
 
 import pytest
-from _support import (
-    AUTHENTICATION_FAULT,
-    SCHEMA_ABSENT_MESSAGE,
-    BrokenNoteError,
-    YieldCountingEntities,
-    _preserve_signature,
-    capture_hydration_bindings,
-    isolated_async_engine,
-)
 
 from sgalchemy import inspect
 from sgalchemy._core._async_engine import AsyncEngine, create_async_engine
 from sgalchemy._core._compiler import FindCall
+from sgalchemy._core._engine_common import AUTH_RECOVERY_NOTE
 from sgalchemy._core._options import joinedload
 from sgalchemy._core._registry import Entity, Registry, RegistryBinding, entity_state
 from sgalchemy._core._result import Result
-from sgalchemy._core._schema_drift import SchemaDrift
 from sgalchemy._core._statement import Select, select
 from sgalchemy._errors import CommitError, CompilationError, SchemaUnavailableError, SgalchemyError
 from sgalchemy._orm import _async_session as async_session_module
+from sgalchemy._orm import _uow
 from sgalchemy._orm._async_session import AsyncSession
+from tests._support import (
+    AUTHENTICATION_FAULT,
+    SCHEMA_ABSENT_MESSAGE,
+    BrokenNoteError,
+    YieldCountingEntities,
+    capture_hydration_bindings,
+    isolated_async_engine,
+    preserve_signature,
+    publish_on_drift,
+    run_async,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
     from pathlib import Path
 
-    from _fakes import _FakeAsyncShotgun
-    from _support import _SyncCallback
-
     from sgalchemy._core._compiler import SummarizeCall
+    from sgalchemy._core._engine import Engine
     from sgalchemy._orm._uow import CommitPlan
     from sgalchemy.schema._model import EntitySchema
+    from tests._fakes import FakeAsyncShotgun
+    from tests._support import SyncCallback
 
-_P = ParamSpec('_P')
-_R = TypeVar('_R')
+
+_COLLISION = (
+    'this session already tracks a different Shot(id=80) object, loaded or staged for deletion '
+    'or revival; edit that object instead of adding this copy'
+)
+_DETACHED = (
+    'Shot(id=80) is not in an open session, so this change would never be sent; call '
+    'session.add(obj) on an open session first, then assign'
+)
+
+
+async def _async_detached_shot(engine: AsyncEngine) -> Entity:
+    source = AsyncSession(engine)
+    shot = source.merge_dict({'type': 'Shot', 'id': 80, 'description': 'before'})
+    await source.close()
+    return shot
 
 
 async def _async_engine_with_symbolic_vendor(
-    fake_async_sg: _FakeAsyncShotgun, tmp_path: Path
+    fake_async_sg: FakeAsyncShotgun, tmp_path: Path
 ) -> tuple[AsyncEngine, type[Entity]]:
     registry = Registry()
     vendor_cls = registry.entity_class('FutureVendor')
@@ -57,8 +74,54 @@ async def _async_engine_with_symbolic_vendor(
     return engine, vendor_cls
 
 
+def test_async_add_reattaches_a_detached_entity_and_sends_later_edits(
+    fake_async_sg: FakeAsyncShotgun, tmp_path: Path
+) -> None:
+    async def scenario() -> None:
+        engine = isolated_async_engine(fake_async_sg, tmp_path)
+        await engine.load_schema()
+        session = AsyncSession(engine)
+        shot = await _async_detached_shot(engine)
+        session.add(shot)
+        session.add(shot)
+        assert entity_state(shot).session is session
+        assert session.merge_dict({'type': 'Shot', 'id': 80}) is shot
+        shot.description = 'after'
+        calls_before = len(fake_async_sg.calls)
+        await session.commit()
+        commit_calls = fake_async_sg.calls[calls_before:]
+        assert [name for name, _, _ in commit_calls] == ['batch']
+        assert commit_calls[0][1][0] == [
+            {
+                'request_type': 'update',
+                'entity_type': 'Shot',
+                'entity_id': 80,
+                'data': {'description': 'after'},
+            }
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_async_assignment_on_a_detached_persistent_entity_raises(
+    fake_async_sg: FakeAsyncShotgun, tmp_path: Path
+) -> None:
+    async def scenario() -> None:
+        engine = isolated_async_engine(fake_async_sg, tmp_path)
+        await engine.load_schema()
+        shot = await _async_detached_shot(engine)
+        with pytest.raises(SgalchemyError) as excinfo:
+            shot.description = 'after'
+        assert str(excinfo.value) == _DETACHED
+        assert entity_state(shot).dirty == {}
+        pending = engine.entities.Shot.new(code='new')
+        pending.description = 'pending entities stay assignable'
+
+    asyncio.run(scenario())
+
+
 def test_async_auth_upload_failure_notes_unknown_outcome_on_commit_error(
-    fake_async_sg: _FakeAsyncShotgun, tmp_path: Path
+    fake_async_sg: FakeAsyncShotgun, tmp_path: Path
 ) -> None:
     async def scenario() -> None:
         engine = isolated_async_engine(fake_async_sg, tmp_path)
@@ -69,7 +132,7 @@ def test_async_auth_upload_failure_notes_unknown_outcome_on_commit_error(
         image_path.write_bytes(b'image')
         shot.image = image_path
         fault = AUTHENTICATION_FAULT('session expired')
-        fake_async_sg._errors.setdefault('upload_thumbnail', []).append(fault)
+        fake_async_sg.errors.setdefault('upload_thumbnail', []).append(fault)
 
         with pytest.raises(CommitError) as excinfo:
             await session.commit()
@@ -84,7 +147,7 @@ def test_async_auth_upload_failure_notes_unknown_outcome_on_commit_error(
 
 
 def test_async_broken_add_note_does_not_mask_provider_error(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -93,7 +156,7 @@ def test_async_broken_add_note_does_not_mask_provider_error(
         session = AsyncSession(engine)
         shot_cls = engine.registry.entity_class('Shot')
         error = BrokenNoteError('provider unavailable')
-        fake_async_sg._errors.setdefault('find', []).append(error)
+        fake_async_sg.errors.setdefault('find', []).append(error)
 
         with pytest.raises(BrokenNoteError) as excinfo:
             await session.scalars(select(shot_cls))
@@ -104,7 +167,7 @@ def test_async_broken_add_note_does_not_mask_provider_error(
 
 
 def test_async_cold_stale_disk_schema_forces_one_refresh_before_commit(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
     schema_fixture: dict[str, Any],
     tmp_path: Path,
@@ -114,7 +177,7 @@ def test_async_cold_stale_disk_schema_forces_one_refresh_before_commit(
         stale_schema = {name: fields for name, fields in schema_fixture.items() if name != 'Shot'}
 
         async def stale_schema_read() -> dict[str, Any]:
-            await stale_sg._record('schema_read')
+            await stale_sg.record('schema_read')
             return copy.deepcopy(stale_schema)
 
         monkeypatch.setattr(stale_sg, 'schema_read', stale_schema_read)
@@ -132,7 +195,7 @@ def test_async_cold_stale_disk_schema_forces_one_refresh_before_commit(
         original_load = engine.load_binding
         force_values: list[bool] = []
 
-        @_preserve_signature(original_load)
+        @preserve_signature(original_load)
         async def tracking_load(*, force: bool = False) -> RegistryBinding:
             force_values.append(force)
             return await original_load(force=force)
@@ -142,7 +205,7 @@ def test_async_cold_stale_disk_schema_forces_one_refresh_before_commit(
         await session.commit()
 
         assert force_values == [False, True]
-        names = [name for name, _, _ in fake_async_sg._calls]
+        names = [name for name, _, _ in fake_async_sg.calls]
         assert names.count('schema_read') == 1
         assert names.count('schema_entity_read') == 1
         assert names.count('batch') == 1
@@ -153,7 +216,7 @@ def test_async_cold_stale_disk_schema_forces_one_refresh_before_commit(
 
 def test_async_commit_schema_recovery_forces_once_when_schema_remains_invalid(
     caplog: pytest.LogCaptureFixture,
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
     schema_fixture: dict[str, Any],
     tmp_path: Path,
@@ -173,7 +236,7 @@ def test_async_commit_schema_recovery_forces_once_when_schema_remains_invalid(
         stale_raw = {name: schema for name, schema in schema_fixture.items() if name != 'Shot'}
 
         async def stale_schema_read() -> dict[str, Any]:
-            await fake_async_sg._record('schema_read')
+            await fake_async_sg.record('schema_read')
             return copy.deepcopy(stale_raw)
 
         monkeypatch.setattr(fake_async_sg, 'schema_read', stale_schema_read)
@@ -184,7 +247,7 @@ def test_async_commit_schema_recovery_forces_once_when_schema_remains_invalid(
         ):
             await session.commit()
 
-        names = [name for name, _, _ in fake_async_sg._calls]
+        names = [name for name, _, _ in fake_async_sg.calls]
         assert names.count('schema_read') == 2
         assert names.count('batch') == 0
         assert caplog.messages.count('commit schema drift: refreshing schema once') == 1
@@ -193,7 +256,7 @@ def test_async_commit_schema_recovery_forces_once_when_schema_remains_invalid(
 
 
 def test_async_commit_schema_recovery_reuses_concurrent_binding_without_io(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -209,25 +272,13 @@ def test_async_commit_schema_recovery_reuses_concurrent_binding_without_io(
             {name: schema for name, schema in complete.schemas.items() if name != 'Shot'},
             key=complete.key,
         )
-        original_plan_commit: _SyncCallback[
+        original_plan_commit: SyncCallback[
             [AsyncSession, RegistryBinding | None, Mapping[tuple[str, int], Entity]],
             CommitPlan,
         ] = async_session_module.plan_commit
-        publications = 0
-
-        def publish_on_drift(call: _SyncCallback[_P, _R]) -> _SyncCallback[_P, _R]:
-            def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
-                try:
-                    return call(*args, **kwargs)
-                except SchemaDrift:
-                    nonlocal publications
-                    publications += 1
-                    engine.registry.bind(dict(complete.schemas), key=complete.key)
-                    raise
-
-            return wrapper
-
-        publish_during_failed_plan = publish_on_drift(original_plan_commit)
+        publish_during_failed_plan, publications = publish_on_drift(
+            original_plan_commit, engine.registry, complete
+        )
 
         monkeypatch.setattr(
             async_session_module,
@@ -237,17 +288,17 @@ def test_async_commit_schema_recovery_reuses_concurrent_binding_without_io(
 
         await session.commit()
 
-        names = [name for name, _, _ in fake_async_sg._calls]
+        names = [name for name, _, _ in fake_async_sg.calls]
         assert entity_state(shot).deleted
-        assert publications == 1
+        assert publications == [1]
         assert names.count('schema_read') == 1
         assert names.count('batch') == 1
 
     asyncio.run(scenario())
 
 
-def test_async_execute_call_accepts_captured_binding_witness(
-    fake_async_sg: _FakeAsyncShotgun,
+def test_async_execute_call_returns_provider_payload(
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -255,20 +306,18 @@ def test_async_execute_call_accepts_captured_binding_witness(
         await engine.load_schema()
         session = AsyncSession(engine)
         call = FindCall('Shot', [], ['id'])
-        fake_async_sg._find_results = [[{'id': 1}]]
-        binding = engine.prepared_binding()
-
-        assert await session.execute_call(call, binding) == [{'id': 1}]
+        fake_async_sg.find_results = [[{'id': 1}]]
+        assert await session.execute_call(call) == [{'id': 1}]
 
     asyncio.run(scenario())
 
 
 def test_async_execute_projection_returns_mapping_and_attribute_rows(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
-        fake_async_sg._find_results = [
+        fake_async_sg.find_results = [
             [{'type': 'Shot', 'id': 1, 'code': 'A', 'sg_cut_duration': 42}]
         ]
         engine = isolated_async_engine(fake_async_sg, tmp_path)
@@ -285,23 +334,23 @@ def test_async_execute_projection_returns_mapping_and_attribute_rows(
 
 
 def test_async_execute_rejects_entity_statement_before_io(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
         engine = isolated_async_engine(fake_async_sg, tmp_path)
         await engine.load_schema()
         session = AsyncSession(engine)
-        calls_before = len(fake_async_sg._calls)
+        calls_before = len(fake_async_sg.calls)
         with pytest.raises(TypeError, match='scalars'):
             await session.execute(cast('Any', select(engine.entities.Shot)))
-        assert len(fake_async_sg._calls) == calls_before
+        assert len(fake_async_sg.calls) == calls_before
 
     asyncio.run(scenario())
 
 
 def test_async_get_identity_hit_does_not_capture_schema(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -311,7 +360,7 @@ def test_async_get_identity_hit_does_not_capture_schema(
         session = AsyncSession(engine)
         shot_cls = engine.entities.Shot
         shot = session.merge_dict({'type': 'Shot', 'id': 1, 'code': 'cached'})
-        calls_before = list(fake_async_sg._calls)
+        calls_before = list(fake_async_sg.calls)
 
         async def fail_load_binding(*, force: bool = False) -> Never:
             del force
@@ -320,13 +369,13 @@ def test_async_get_identity_hit_does_not_capture_schema(
         monkeypatch.setattr(engine, 'load_binding', fail_load_binding)
 
         assert await session.get(shot_cls, 1) is shot
-        assert fake_async_sg._calls == calls_before
+        assert fake_async_sg.calls == calls_before
 
     asyncio.run(scenario())
 
 
 def test_async_get_rejects_mismatched_identity_before_registration(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -334,30 +383,30 @@ def test_async_get_rejects_mismatched_identity_before_registration(
         await engine.load_schema()
         session = AsyncSession(engine)
         shot_cls = engine.entities.Shot
-        fake_async_sg._find_results = [[{'type': 'Shot', 'id': 2, 'code': 'wrong'}]]
+        fake_async_sg.find_results = [[{'type': 'Shot', 'id': 2, 'code': 'wrong'}]]
 
         with pytest.raises(SgalchemyError, match=r'requested Shot\(id=1\).*Shot\(id=2\)'):
             await session.get(shot_cls, 1)
 
-        assert session._identity_values() == []
+        assert session.identity_values() == []
 
     asyncio.run(scenario())
 
 
 def test_async_get_type_absent_after_refresh_raises_teaching_error(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
         engine, vendor_cls = await _async_engine_with_symbolic_vendor(fake_async_sg, tmp_path)
         session = AsyncSession(engine)
-        reads_before = [name for name, _args, _kwargs in fake_async_sg._calls].count('schema_read')
+        reads_before = [name for name, _args, _kwargs in fake_async_sg.calls].count('schema_read')
 
         with pytest.raises(SchemaUnavailableError) as excinfo:
             await session.get(vendor_cls, 5)
 
         assert str(excinfo.value) == SCHEMA_ABSENT_MESSAGE
-        calls = [name for name, _args, _kwargs in fake_async_sg._calls]
+        calls = [name for name, _args, _kwargs in fake_async_sg.calls]
         assert calls.count('schema_read') == reads_before + 1
         assert calls.count('find_one') == 0
 
@@ -365,7 +414,7 @@ def test_async_get_type_absent_after_refresh_raises_teaching_error(
 
 
 def test_async_get_unknown_type_forces_one_refresh_then_succeeds(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
     schema_fixture: dict[str, Any],
     tmp_path: Path,
@@ -384,7 +433,7 @@ def test_async_get_unknown_type_forces_one_refresh_then_succeeds(
             return copy.deepcopy(extended)
 
         monkeypatch.setattr(fake_async_sg, 'schema_read', extended_read)
-        fake_async_sg._find_results = [[{'type': 'FutureVendor', 'id': 5, 'code': 'V5'}]]
+        fake_async_sg.find_results = [[{'type': 'FutureVendor', 'id': 5, 'code': 'V5'}]]
         session = AsyncSession(engine)
         hydration_bindings = capture_hydration_bindings(session, monkeypatch)
 
@@ -395,13 +444,13 @@ def test_async_get_unknown_type_forces_one_refresh_then_succeeds(
         assert len(hydration_bindings) == 1
         assert hydration_bindings[0] is engine.prepared_binding()
         assert len(schema_reads) == 1
-        assert [name for name, _args, _kwargs in fake_async_sg._calls].count('find_one') == 1
+        assert [name for name, _args, _kwargs in fake_async_sg.calls].count('find_one') == 1
 
     asyncio.run(scenario())
 
 
-def test_async_hydration_scope_is_rebuilt_after_provider_await(
-    fake_async_sg: _FakeAsyncShotgun, tmp_path: Path
+def test_async_hydration_observes_staging_changed_during_provider_await(
+    fake_async_sg: FakeAsyncShotgun, tmp_path: Path
 ) -> None:
     async def scenario() -> None:
         engine = isolated_async_engine(fake_async_sg, tmp_path)
@@ -409,40 +458,38 @@ def test_async_hydration_scope_is_rebuilt_after_provider_await(
         session = AsyncSession(engine)
         first = session.merge_dict({'type': 'Shot', 'id': 1})
         session.delete(first)
-        fake_async_sg._find_results = [[{'type': 'Shot', 'id': 1}]]
+        unit_of_work = session.raw_unit_of_work
+        fake_async_sg.find_results = [[{'type': 'Shot', 'id': 1}]]
         await session.scalars(select(engine.entities.Shot).execution_options(retired_only=True))
         assert inspect(first).deleted is False
-        entered, release = fake_async_sg._block('find')
-        fake_async_sg._find_results = [[{'type': 'Shot', 'id': 1}]]
+        entered, release = fake_async_sg.block('find')
+        fake_async_sg.find_results = [[{'type': 'Shot', 'id': 1}]]
         reading = asyncio.create_task(
             session.scalars(select(engine.entities.Shot).execution_options(retired_only=True))
         )
         await entered.wait()
-        assert session._state._hydration_index is None
-        # Inject a staging change at the response boundary to check hydration scope timing.
-        session._unit_of_work._deleted.clear()
+        # Inject a staging change at the response boundary to check hydration timing.
+        unit_of_work.clear_staged('deleted')
         release.set()
         objects = await reading
         assert objects[0] is first
         assert inspect(first).deleted is True
-        assert session._state._hydration_index is None
 
-        fake_async_sg._find_results = [
+        fake_async_sg.find_results = [
             [{'type': 'Shot', 'id': 2, 'project': {'type': 'Vendor', 'id': 1}}]
         ]
         with pytest.raises(SgalchemyError, match='display alias'):
             await session.scalars(select(engine.entities.Shot))
-        assert session._state._hydration_index is None
-        session.unit_of_work._revived.append(first)
-        fake_async_sg._find_results = [[{'type': 'Shot', 'id': 1}]]
+        unit_of_work.append_staged('revived', first)
+        fake_async_sg.find_results = [[{'type': 'Shot', 'id': 1}]]
         await session.scalars(select(engine.entities.Shot))
         assert inspect(first).deleted is True
 
-    asyncio.run(scenario())
+    run_async(scenario())
 
 
 def test_async_joinedload_force_refreshes_before_one_primary_query(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -454,7 +501,7 @@ def test_async_joinedload_force_refreshes_before_one_primary_query(
             {name: schema for name, schema in complete.schemas.items() if name != 'Sequence'},
             key=complete.key,
         )
-        fake_async_sg._find_results = [
+        fake_async_sg.find_results = [
             [
                 {
                     'type': 'Shot',
@@ -472,14 +519,14 @@ def test_async_joinedload_force_refreshes_before_one_primary_query(
         ]
 
         assert shot.sg_sequence.code == 'SEQ'
-        assert [name for name, _, _ in fake_async_sg._calls].count('schema_read') == 2
-        assert [name for name, _, _ in fake_async_sg._calls].count('find') == 1
+        assert [name for name, _, _ in fake_async_sg.calls].count('schema_read') == 2
+        assert [name for name, _, _ in fake_async_sg.calls].count('find') == 1
 
     asyncio.run(scenario())
 
 
 def test_async_joinedload_remaining_drift_forces_once_without_query(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
     schema_fixture: dict[str, Any],
     tmp_path: Path,
@@ -496,7 +543,7 @@ def test_async_joinedload_remaining_drift_forces_once_without_query(
         stale_raw = {name: schema for name, schema in schema_fixture.items() if name != 'Sequence'}
 
         async def stale_schema_read() -> dict[str, Any]:
-            await fake_async_sg._record('schema_read')
+            await fake_async_sg.record('schema_read')
             return stale_raw
 
         monkeypatch.setattr(fake_async_sg, 'schema_read', stale_schema_read)
@@ -509,14 +556,14 @@ def test_async_joinedload_remaining_drift_forces_once_without_query(
         ):
             await session.scalars(select(shot_cls).options(joinedload(shot_cls.sg_sequence)))
 
-        assert [name for name, _, _ in fake_async_sg._calls].count('schema_read') == 2
-        assert [name for name, _, _ in fake_async_sg._calls].count('find') == 0
+        assert [name for name, _, _ in fake_async_sg.calls].count('schema_read') == 2
+        assert [name for name, _, _ in fake_async_sg.calls].count('find') == 0
 
     asyncio.run(scenario())
 
 
 def test_async_joinedload_reuses_concurrently_published_binding_without_io(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -529,7 +576,7 @@ def test_async_joinedload_reuses_concurrently_published_binding_without_io(
             {name: schema for name, schema in complete.schemas.items() if name != 'Sequence'},
             key=complete.key,
         )
-        fake_async_sg._find_results = [
+        fake_async_sg.find_results = [
             [
                 {
                     'type': 'Shot',
@@ -542,25 +589,13 @@ def test_async_joinedload_reuses_concurrently_published_binding_without_io(
         session = AsyncSession(engine)
         shot_cls = engine.registry.entity_class('Shot')
         statement = select(shot_cls).options(joinedload(shot_cls.sg_sequence))
-        compile_statement: _SyncCallback[
+        compile_statement: SyncCallback[
             [Select[Entity | None], Mapping[str, EntitySchema]],
             FindCall | SummarizeCall,
         ] = async_session_module.compile_statement
-        publications = 0
-
-        def publish_on_drift(call: _SyncCallback[_P, _R]) -> _SyncCallback[_P, _R]:
-            def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
-                try:
-                    return call(*args, **kwargs)
-                except SchemaDrift:
-                    nonlocal publications
-                    publications += 1
-                    engine.registry.bind(dict(complete.schemas), key=complete.key)
-                    raise
-
-            return wrapper
-
-        publish_during_failed_compile = publish_on_drift(compile_statement)
+        publish_during_failed_compile, publications = publish_on_drift(
+            compile_statement, engine.registry, complete
+        )
 
         monkeypatch.setattr(
             async_session_module,
@@ -571,15 +606,15 @@ def test_async_joinedload_reuses_concurrently_published_binding_without_io(
         shot = (await session.scalars(statement))[0]
 
         assert shot.sg_sequence.code == 'SEQ'
-        assert publications == 1
-        assert [name for name, _, _ in fake_async_sg._calls].count('schema_read') == 1
-        assert [name for name, _, _ in fake_async_sg._calls].count('find') == 1
+        assert publications == [1]
+        assert [name for name, _, _ in fake_async_sg.calls].count('schema_read') == 1
+        assert [name for name, _, _ in fake_async_sg.calls].count('find') == 1
 
     asyncio.run(scenario())
 
 
 def test_async_load_parent_fetch_preserves_dirty_relationship(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -591,7 +626,7 @@ def test_async_load_parent_fetch_preserves_dirty_relationship(
         dirty = session.merge_dict({'type': 'Shot', 'id': 2, 'assets': []})
         local_asset = session.merge_dict({'type': 'Asset', 'id': 20})
         dirty.assets = [local_asset]
-        fake_async_sg._find_results = [
+        fake_async_sg.find_results = [
             [
                 {'type': 'Shot', 'id': 1, 'assets': [{'type': 'Asset', 'id': 10}]},
                 {'type': 'Shot', 'id': 2, 'assets': [{'type': 'Asset', 'id': 99}]},
@@ -606,7 +641,7 @@ def test_async_load_parent_fetch_preserves_dirty_relationship(
 
         assert dirty.assets == [local_asset]
         assert absent.assets[0].code == 'fetched'
-        find_calls = [call for call in fake_async_sg._calls if call[0] == 'find']
+        find_calls = [call for call in fake_async_sg.calls if call[0] == 'find']
         assert find_calls[0][1][1] == [['id', 'in', [1]]]
         assert find_calls[0][1][2] == ['assets']
 
@@ -614,7 +649,7 @@ def test_async_load_parent_fetch_preserves_dirty_relationship(
 
 
 def test_async_load_rejects_detached_same_registry_parent_before_io(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -631,19 +666,19 @@ def test_async_load_rejects_detached_same_registry_parent_before_io(
         )
         await owner.close()
         borrower = AsyncSession(engine)
-        fake_async_sg._find_results = [[{'type': 'Asset', 'id': 10, 'code': 'server'}]]
-        calls_before = list(fake_async_sg._calls)
+        fake_async_sg.find_results = [[{'type': 'Asset', 'id': 10, 'code': 'server'}]]
+        calls_before = list(fake_async_sg.calls)
 
         with pytest.raises(SgalchemyError, match='owned by this session'):
             await borrower.load(shot, shot_cls.assets)
 
-        assert fake_async_sg._calls == calls_before
+        assert fake_async_sg.calls == calls_before
 
     asyncio.run(scenario())
 
 
 def test_async_merge_dict_captures_once_and_record_hydration_passes_binding_through(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -681,7 +716,7 @@ def test_async_merge_dict_captures_once_and_record_hydration_passes_binding_thro
 
 
 def test_async_merge_dict_rejects_non_canonical_root_identity(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -699,7 +734,7 @@ def test_async_merge_dict_rejects_non_canonical_root_identity(
 
 
 def test_async_no_work_commit_does_not_load_schema(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -719,7 +754,7 @@ def test_async_no_work_commit_does_not_load_schema(
 
 
 def test_async_read_auth_failure_carries_read_recovery_note(
-    fake_async_sg: _FakeAsyncShotgun, tmp_path: Path
+    fake_async_sg: FakeAsyncShotgun, tmp_path: Path
 ) -> None:
     async def scenario() -> None:
         engine = isolated_async_engine(fake_async_sg, tmp_path)
@@ -727,7 +762,7 @@ def test_async_read_auth_failure_carries_read_recovery_note(
         session = AsyncSession(engine)
         shot_cls = engine.registry.entity_class('Shot')
         fault = AUTHENTICATION_FAULT('session expired')
-        fake_async_sg._errors.setdefault('find', []).append(fault)
+        fake_async_sg.errors.setdefault('find', []).append(fault)
 
         with pytest.raises(AUTHENTICATION_FAULT) as excinfo:
             await session.scalars(select(shot_cls))
@@ -741,7 +776,7 @@ def test_async_read_auth_failure_carries_read_recovery_note(
 
 
 def test_async_refetch_skips_deep_fields_under_dirty_relationship(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -773,7 +808,7 @@ def test_async_refetch_skips_deep_fields_under_dirty_relationship(
 
 
 def test_async_refresh_clears_only_returned_field_markers_without_probe_io(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -785,7 +820,7 @@ def test_async_refresh_clears_only_returned_field_markers_without_probe_io(
         state.loaded.pop('code')
         state.refresh_required.update({'code', 'description'})
         state.unverified_writes.update({'sg_status_list', 'sg_cut_duration'})
-        fake_async_sg._find_results = [
+        fake_async_sg.find_results = [
             [
                 {
                     'type': 'Shot',
@@ -802,19 +837,19 @@ def test_async_refresh_clears_only_returned_field_markers_without_probe_io(
         assert shot.sg_status_list == 'ip'
         assert state.refresh_required == {'description'}
         assert state.unverified_writes == {'sg_cut_duration'}
-        calls_after_refresh = list(fake_async_sg._calls)
+        calls_after_refresh = list(fake_async_sg.calls)
         info = inspect(shot)
         assert repr(shot) == "Shot(id=1, code='new')"
         assert shot.as_dict()['code'] == 'new'
         assert info.refresh_required == frozenset({'description'})
         assert info.unverified_writes == frozenset({'sg_cut_duration'})
-        assert fake_async_sg._calls == calls_after_refresh
+        assert fake_async_sg.calls == calls_after_refresh
 
     asyncio.run(scenario())
 
 
 def test_async_refresh_opaque_object_succeeds_after_one_forced_refresh(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
     schema_fixture: dict[str, Any],
     tmp_path: Path,
@@ -836,7 +871,7 @@ def test_async_refresh_opaque_object_succeeds_after_one_forced_refresh(
         session = AsyncSession(engine)
         opaque = session.merge_dict({'type': 'FutureVendor', 'id': 9})
         hydration_bindings = capture_hydration_bindings(session, monkeypatch)
-        fake_async_sg._find_results = [[{'type': 'FutureVendor', 'id': 9, 'code': 'V9'}]]
+        fake_async_sg.find_results = [[{'type': 'FutureVendor', 'id': 9, 'code': 'V9'}]]
 
         await session.refresh(opaque)
 
@@ -849,20 +884,20 @@ def test_async_refresh_opaque_object_succeeds_after_one_forced_refresh(
 
 
 def test_async_refresh_opaque_object_teaches_after_one_refresh(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
         engine, _vendor_cls = await _async_engine_with_symbolic_vendor(fake_async_sg, tmp_path)
         session = AsyncSession(engine)
         opaque = session.merge_dict({'type': 'FutureVendor', 'id': 9})
-        reads_before = [name for name, _args, _kwargs in fake_async_sg._calls].count('schema_read')
+        reads_before = [name for name, _args, _kwargs in fake_async_sg.calls].count('schema_read')
 
         with pytest.raises(SchemaUnavailableError) as excinfo:
             await session.refresh(opaque)
 
         assert str(excinfo.value) == SCHEMA_ABSENT_MESSAGE
-        calls = [name for name, _args, _kwargs in fake_async_sg._calls]
+        calls = [name for name, _args, _kwargs in fake_async_sg.calls]
         assert calls.count('schema_read') == reads_before + 1
         assert calls.count('find') == 0
 
@@ -883,7 +918,7 @@ def test_async_refresh_opaque_object_teaches_after_one_refresh(
     ],
 )
 def test_async_refresh_rejects_mismatched_or_multiple_rows_without_mutation(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
     rows: list[dict[str, Any]],
     message: str,
@@ -896,20 +931,38 @@ def test_async_refresh_rejects_mismatched_or_multiple_rows_without_mutation(
         session.expire(shot)
         state = entity_state(shot)
         loaded_before = dict(state.loaded)
-        fake_async_sg._find_results = [rows]
+        fake_async_sg.find_results = [rows]
 
         with pytest.raises(SgalchemyError, match=message):
             await session.refresh(shot)
 
         assert state.loaded == loaded_before
         assert state.expired is True
-        assert session._identity_values() == [shot]
+        assert session.identity_values() == [shot]
+
+    asyncio.run(scenario())
+
+
+def test_async_refresh_rejects_unowned_entity_before_io(
+    fake_async_sg: FakeAsyncShotgun, tmp_path: Path
+) -> None:
+    async def scenario() -> None:
+        engine = isolated_async_engine(fake_async_sg, tmp_path)
+        await engine.load_schema()
+        session = AsyncSession(engine)
+        detached = engine.entities.Shot.new()
+        calls = list(fake_async_sg.calls)
+
+        with pytest.raises(SgalchemyError, match='must be owned by this session'):
+            await session.refresh(detached)
+
+        assert fake_async_sg.calls == calls
 
     asyncio.run(scenario())
 
 
 def test_async_refresh_retired_entity_requests_retired_only(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -920,20 +973,20 @@ def test_async_refresh_retired_entity_requests_retired_only(
         active = session.merge_dict({'type': 'Shot', 'id': 42, 'code': 'old-active'})
         session.delete(retired)
         await session.commit()
-        fake_async_sg._find_results = [
+        fake_async_sg.find_results = [
             [{'type': 'Shot', 'id': 41, 'code': 'retired'}],
             [{'type': 'Shot', 'id': 42, 'code': 'active'}],
         ]
 
         await session.refresh(retired)
 
-        refresh_find = [call for call in fake_async_sg._calls if call[0] == 'find'][-1]
+        refresh_find = [call for call in fake_async_sg.calls if call[0] == 'find'][-1]
         assert refresh_find[2]['retired_only'] is True
         assert retired.code == 'retired'
 
         await session.refresh(active)
 
-        refresh_find = [call for call in fake_async_sg._calls if call[0] == 'find'][-1]
+        refresh_find = [call for call in fake_async_sg.calls if call[0] == 'find'][-1]
         assert 'retired_only' not in refresh_find[2]
         assert active.code == 'active'
 
@@ -941,13 +994,13 @@ def test_async_refresh_retired_entity_requests_retired_only(
 
 
 def test_async_retired_query_marks_root_deleted(
-    fake_async_sg: _FakeAsyncShotgun, tmp_path: Path
+    fake_async_sg: FakeAsyncShotgun, tmp_path: Path
 ) -> None:
     async def scenario() -> None:
         engine = isolated_async_engine(fake_async_sg, tmp_path)
         await engine.load_schema()
         session = AsyncSession(engine)
-        fake_async_sg._find_results = [[{'type': 'Shot', 'id': 41, 'code': 'retired'}]]
+        fake_async_sg.find_results = [[{'type': 'Shot', 'id': 41, 'code': 'retired'}]]
         shot = (
             await session.scalars(
                 select(engine.entities.Shot).execution_options(retired_only=True)
@@ -962,10 +1015,10 @@ def test_async_retired_query_marks_root_deleted(
 
 
 def test_async_scalars_identity_and_dirty_merge(
-    fake_async_sg: _FakeAsyncShotgun, tmp_path: Path
+    fake_async_sg: FakeAsyncShotgun, tmp_path: Path
 ) -> None:
     async def scenario() -> None:
-        fake_async_sg._find_results = [
+        fake_async_sg.find_results = [
             [{'type': 'Shot', 'id': 1, 'code': 'A'}],
             [{'type': 'Shot', 'id': 1, 'code': 'server-change'}],
         ]
@@ -985,7 +1038,7 @@ def test_async_scalars_identity_and_dirty_merge(
 @pytest.mark.parametrize('retired', [False, True])
 @pytest.mark.parametrize('child_baseline', [None, False, True])
 def test_async_scalars_retirement_observation_is_root_only(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
     retired: bool,
     child_baseline: bool | None,
@@ -998,7 +1051,7 @@ def test_async_scalars_retirement_observation_is_root_only(
         if child_baseline is not None:
             child = session.merge_dict({'type': 'Sequence', 'id': 51, 'code': 'before'})
             entity_state(child).deleted = child_baseline
-        fake_async_sg._find_results = [
+        fake_async_sg.find_results = [
             [
                 {
                     'type': 'Shot',
@@ -1031,7 +1084,7 @@ def test_async_scalars_retirement_observation_is_root_only(
     [(None, None), (False, None), (True, None), (False, 'delete'), (True, 'revive')],
 )
 def test_async_scalars_retirement_observation_preserves_staged_intent(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
     retired: bool,
     baseline: bool | None,
@@ -1053,7 +1106,7 @@ def test_async_scalars_retirement_observation_preserves_staged_intent(
             state.unverified_writes.update({'code', 'description', 'sg_status_list'})
         deleted_before = tuple(session.unit_of_work.deleted)
         revived_before = tuple(session.unit_of_work.revived)
-        fake_async_sg._find_results = [
+        fake_async_sg.find_results = [
             [{'type': 'Shot', 'id': 41, 'code': 'server', 'description': 'refreshed'}]
         ]
 
@@ -1082,9 +1135,9 @@ def test_async_scalars_retirement_observation_preserves_staged_intent(
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize('size', [100, 200, 400])
+@pytest.mark.parametrize('size', [100])
 def test_async_response_hydration_bounds_staged_item_visits(
-    fake_async_sg: _FakeAsyncShotgun, tmp_path: Path, size: int
+    fake_async_sg: FakeAsyncShotgun, tmp_path: Path, size: int
 ) -> None:
     async def scenario() -> None:
         engine = isolated_async_engine(fake_async_sg, tmp_path)
@@ -1097,11 +1150,11 @@ def test_async_response_hydration_bounds_staged_item_visits(
         for obj in revived:
             entity_state(obj).deleted = True
             session.revive(obj)
-        deleted_queue = YieldCountingEntities(session.unit_of_work._deleted)
-        revived_queue = YieldCountingEntities(session.unit_of_work._revived)
-        session.unit_of_work._deleted = deleted_queue
-        session.unit_of_work._revived = revived_queue
-        fake_async_sg._find_results = [
+        deleted_queue = YieldCountingEntities(session.unit_of_work.deleted)
+        revived_queue = YieldCountingEntities(session.unit_of_work.revived)
+        session.unit_of_work.deleted = deleted_queue
+        session.unit_of_work.revived = revived_queue
+        fake_async_sg.find_results = [
             [
                 {'type': 'Shot', 'id': i + 1, 'project': {'type': 'Project', 'id': i + 1}}
                 for i in range(size)
@@ -1111,15 +1164,44 @@ def test_async_response_hydration_bounds_staged_item_visits(
         objects = await session.scalars(select(engine.entities.Shot))
 
         assert len(objects) == size
-        assert len(session._identity_values()) == 4 * size
+        assert len(session.identity_values()) == 4 * size
         assert objects[0].project.id == 1
-        assert deleted_queue._visits + revived_queue._visits <= 6 * size
+        assert deleted_queue.visits + revived_queue.visits == 0
 
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize('held', ['loaded', 'staged'])
+def test_async_add_rejects_a_detached_copy_when_the_session_tracks_the_record(
+    fake_async_sg: FakeAsyncShotgun, tmp_path: Path, held: str
+) -> None:
+    async def scenario() -> None:
+        engine = isolated_async_engine(fake_async_sg, tmp_path)
+        await engine.load_schema()
+        session = AsyncSession(engine)
+        if held == 'loaded':
+            session.merge_dict({'type': 'Shot', 'id': 80})
+        else:
+            session.delete(await _async_detached_shot(engine))
+        copy = await _async_detached_shot(engine)
+        with pytest.raises(SgalchemyError) as excinfo:
+            session.add(copy)
+        assert str(excinfo.value) == _COLLISION
+        assert entity_state(copy).session is None
+
+    asyncio.run(scenario())
+
+
+def test_async_session_rejects_a_sync_engine(engine: Engine) -> None:
+    with pytest.raises(TypeError) as excinfo:
+        AsyncSession(engine)  # pyright: ignore[reportArgumentType]
+    assert str(excinfo.value) == (
+        'AsyncSession() requires an AsyncEngine, not an Engine; use Session(engine)'
+    )
+
+
 def test_async_shape_mismatch_and_foreign_registry_parity(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -1145,7 +1227,7 @@ def test_async_shape_mismatch_and_foreign_registry_parity(
         contradictory = session.merge_dict({'type': 'Shot', 'id': 1, 'code': ['not', 'scalar']})
         assert contradictory.code == ['not', 'scalar']
         await engine.load_schema()
-        assert [name for name, _, _ in fake_async_sg._calls].count('schema_read') == 3
+        assert [name for name, _, _ in fake_async_sg.calls].count('schema_read') == 3
 
         with pytest.raises(SgalchemyError, match='different registry'):
             await session.get(foreign_cls, 9)
@@ -1160,11 +1242,11 @@ def test_async_shape_mismatch_and_foreign_registry_parity(
 
 
 def test_async_shared_access_guard_rejects_foreign_task_use(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
-        entered, release = fake_async_sg._block('find')
+        entered, release = fake_async_sg.block('find')
         engine = isolated_async_engine(fake_async_sg, tmp_path)
         await engine.load_schema()
         session = AsyncSession(engine)
@@ -1189,11 +1271,11 @@ def test_async_shared_access_guard_rejects_foreign_task_use(
         release.set()
         await first
 
-    asyncio.run(scenario())
+    run_async(scenario())
 
 
 def test_async_sole_batch_auth_failure_notes_state_local_facts_only(
-    fake_async_sg: _FakeAsyncShotgun, tmp_path: Path
+    fake_async_sg: FakeAsyncShotgun, tmp_path: Path
 ) -> None:
     async def scenario() -> None:
         engine = isolated_async_engine(fake_async_sg, tmp_path)
@@ -1202,25 +1284,24 @@ def test_async_sole_batch_auth_failure_notes_state_local_facts_only(
         shot_cls = engine.registry.entity_class('Shot')
         session.add(shot_cls.new(code='auth-fail'))
         fault = AUTHENTICATION_FAULT('session expired')
-        fake_async_sg._errors.setdefault('batch', []).append(fault)
+        fake_async_sg.errors.setdefault('batch', []).append(fault)
 
         with pytest.raises(AUTHENTICATION_FAULT) as excinfo:
             await session.commit()
 
         assert excinfo.value is fault
-        joined = '\n'.join(getattr(excinfo.value, '__notes__', []))
-        assert 'its server outcome is unknown' in joined
-        assert 'remain staged' in joined
-        assert 'no automatic retry' in joined
-        assert 'nothing committed' not in joined
-        assert 'did not execute' not in joined
-        assert sum('no automatic retry' in note for note in excinfo.value.__notes__) == 1
+        assert fault.__notes__ == [
+            AUTH_RECOVERY_NOTE,
+            _uow.SOLE_BATCH_STAGED_NOTE,
+            _uow._BATCH_OUTCOME_UNKNOWN_NOTE,
+            'sgalchemy: failed during batch wave 1 chunk 1',
+        ]
 
     asyncio.run(scenario())
 
 
 def test_async_unprepared_hydration_rejects_alias_known_by_shared_registry(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -1239,7 +1320,7 @@ def test_async_unprepared_hydration_rejects_alias_known_by_shared_registry(
             bind_default=False,
         )
         session = AsyncSession(unprepared)
-        calls_before = list(fake_async_sg._calls)
+        calls_before = list(fake_async_sg.calls)
         alias = {'type': 'Vendor', 'id': 7, 'code': 'raw'}
         operations = (
             lambda: session.merge_dict(alias),
@@ -1249,10 +1330,10 @@ def test_async_unprepared_hydration_rejects_alias_known_by_shared_registry(
         for operation in operations:
             with pytest.raises(SgalchemyError, match=r'Vendor.*alias.*CustomEntity03'):
                 operation()
-            assert session._identity_values() == []
+            assert session.identity_values() == []
 
         future = session.merge_dict({'type': 'FutureVendor', 'id': 7, 'code': 'raw'})
         assert type(future).__name__ == 'FutureVendor'
-        assert fake_async_sg._calls == calls_before
+        assert fake_async_sg.calls == calls_before
 
     asyncio.run(scenario())

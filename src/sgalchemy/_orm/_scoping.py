@@ -6,23 +6,26 @@ import logging
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, TypedDict, TypeVar, Unpack, cast
+from typing import TYPE_CHECKING, Any, Literal, TypedDict, TypeVar, Unpack, cast
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    from os import PathLike
     from types import TracebackType
 
     from sgalchemy._core._expressions import Filter, FilterGroup, RawFilters
     from sgalchemy.schema._policy import SchemaCachePolicy
 
+from sgalchemy._core._async_engine import AsyncEngine
 from sgalchemy._core._construction import validate_site
 from sgalchemy._core._engine import Engine, create_engine
 from sgalchemy._core._engine_common import add_note_once
+from sgalchemy._core._expressions import FieldExpr
 from sgalchemy._core._registry import (
     Entity,
     Registry,
     can_replace_default_registry,
     commit_default_registry_transition,
+    entity_type,
     install_entity_finder,
     release_default_registry_transition,
     reserve_default_registry_transition,
@@ -35,6 +38,12 @@ from sgalchemy._orm._scope_common import record_close_failure
 from sgalchemy._orm._session import Session, commit_session
 from sgalchemy._shotgun import ClosableShotgunLike, ShotgunLike
 
+_CLOSE_UNFINISHED_NOTE = (
+    "sgalchemy: the factory's Session.close() did not finish; call close() on the session again"
+)
+_CLOSE_UNFINISHED_RESTAGE_NOTE = (
+    _CLOSE_UNFINISHED_NOTE + ', and explicitly restage any desired unsent work on a new Session'
+)
 _COMMIT_FAILURE_CLOSE_NOTE = (
     'sgalchemy: the factory closed the Session and discarded its local retry queue; '
     'callers must explicitly restage any desired unsent work on a usable Session'
@@ -66,7 +75,7 @@ class _CommitOnSuccess:
         exc_type: type[BaseException] | None,
         exc_value: BaseException | None,
         traceback: TracebackType | None,
-    ) -> bool:
+    ) -> Literal[False]:
         """Commit a clean body, preserve the primary fault, and always close."""
         del exc_type, traceback
         session = self._session
@@ -74,13 +83,13 @@ class _CommitOnSuccess:
             raise RuntimeError('commit_on_success() entered without a Session')
         try:
             if exc_value is not None:
-                _close_preserving(session, exc_value)
+                _close_preserving(session, exc_value, restage=False)
                 return False
             try:
                 commit_session(session, wrap_ordinary_failure=True)
             except BaseException as primary:
-                _close_preserving(session, primary)
-                add_note_once(primary, _COMMIT_FAILURE_CLOSE_NOTE)
+                if _close_preserving(session, primary, restage=True):
+                    add_note_once(primary, _COMMIT_FAILURE_CLOSE_NOTE)
                 raise
             else:
                 session.close()
@@ -96,7 +105,7 @@ class _ConnectOptions(TypedDict, total=False):
     script_name: str | None
     api_key: str | None
     session_token: str | None
-    cache_root: Path | None
+    cache_root: str | PathLike[str] | None
     policy: SchemaCachePolicy | None
     echo: bool
     registry: Registry | None
@@ -107,11 +116,11 @@ class _ConnectOptions(TypedDict, total=False):
 class _SessionLocal(threading.local):
     """Hold the current thread's scoped Session."""
 
-    _session: Session | None
+    session: Session | None
 
     def __init__(self) -> None:
         """Initialize one thread's empty Session slot."""
-        self._session = None
+        self.session = None
 
 
 class ScopedSession:
@@ -131,11 +140,11 @@ class ScopedSession:
     def __call__(self) -> Session:
         """Return the current thread's Session, creating it when absent."""
         local = cast('_SessionLocal', object.__getattribute__(self, '_local'))
-        session = local._session  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        session = local.session
         if session is None:
             factory = cast('Callable[[], Session]', object.__getattribute__(self, '_factory'))
             session = factory()
-            local._session = session  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            local.session = session
         return session
 
     if not TYPE_CHECKING:
@@ -150,10 +159,14 @@ class ScopedSession:
                 return getattr(self(), name)
 
     def add(self, obj: Entity) -> None:
-        """Forward an entity creation stage to the current Session.
+        """Stage a pending create or attach a detached persistent entity.
 
         Args:
-            obj: Schema-bound pending entity from `Entity.new()`.
+            obj: Schema-bound pending or persistent entity.
+
+        Raises:
+            SgalchemyError: If entity ownership, state, or identity prevents
+                attachment, or pending accepted bookkeeping cannot finish.
         """
         self().add(obj)
 
@@ -164,8 +177,22 @@ class ScopedSession:
     def commit(self, batch_size: int | None = None) -> None:
         """Forward staged work to the current Session's commit.
 
+        A commit is atomic only when its complete plan uses one provider batch.
+
         Args:
-            batch_size: Maximum provider operations per batch request.
+            batch_size: Optional positive maximum requests per batch. The limit
+                must fit every indivisible operation group.
+
+        Raises:
+            CommitError: If execution reports partial outcome evidence or a
+                successful batch cannot be reconciled safely.
+            RetiredEntityWriteError: If staged writes on a retired entity lack
+                revival intent.
+            SgalchemyError: If local planning or pending bookkeeping is
+                rejected.
+            ValueError: If the batch limit is invalid or too small.
+            Exception: Original provider or schema-preparation failure; a
+                sole-batch provider failure remains unwrapped.
         """
         self().commit(batch_size)
 
@@ -194,6 +221,14 @@ class ScopedSession:
 
         Returns:
             Projection result or raw summary payload.
+
+        Raises:
+            TypeError: If `stmt` selects entities.
+            CompilationError: If the statement cannot compile.
+            SgalchemyError: If pending bookkeeping cannot finish or the
+                provider result is invalid.
+            Exception: Original schema-preparation or provider failure,
+                annotated and unwrapped.
         """
         return self().execute(stmt)
 
@@ -218,6 +253,14 @@ class ScopedSession:
 
         Returns:
             Identity-mapped entity or `None` when absent.
+
+        Raises:
+            SchemaUnavailableError: If the entity type remains absent after one
+                forced schema refresh.
+            SgalchemyError: If identity or ownership is invalid, or pending
+                bookkeeping cannot finish.
+            Exception: Original schema-preparation or provider failure,
+                annotated and unwrapped.
         """
         return self().get(cls, entity_id)
 
@@ -237,6 +280,14 @@ class ScopedSession:
 
         Args:
             obj: Session-owned persistent entity.
+
+        Raises:
+            SchemaUnavailableError: If the entity type remains absent after one
+                forced schema refresh.
+            SgalchemyError: If ownership or the provider result is invalid, or
+                pending bookkeeping cannot finish.
+            Exception: Original schema-preparation or provider failure,
+                annotated and unwrapped.
         """
         self().refresh(obj)
 
@@ -246,13 +297,13 @@ class ScopedSession:
         Close restores local dirty snapshots and detaches owned entities.
         """
         local = cast('_SessionLocal', object.__getattribute__(self, '_local'))
-        session = local._session  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        session = local.session
         if session is None:
             return
         try:
             session.close()
         finally:
-            local._session = None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+            local.session = None
 
     def revive(self, obj: Entity) -> None:
         """Forward an entity revival stage to the current Session.
@@ -274,6 +325,16 @@ class ScopedSession:
 
         Returns:
             Identity-mapped entities in provider order.
+
+        Raises:
+            TypeError: If `stmt` is a projection or summary.
+            CompilationError: If the statement or loader options cannot
+                compile.
+            SgalchemyError: If ownership, returned identity data, or
+                relationship loading is invalid, or pending bookkeeping cannot
+                finish.
+            Exception: Original schema-preparation or provider failure,
+                annotated and unwrapped.
         """
         return self().scalars(stmt)
 
@@ -330,7 +391,13 @@ def _find_entities(
     eq_filters: dict[str, object],
 ) -> list[Entity]:
     """Execute model-level finder sugar through the current default Session."""
-    equalities = tuple(getattr(cls, name) == value for name, value in eq_filters.items())
+    equalities: list[Filter] = []
+    for name, value in eq_filters.items():
+        field = getattr(cls, name)
+        if isinstance(field, FieldExpr):
+            equalities.append(field == value)
+            continue
+        raise AttributeError(f'{entity_type(cls)} has no field or field alias {name!r}')
     return _default_session().scalars(select(cls).where(*conditions, *equalities))
 
 
@@ -357,13 +424,19 @@ def _record_close_failure(primary: BaseException, secondary: BaseException) -> N
     record_close_failure(primary, secondary, 'Session', _LOGGER)
 
 
-def _close_preserving(session: Session, primary: BaseException) -> None:
-    """Keep the primary on close `Exception`; propagate cleanup or diagnostic `BaseException`."""
+def _close_preserving(session: Session, primary: BaseException, *, restage: bool) -> bool:
+    """Keep the primary on ordinary close failure and report whether close finished."""
     suppression = _SuppressFailure()
     with suppression:
         session.close()
     if suppression.error is not None:
         _record_close_failure(primary, suppression.error)
+        add_note_once(
+            primary,
+            _CLOSE_UNFINISHED_RESTAGE_NOTE if restage else _CLOSE_UNFINISHED_NOTE,
+        )
+        return False
+    return True
 
 
 def _select_connection_registry(
@@ -439,7 +512,15 @@ def scoped_session(factory: Callable[[], Session]) -> ScopedSession:
     Returns:
         Callable thread-local registry with public `Session` attribute
         passthrough and local-state-reverting `remove()` cleanup.
+
+    Raises:
+        TypeError: If `factory` is an AsyncEngine.
     """
+    if isinstance(factory, AsyncEngine):
+        raise TypeError(
+            'scoped_session() requires a Session factory, not an AsyncEngine; use '
+            'async_scoped_session(async_sessionmaker(engine))'
+        )
     return ScopedSession(factory)
 
 
@@ -459,7 +540,14 @@ def sessionmaker(
 
     Returns:
         Zero-argument Session factory with frozen lazy-load budget.
+
+    Raises:
+        TypeError: If `engine` is an AsyncEngine.
     """
+    if isinstance(engine, AsyncEngine):
+        raise TypeError(
+            'sessionmaker() requires an Engine, not an AsyncEngine; use async_sessionmaker(engine)'
+        )
     return SessionFactory(engine, max_implicit_queries)
 
 

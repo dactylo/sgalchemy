@@ -1,12 +1,19 @@
 """Build field expressions, filters, and groupings."""
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from dataclasses import field as dc_field
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, TypeGuard
 
 from sgalchemy._errors import CompilationError
 from sgalchemy.schema._model import EntitySchema, FieldSchema
+
+__all__ = ['Func']
+
+_FILTER_TRUTH_MESSAGE = (
+    'filter conditions have no truth value; combine them with and_(), or_(), or several where() '
+    "arguments instead of Python's and/or/not, and use field.in_(values) instead of Python's in"
+)
 
 # Server-supported grouping modes (summarize() docs); validity per mode depends on the
 # grouped field's data type - the server is the authority, we only reject unknown names.
@@ -48,10 +55,15 @@ _SUMMARY_WIRE = {
     'record_count': 'record_count',
 }
 
+_TIME_UNITS = ('HOUR', 'DAY', 'WEEK', 'MONTH', 'YEAR')
+
 
 @dataclass(frozen=True)
 class Filter:
     """Carry one provider filter condition and optional root ownership.
+
+    Truth testing raises `TypeError`, except a stamped field-to-field `is` or
+    `is_not` comparison tests structural field identity.
 
     Attributes:
         path: Rendered wire field path.
@@ -68,13 +80,44 @@ class Filter:
     extra_values: tuple[object, ...] = ()
     entity_type: str | None = dc_field(default=None, compare=False)
 
+    def __bool__(self) -> bool:
+        """Test structural identity only for field-to-field comparisons.
+
+        Returns:
+            Whether two field references have the same root type and wire path,
+            negated for `is_not`.
+
+        Raises:
+            TypeError: If this is not a stamped field-to-field comparison.
+        """
+        if (
+            self.op in ('is', 'is_not')
+            and isinstance(self.value, FieldExpr)
+            and not self.extra_values
+            and self.entity_type is not None
+        ):
+            same = (self.entity_type, self.path) == (
+                self.value.root_type,
+                self.value.filter_field,
+            )
+            return same if self.op == 'is' else not same
+        raise TypeError(_FILTER_TRUTH_MESSAGE)
+
 
 @dataclass(frozen=True)
 class FilterGroup:
-    """Nested any/all group compiling to a `filter_operator` block."""
+    """Nested any/all group with no truth value, compiling to a `filter_operator` block."""
 
     op: Literal['any', 'all']
     items: tuple['Filter | FilterGroup | RawFilters', ...]
+
+    def __bool__(self) -> bool:
+        """Reject truth testing of a condition group.
+
+        Raises:
+            TypeError: Filter groups have no truth value.
+        """
+        raise TypeError(_FILTER_TRUTH_MESSAGE)
 
 
 @dataclass(frozen=True)
@@ -117,6 +160,8 @@ class FieldExpr:
     open-ended `between` filters. Private names raise `AttributeError`;
     schema-bound traversal raises `CompilationError` for non-single-entity
     links, ambiguous target types, and unavailable target entities or fields.
+    Value comparisons have no truth value; comparisons between field references
+    test root type and wire path identity. Hashing uses that same identity.
     """
 
     def __init__(
@@ -144,12 +189,12 @@ class FieldExpr:
         self._schemas = schemas
 
     def __hash__(self) -> int:
-        """Hash by entity type and path.
+        """Hash by root entity type and wire path.
 
         Returns:
-            Stable hash of the current entity type and path.
+            Stable hash of the root entity type and path.
         """
-        return hash((self._entity_type, self._path))
+        return hash((self._root_type, self._path))
 
     @property
     def filter_field(self) -> str:
@@ -400,12 +445,16 @@ class FieldExpr:
         """Compile to `in`.
 
         Args:
-            *values: Accepted field values.
+            *values: Accepted field values, or one iterable of them other than
+                a string, bytes, or mapping.
 
         Returns:
             Filter using the `in` wire operator.
+
+        Raises:
+            TypeError: If an iterable of values is mixed with separate values.
         """
-        return self._filter('in', list(values))
+        return self._filter('in', _in_values('in_()', values))
 
     def in_calendar_day(self, offset: int) -> Filter:
         """Compile to `in_calendar_day`.
@@ -456,24 +505,32 @@ class FieldExpr:
 
         Args:
             count: Number of time units.
-            unit: Server time unit name.
+            unit: `HOUR`, `DAY`, `WEEK`, `MONTH`, or `YEAR`, in any letter
+                case.
 
         Returns:
             Filter using the `in_last` wire operator.
+
+        Raises:
+            CompilationError: If the time unit is unknown.
         """
-        return self._filter('in_last', count, unit)
+        return self._filter('in_last', count, _time_unit(unit))
 
     def in_next(self, count: int, unit: str) -> Filter:
         """Compile to `in_next`.
 
         Args:
             count: Number of time units.
-            unit: Server time unit name.
+            unit: `HOUR`, `DAY`, `WEEK`, `MONTH`, or `YEAR`, in any letter
+                case.
 
         Returns:
             Filter using the `in_next` wire operator.
+
+        Raises:
+            CompilationError: If the time unit is unknown.
         """
-        return self._filter('in_next', count, unit)
+        return self._filter('in_next', count, _time_unit(unit))
 
     def is_(self, value: object) -> Filter:
         """Compile to `is`.
@@ -579,36 +636,48 @@ class FieldExpr:
         """Compile to `not_in`.
 
         Args:
-            *values: Rejected field values.
+            *values: Rejected field values, or one iterable of them other than
+                a string, bytes, or mapping.
 
         Returns:
             Filter using the `not_in` wire operator.
+
+        Raises:
+            TypeError: If an iterable of values is mixed with separate values.
         """
-        return self._filter('not_in', list(values))
+        return self._filter('not_in', _in_values('not_in()', values))
 
     def not_in_last(self, count: int, unit: str) -> Filter:
         """Compile to `not_in_last`.
 
         Args:
             count: Number of time units.
-            unit: Server time unit name.
+            unit: `HOUR`, `DAY`, `WEEK`, `MONTH`, or `YEAR`, in any letter
+                case.
 
         Returns:
             Filter using the `not_in_last` wire operator.
+
+        Raises:
+            CompilationError: If the time unit is unknown.
         """
-        return self._filter('not_in_last', count, unit)
+        return self._filter('not_in_last', count, _time_unit(unit))
 
     def not_in_next(self, count: int, unit: str) -> Filter:
         """Compile to `not_in_next`.
 
         Args:
             count: Number of time units.
-            unit: Server time unit name.
+            unit: `HOUR`, `DAY`, `WEEK`, `MONTH`, or `YEAR`, in any letter
+                case.
 
         Returns:
             Filter using the `not_in_next` wire operator.
+
+        Raises:
+            CompilationError: If the time unit is unknown.
         """
-        return self._filter('not_in_next', count, unit)
+        return self._filter('not_in_next', count, _time_unit(unit))
 
     @property
     def path(self) -> tuple[str, ...]:
@@ -664,9 +733,17 @@ class FieldExpr:
 
 @dataclass(frozen=True)
 class RawFilters:
-    """Raw SG filter-list syntax passed through verbatim."""
+    """Raw SG filter-list syntax passed through verbatim, with no truth value."""
 
     filters: list[Any]
+
+    def __bool__(self) -> bool:
+        """Reject truth testing of raw filters.
+
+        Raises:
+            TypeError: Raw filters have no truth value.
+        """
+        raise TypeError(_FILTER_TRUTH_MESSAGE)
 
 
 @dataclass(frozen=True)
@@ -684,8 +761,12 @@ class Summary:
     entity_type: str
 
 
-class _Func:
-    """Aggregate namespace containing only server-supported summary types."""
+class Func:
+    """Provide the server-supported aggregate factories used by `func`.
+
+    Each declared member accepts one field expression and builds its
+    corresponding server summary expression.
+    """
 
     count: Callable[[FieldExpr], Summary]
     sum: Callable[[FieldExpr], Summary]
@@ -704,7 +785,17 @@ class _Func:
     if not TYPE_CHECKING:
 
         def __getattr__(self, name: str) -> Callable[[FieldExpr], Summary]:
-            """Return the factory for a server-supported summary type."""
+            """Return a factory for a server-supported summary type.
+
+            Args:
+                name: Summary type requested by the caller.
+
+            Returns:
+                A factory that builds a summary expression for one field.
+
+            Raises:
+                AttributeError: If the server does not support `name`.
+            """
             wire = _SUMMARY_WIRE.get(name)
             if wire is None:
                 raise AttributeError(
@@ -717,28 +808,34 @@ class _Func:
             return make
 
 
-def and_(*items: 'Filter | FilterGroup | RawFilters') -> FilterGroup:
-    """Combine conditions so all must match.
+def _in_values(call: str, values: tuple[object, ...]) -> list[object]:
+    """Expand one non-text iterable or retain separate field values."""
 
-    Args:
-        *items: Filters, nested groups, or raw filter lists.
+    def is_value_iterable(value: object) -> TypeGuard[Iterable[object]]:
+        return isinstance(value, Iterable) and not isinstance(
+            value, (str, bytes, bytearray, Mapping)
+        )
 
-    Returns:
-        All-items filter group.
-    """
-    return FilterGroup('all', tuple(items))
+    if len(values) == 1:
+        value = values[0]
+        if is_value_iterable(value):
+            return list(value)
+    if len(values) > 1 and any(is_value_iterable(value) for value in values):
+        raise TypeError(
+            f'{call} takes either one iterable of values or the values as separate arguments, '
+            'not both'
+        )
+    return list(values)
 
 
-def or_(*items: 'Filter | FilterGroup | RawFilters') -> FilterGroup:
-    """Combine conditions so any may match.
-
-    Args:
-        *items: Filters, nested groups, or raw filter lists.
-
-    Returns:
-        Any-item filter group.
-    """
-    return FilterGroup('any', tuple(items))
+def _time_unit(unit: object) -> str:
+    """Normalize a server-supported relative-date unit."""
+    if isinstance(unit, str) and unit.upper() in _TIME_UNITS:
+        return unit.upper()
+    raise CompilationError(
+        f'unknown time unit {unit!r}; server-supported units: HOUR, DAY, WEEK, MONTH, YEAR '
+        '(any letter case)'
+    )
 
 
 def raw(filters: list[Any]) -> RawFilters:
@@ -753,4 +850,63 @@ def raw(filters: list[Any]) -> RawFilters:
     return RawFilters(filters)
 
 
-func = _Func()
+def require_conditions(call: str, conditions: tuple[object, ...]) -> None:
+    """Reject values that cannot be compiled as filter conditions.
+
+    Args:
+        call: Name of the builder call for an actionable error.
+        conditions: Positional values supplied to the builder.
+
+    Raises:
+        TypeError: If a value is not a filter condition.
+    """
+    for item in conditions:
+        if isinstance(item, (Filter, FilterGroup, RawFilters)):
+            continue
+        message = (
+            f'{call} takes filter conditions (Filter, FilterGroup, or RawFilters), '
+            f'not {type(item).__name__}'
+        )
+        if isinstance(item, bool):
+            message += (
+                "; Python's in, and, and or were already evaluated, so use "
+                'field.in_(), and_(), or or_() instead'
+            )
+        elif isinstance(item, (list, tuple)):
+            message += '; pass the conditions as separate arguments, such as where(*conditions)'
+        raise TypeError(message)
+
+
+def and_(*items: 'Filter | FilterGroup | RawFilters') -> FilterGroup:
+    """Combine conditions so all must match.
+
+    Args:
+        *items: Filters, nested groups, or raw filter lists.
+
+    Returns:
+        All-items filter group.
+
+    Raises:
+        TypeError: If an item is not a filter condition.
+    """
+    require_conditions('and_()', items)
+    return FilterGroup('all', tuple(items))
+
+
+def or_(*items: 'Filter | FilterGroup | RawFilters') -> FilterGroup:
+    """Combine conditions so any may match.
+
+    Args:
+        *items: Filters, nested groups, or raw filter lists.
+
+    Returns:
+        Any-item filter group.
+
+    Raises:
+        TypeError: If an item is not a filter condition.
+    """
+    require_conditions('or_()', items)
+    return FilterGroup('any', tuple(items))
+
+
+func = Func()

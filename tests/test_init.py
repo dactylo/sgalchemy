@@ -6,17 +6,30 @@ from pathlib import Path
 import sgalchemy
 
 _REQUIRED_PUBLIC = [
+    'AsyncClosableShotgunLike',
     'AsyncEngine',
     'AsyncScopedSession',
     'AsyncSession',
     'AsyncSessionFactory',
     'AsyncShotgunLike',
+    'ClosableShotgunLike',
     'CommitError',
     'CompilationError',
+    'Defer',
     'Engine',
     'Entity',
+    'EntityNamespace',
     'FieldExpr',
+    'Filter',
+    'FilterGroup',
+    'FindCall',
+    'Grouping',
     'InspectionInfo',
+    'JoinedLoad',
+    'LazyLoad',
+    'LoadOnly',
+    'Ordering',
+    'RawFilters',
     'RefreshRequiredError',
     'Registry',
     'RelationshipTargetUnavailableError',
@@ -26,11 +39,14 @@ _REQUIRED_PUBLIC = [
     'SchemaUnavailableError',
     'ScopedSession',
     'Select',
+    'SelectinLoad',
     'Session',
     'SessionFactory',
     'SgalchemyError',
     'ShotgunLike',
     'StaleObjectError',
+    'SummarizeCall',
+    'Summary',
     'UnfetchedFieldError',
     'and_',
     'async_scoped_session',
@@ -53,6 +69,16 @@ _REQUIRED_PUBLIC = [
     'sessionmaker',
     'set_default_registry',
 ]
+
+
+def _run_script(script: str, **env_overrides: str) -> None:
+    env = dict(os.environ)
+    source_root = Path(__file__).parents[1] / 'src'
+    env['PYTHONPATH'] = os.pathsep.join(
+        part for part in (str(source_root), env.get('PYTHONPATH')) if part
+    )
+    env.update(env_overrides)
+    subprocess.run([sys.executable, '-c', script], env=env, check=True)
 
 
 def _run_nondefault_to_default_transition(tmp_path: Path, registry_mode: str) -> None:
@@ -166,14 +192,7 @@ assert entity_state(new_found[0]).session is replacement
 assert [call[0] for call in old_connection.calls].count('find') == 1
 assert [call[0] for call in new_connection.calls].count('find') == 1
 """
-    env = dict(os.environ)
-    source_root = Path(__file__).parents[1] / 'src'
-    env['PYTHONPATH'] = os.pathsep.join(
-        part for part in (str(source_root), env.get('PYTHONPATH')) if part
-    )
-    env['TEST_CACHE_ROOT'] = str(cache_root)
-    env['TEST_REGISTRY_MODE'] = registry_mode
-    subprocess.run([sys.executable, '-c', script], env=env, check=True)
+    _run_script(script, TEST_CACHE_ROOT=str(cache_root), TEST_REGISTRY_MODE=registry_mode)
 
 
 def test_all_is_exact_sorted_and_importable() -> None:
@@ -231,13 +250,7 @@ assert entities.Shot is shot
 pending = shot.new(code='bound')
 session.add(pending)
 """
-    env = dict(os.environ)
-    source_root = Path(__file__).parents[1] / 'src'
-    env['PYTHONPATH'] = os.pathsep.join(
-        part for part in (str(source_root), env.get('PYTHONPATH')) if part
-    )
-    env['TEST_CACHE_ROOT'] = str(cache_root)
-    subprocess.run([sys.executable, '-c', script], env=env, check=True)
+    _run_script(script, TEST_CACHE_ROOT=str(cache_root))
 
 
 def test_force_connect_from_explicit_session_binds_lazy_default_registry(
@@ -285,11 +298,5 @@ for target in targets:
 assert get_type_hints(sgalchemy.InspectionInfo)
 assert 'shotgun_api3' not in sys.modules
 """
-    env = dict(os.environ)
-    source_root = Path(__file__).parents[1] / 'src'
-    env['PYTHONPATH'] = os.pathsep.join(
-        part for part in (str(source_root), env.get('PYTHONPATH')) if part
-    )
-    env['SGALCHEMY_SCHEMA_CACHE'] = str(cache_root)
-    subprocess.run([sys.executable, '-c', script], env=env, check=True)
+    _run_script(script, SGALCHEMY_SCHEMA_CACHE=str(cache_root))
     assert not cache_root.exists()

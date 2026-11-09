@@ -1,15 +1,17 @@
 """Shared synchronous and asynchronous engine behavior."""
 
+import logging
 import re
 from contextlib import suppress
 from dataclasses import dataclass, field
+from pathlib import Path
 from threading import Event
 from typing import Any
 
 from sgalchemy._core._compiler import FindCall, SummarizeCall
 from sgalchemy._core._registry import Entity, Registry
 from sgalchemy._errors import SgalchemyError
-from sgalchemy.schema._cache import SchemaCache, validate_cache
+from sgalchemy.schema._cache import SchemaCache, store_cache, validate_cache
 from sgalchemy.schema._model import EntitySchema, build_schema
 
 AUTH_READ_NOTE = (
@@ -31,6 +33,7 @@ AUTH_UPLOAD_NOTE = (
     'recover, call session.refresh(entity) or query through a fresh session to '
     'reconcile the field.'
 )
+_LOGGER = logging.getLogger('sgalchemy.engine')
 _SCHEMA_FAULT_PATTERNS = (
     re.compile(r'\b(?:unknown|invalid)\s+(?:field|entity(?:\s+type)?)\b', re.IGNORECASE),
     re.compile(
@@ -121,9 +124,12 @@ def looks_like_auth_fault(err: Exception) -> bool:
 
     Returns:
         Whether the exception type inherits from a class named
-        `AuthenticationFault`.
+        `AuthenticationFault`. A type whose attributes cannot be read is not
+        one.
     """
-    return any(cls.__name__ == 'AuthenticationFault' for cls in type(err).__mro__)
+    with suppress(Exception):
+        return any(cls.__name__ == 'AuthenticationFault' for cls in type(err).__mro__)
+    return False
 
 
 def add_auth_note(source: Exception, target: Exception, note: str) -> None:
@@ -153,6 +159,22 @@ def looks_like_schema_fault(method: str, err: Exception) -> bool:
     return any(pattern.search(str(err)) is not None for pattern in _SCHEMA_FAULT_PATTERNS)
 
 
+def missing_provider_error(keywords: str) -> ModuleNotFoundError:
+    """Name the missing SG provider and the alternate client sources.
+
+    Args:
+        keywords: Factory keywords that accept a caller-supplied client.
+
+    Returns:
+        Missing-module error retaining `shotgun_api3` as its module name.
+    """
+    return ModuleNotFoundError(
+        'no SG API provider is installed; install sgalchemy with the official, api, or async '
+        f'extra, or pass {keywords}',
+        name='shotgun_api3',
+    )
+
+
 def provider_call_arguments(
     call: FindCall | SummarizeCall,
 ) -> tuple[str, tuple[Any, ...], dict[str, Any]]:
@@ -176,8 +198,35 @@ def provider_call_arguments(
     return 'summarize', (call.entity_type, call.filters, call.summary_fields), kwargs
 
 
+def try_store_cache(path: Path, cache: SchemaCache) -> OSError | None:
+    """Write a cache, returning a filesystem failure instead of raising it.
+
+    Args:
+        path: Destination cache file.
+        cache: Schema snapshot to serialize.
+
+    Returns:
+        The filesystem error, or `None` when the cache was stored.
+
+    Raises:
+        TypeError: If the cache contains a value JSON cannot serialize.
+        ValueError: If the cache contains a reference cycle.
+    """
+    try:
+        store_cache(path, cache)
+    except OSError as error:
+        return error
+    return None
+
+
 def validated_schema(cache: SchemaCache) -> dict[str, EntitySchema]:
     """Build provider schema only after validating its complete wire shape.
+
+    Args:
+        cache: Freshly fetched or loaded schema cache to validate.
+
+    Returns:
+        Entity schemas keyed by canonical entity type.
 
     Raises:
         SgalchemyError: If provider schema is malformed and cannot be
@@ -190,3 +239,18 @@ def validated_schema(cache: SchemaCache) -> dict[str, EntitySchema]:
         raise SgalchemyError(
             'provider returned malformed schema; cache was not updated'
         ) from error
+
+
+def warn_cache_not_written(path: Path, error: OSError) -> None:
+    """Log that a fetched schema remains usable despite a cache-write failure.
+
+    Args:
+        path: Cache destination that could not be written.
+        error: Filesystem failure from storing the cache.
+    """
+    _LOGGER.warning(
+        'could not write the schema cache %s: %s; using the fetched schema without caching it. '
+        'Set SGALCHEMY_SCHEMA_CACHE or pass cache_root= to use a writable directory',
+        path,
+        error,
+    )

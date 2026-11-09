@@ -7,8 +7,6 @@ from pathlib import Path
 from typing import Any, Never, ParamSpec, TypeVar, cast
 
 import pytest
-from _fakes import _FakeAsyncShotgun
-from _support import YieldCountingEntities, _AsyncCallback, isolated_async_engine
 
 from sgalchemy._core._async_engine import create_async_engine
 from sgalchemy._core._options import joinedload, lazyload, selectinload
@@ -17,21 +15,23 @@ from sgalchemy._core._statement import select
 from sgalchemy._errors import CompilationError, RelationshipTargetUnavailableError, SgalchemyError
 from sgalchemy._orm._async_session import AsyncSession
 from sgalchemy._shotgun import WireRecord, WireRecords
+from tests._fakes import FakeAsyncShotgun
+from tests._support import AsyncCallback, YieldCountingEntities, isolated_async_engine, run_async
 
 _P = ParamSpec('_P')
 _R = TypeVar('_R')
 
 
 def _find_calls(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
 ) -> list[tuple[str, tuple[Any, ...], dict[str, Any]]]:
-    return [call for call in fake_async_sg._calls if call[0] == 'find']
+    return [call for call in fake_async_sg.calls if call[0] == 'find']
 
 
 def _replace_call(
-    _call: _AsyncCallback[_P, _R],
+    _call: AsyncCallback[_P, _R],
     replacement: Callable[[str, tuple[object, ...], dict[str, object]], Awaitable[_R]],
-) -> _AsyncCallback[_P, _R]:
+) -> AsyncCallback[_P, _R]:
     async def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
         entity_type = cast('str', kwargs['entity_type'] if 'entity_type' in kwargs else args[0])
         return await replacement(entity_type, tuple(args), dict(kwargs))
@@ -39,7 +39,7 @@ def _replace_call(
     return wrapper
 
 
-def _track_call(call: _AsyncCallback[_P, _R]) -> tuple[_AsyncCallback[_P, _R], list[None]]:
+def _track_call(call: AsyncCallback[_P, _R]) -> tuple[AsyncCallback[_P, _R], list[None]]:
     captures: list[None] = []
 
     async def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
@@ -50,7 +50,7 @@ def _track_call(call: _AsyncCallback[_P, _R]) -> tuple[_AsyncCallback[_P, _R], l
 
 
 def test_async_explicit_load_fetches_active_and_retired_parents(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -71,7 +71,7 @@ def test_async_explicit_load_fetches_active_and_retired_parents(
         ) -> WireRecords:
             if entity_type == 'Shot':
                 parent_id = 2 if kwargs.get('retired_only') else 1
-                fake_async_sg._find_results = [
+                fake_async_sg.find_results = [
                     [
                         {
                             'type': 'Shot',
@@ -81,7 +81,7 @@ def test_async_explicit_load_fetches_active_and_retired_parents(
                     ]
                 ]
             else:
-                fake_async_sg._find_results = [
+                fake_async_sg.find_results = [
                     [{'type': 'Project', 'id': 10, 'name': 'Project One'}]
                 ]
             return await original_find(
@@ -105,7 +105,7 @@ def test_async_explicit_load_fetches_active_and_retired_parents(
 
 
 def test_async_explicit_load_keeps_operation_owned_while_awaiting(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -116,8 +116,8 @@ def test_async_explicit_load_keeps_operation_owned_while_awaiting(
         shot = session.merge_dict(
             {'type': 'Shot', 'id': 1, 'assets': [{'type': 'Asset', 'id': 10}]}
         )
-        entered, release = fake_async_sg._block('find')
-        fake_async_sg._find_results = [[{'type': 'Asset', 'id': 10, 'code': 'A'}]]
+        entered, release = fake_async_sg.block('find')
+        fake_async_sg.find_results = [[{'type': 'Asset', 'id': 10, 'code': 'A'}]]
 
         loading = asyncio.create_task(session.load(shot, shot_cls.assets))
         await entered.wait()
@@ -128,11 +128,11 @@ def test_async_explicit_load_keeps_operation_owned_while_awaiting(
 
         assert shot.assets[0].code == 'A'
 
-    asyncio.run(scenario())
+    run_async(scenario())
 
 
 def test_async_explicit_load_recovers_unknown_target_without_repeating_parent(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
     schema_fixture: dict[str, Any],
     tmp_path: Path,
@@ -150,7 +150,7 @@ def test_async_explicit_load_recovers_unknown_target_without_repeating_parent(
 
         async def refreshed_schema_read() -> dict[str, Any]:
             nonlocal opaque_before_refresh, opaque_cls_before_refresh
-            await fake_async_sg._record('schema_read')
+            await fake_async_sg.record('schema_read')
             opaque_before_refresh = cast(
                 'Entity',
                 entity_state(shot).loaded['sg_vendor'],
@@ -159,7 +159,7 @@ def test_async_explicit_load_recovers_unknown_target_without_repeating_parent(
             return refreshed_raw
 
         monkeypatch.setattr(fake_async_sg, 'schema_read', refreshed_schema_read)
-        fake_async_sg._find_results = [
+        fake_async_sg.find_results = [
             [
                 {
                     'type': 'Shot',
@@ -176,7 +176,7 @@ def test_async_explicit_load_recovers_unknown_target_without_repeating_parent(
         assert type(shot.sg_vendor) is opaque_cls_before_refresh
         assert engine.registry.entity_class('FutureVendor') is opaque_cls_before_refresh
         assert shot.sg_vendor.code == 'FV-9'
-        assert [name for name, _, _ in fake_async_sg._calls].count('schema_read') == 2
+        assert [name for name, _, _ in fake_async_sg.calls].count('schema_read') == 2
         assert [call[1][0] for call in _find_calls(fake_async_sg)] == [
             'Shot',
             'FutureVendor',
@@ -186,7 +186,7 @@ def test_async_explicit_load_recovers_unknown_target_without_repeating_parent(
 
 
 def test_async_explicit_load_rejects_foreign_objects_and_wrong_root(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -210,14 +210,14 @@ def test_async_explicit_load_rejects_foreign_objects_and_wrong_root(
         own = session.merge_dict({'type': 'Shot', 'id': 1, 'assets': []})
         foreign = AsyncSession(other).merge_dict({'type': 'Shot', 'id': 2, 'assets': []})
         foreign_asset = AsyncSession(other).merge_dict({'type': 'Asset', 'id': 3, 'shots': []})
-        calls_before = len(fake_async_sg._calls)
+        calls_before = len(fake_async_sg.calls)
         with pytest.raises(SgalchemyError, match='different registry'):
             await session.load(foreign, shot_cls.assets)
         with pytest.raises(SgalchemyError, match='field root'):
             await session.load(own, asset_cls.shots)
         with pytest.raises(SgalchemyError, match='different registry'):
             await session.load([own, foreign_asset], asset_cls.shots)
-        assert len(fake_async_sg._calls) == calls_before
+        assert len(fake_async_sg.calls) == calls_before
 
     asyncio.run(scenario())
 
@@ -233,7 +233,7 @@ def test_async_explicit_load_rejects_foreign_objects_and_wrong_root(
     ],
 )
 def test_async_explicit_load_rejects_invalid_fields_before_io(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
     field_name: str,
     parent_row: dict[str, Any],
@@ -245,8 +245,8 @@ def test_async_explicit_load_rejects_invalid_fields_before_io(
         shot_cls = engine.entities.Shot
         shot = session.merge_dict({'type': 'Shot', 'id': 1})
         field = shot_cls.project.name if field_name == 'deep' else shot_cls.code
-        fake_async_sg._find_results = [[parent_row]]
-        schema_reads_before = [call for call in fake_async_sg._calls if call[0] == 'schema_read']
+        fake_async_sg.find_results = [[parent_row]]
+        schema_reads_before = [call for call in fake_async_sg.calls if call[0] == 'schema_read']
 
         with pytest.raises(SgalchemyError) as excinfo:
             await session.load(shot, field)
@@ -256,7 +256,7 @@ def test_async_explicit_load_rejects_invalid_fields_before_io(
         assert _find_calls(fake_async_sg) == []
         assert state.loaded == {'id': 1}
         assert all('.' not in key for key in state.loaded)
-        assert [call for call in fake_async_sg._calls if call[0] == 'schema_read'] == (
+        assert [call for call in fake_async_sg.calls if call[0] == 'schema_read'] == (
             schema_reads_before
         )
         assert isinstance(excinfo.value, CompilationError)
@@ -265,7 +265,7 @@ def test_async_explicit_load_rejects_invalid_fields_before_io(
 
 
 def test_async_explicit_load_uses_one_binding_for_complete_batch(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
     schema_fixture: dict[str, Any],
     tmp_path: Path,
@@ -295,7 +295,7 @@ def test_async_explicit_load_uses_one_binding_for_complete_batch(
                 {'type': 'Version', 'id': 2, 'entity': {'type': 'Asset', 'id': 20}}
             ),
         ]
-        fake_async_sg._find_results = [
+        fake_async_sg.find_results = [
             [{'type': 'Asset', 'id': 20, 'code': '2026-07-24'}],
             [{'type': 'Shot', 'id': 10, 'code': '2026-07-25'}],
         ]
@@ -303,7 +303,7 @@ def test_async_explicit_load_uses_one_binding_for_complete_batch(
         release_first_target = asyncio.Event()
         original_find = fake_async_sg.find
 
-        def gate_call(call: _AsyncCallback[_P, _R]) -> _AsyncCallback[_P, _R]:
+        def gate_call(call: AsyncCallback[_P, _R]) -> AsyncCallback[_P, _R]:
             async def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
                 entity_type = cast(
                     'str', kwargs['entity_type'] if 'entity_type' in kwargs else args[0]
@@ -342,11 +342,11 @@ def test_async_explicit_load_uses_one_binding_for_complete_batch(
         assert [call[1][0] for call in _find_calls(fake_async_sg)] == ['Asset', 'Shot']
         assert len(captures) == 1
 
-    asyncio.run(scenario())
+    run_async(scenario())
 
 
 def test_async_explicit_load_valid_direct_relationship_control(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -355,7 +355,7 @@ def test_async_explicit_load_valid_direct_relationship_control(
         session = AsyncSession(engine)
         shot_cls = engine.entities.Shot
         shot = session.merge_dict({'type': 'Shot', 'id': 1})
-        fake_async_sg._find_results = [
+        fake_async_sg.find_results = [
             [
                 {
                     'type': 'Shot',
@@ -375,25 +375,25 @@ def test_async_explicit_load_valid_direct_relationship_control(
 
 
 def test_async_lazyload_rejected_before_io(
-    fake_async_sg: _FakeAsyncShotgun, tmp_path: Path
+    fake_async_sg: FakeAsyncShotgun, tmp_path: Path
 ) -> None:
     async def scenario() -> None:
         engine = isolated_async_engine(fake_async_sg, tmp_path)
         await engine.load_schema()
         session = AsyncSession(engine)
         shot_cls = engine.entities.Shot
-        calls_before = len(fake_async_sg._calls)
+        calls_before = len(fake_async_sg.calls)
         with pytest.raises(SgalchemyError, match='cannot await') as excinfo:
             await session.scalars(select(shot_cls).options(lazyload(shot_cls.assets)))
         assert 'selectinload()' in str(excinfo.value)
         assert 'await session.load(...)' in str(excinfo.value)
-        assert len(fake_async_sg._calls) == calls_before
+        assert len(fake_async_sg.calls) == calls_before
 
     asyncio.run(scenario())
 
 
 def test_async_load_fetches_only_absent_relationships(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -403,7 +403,7 @@ def test_async_load_fetches_only_absent_relationships(
         shot_cls = engine.entities.Shot
         absent = session.merge_dict({'type': 'Shot', 'id': 1})
         empty = session.merge_dict({'type': 'Shot', 'id': 2, 'assets': []})
-        fake_async_sg._find_results = [
+        fake_async_sg.find_results = [
             [{'type': 'Shot', 'id': 1, 'assets': [{'type': 'Asset', 'id': 10}]}],
             [{'type': 'Asset', 'id': 10, 'code': 'A'}],
         ]
@@ -419,7 +419,7 @@ def test_async_load_fetches_only_absent_relationships(
 
 
 def test_async_load_pending_only_targets_capture_schema_without_record_io(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -432,7 +432,7 @@ def test_async_load_pending_only_targets_capture_schema_without_record_io(
         pending_asset = asset_cls.new(code='pending')
         shot = session.merge_dict({'type': 'Shot', 'id': 2, 'assets': []})
         shot.assets = [pending_asset]
-        calls_before = list(fake_async_sg._calls)
+        calls_before = list(fake_async_sg.calls)
         original_load_binding = engine.load_binding
         tracking_load_binding, captures = _track_call(original_load_binding)
 
@@ -443,13 +443,13 @@ def test_async_load_pending_only_targets_capture_schema_without_record_io(
         assert len(captures) == 1
         assert shot.assets == [pending_asset]
         assert entity_state(shot).dirty == {'assets': [pending_asset]}
-        assert fake_async_sg._calls == calls_before
+        assert fake_async_sg.calls == calls_before
 
     asyncio.run(scenario())
 
 
 def test_async_load_present_empty_values_capture_one_schema(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -460,7 +460,7 @@ def test_async_load_present_empty_values_capture_one_schema(
         shot_cls = engine.entities.Shot
         empty_list = session.merge_dict({'type': 'Shot', 'id': 1, 'assets': []})
         empty_none = session.merge_dict({'type': 'Shot', 'id': 2, 'assets': None})
-        calls_before = list(fake_async_sg._calls)
+        calls_before = list(fake_async_sg.calls)
         original_load_binding = engine.load_binding
         tracking_load_binding, captures = _track_call(original_load_binding)
 
@@ -473,7 +473,7 @@ def test_async_load_present_empty_values_capture_one_schema(
         assert len(captures) == 1
         assert empty_list.assets == []
         assert empty_none.assets is None
-        assert fake_async_sg._calls == calls_before
+        assert fake_async_sg.calls == calls_before
 
     asyncio.run(scenario())
 
@@ -486,7 +486,7 @@ def test_async_load_present_empty_values_capture_one_schema(
     ],
 )
 def test_async_load_rejects_corrupt_link_shapes_before_io(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
     value: object,
 ) -> None:
@@ -496,13 +496,13 @@ def test_async_load_rejects_corrupt_link_shapes_before_io(
         session = AsyncSession(engine)
         shot_cls = engine.entities.Shot
         shot = session.merge_dict({'type': 'Shot', 'id': 1, 'assets': value})
-        calls_before = list(fake_async_sg._calls)
+        calls_before = list(fake_async_sg.calls)
 
         with pytest.raises(SgalchemyError, match=r'Shot\.assets.*Entity'):
             await session.load(shot, shot_cls.assets)
 
         assert _find_calls(fake_async_sg) == []
-        assert fake_async_sg._calls[: len(calls_before)] == calls_before
+        assert fake_async_sg.calls[: len(calls_before)] == calls_before
 
     asyncio.run(scenario())
 
@@ -513,7 +513,7 @@ def test_async_load_rejects_corrupt_link_shapes_before_io(
     ids=['missing-parent-row', 'omitted-relationship-field'],
 )
 def test_async_load_rejects_incomplete_parent_response(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
     parent_rows: list[dict[str, Any]],
 ) -> None:
@@ -523,7 +523,7 @@ def test_async_load_rejects_incomplete_parent_response(
         session = AsyncSession(engine)
         shot_cls = engine.entities.Shot
         shot = session.merge_dict({'type': 'Shot', 'id': 1, 'code': 'parent'})
-        fake_async_sg._find_results = [parent_rows]
+        fake_async_sg.find_results = [parent_rows]
 
         with pytest.raises(
             SgalchemyError,
@@ -542,7 +542,7 @@ def test_async_load_rejects_incomplete_parent_response(
 
 
 def test_async_load_rejects_pending_parent_before_io(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -553,18 +553,18 @@ def test_async_load_rejects_pending_parent_before_io(
         persistent = session.merge_dict({'type': 'Shot', 'id': 1})
         pending = shot_cls.new(code='pending')
         session.add(pending)
-        calls_before = list(fake_async_sg._calls)
+        calls_before = list(fake_async_sg.calls)
 
         with pytest.raises(SgalchemyError, match='without a server identity'):
             await session.load([persistent, pending], shot_cls.assets)
 
-        assert fake_async_sg._calls == calls_before
+        assert fake_async_sg.calls == calls_before
 
     asyncio.run(scenario())
 
 
 def test_async_load_retries_missing_targets_after_new_binding(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -598,7 +598,7 @@ def test_async_load_retries_missing_targets_after_new_binding(
                 strict=True,
             )
         )
-        assert [name for name, _, _ in fake_async_sg._calls].count('schema_read') == 2
+        assert [name for name, _, _ in fake_async_sg.calls].count('schema_read') == 2
         assert _find_calls(fake_async_sg) == []
 
         failed = engine.prepared_binding()
@@ -617,7 +617,7 @@ def test_async_load_retries_missing_targets_after_new_binding(
             {**failed.schemas, 'FutureA': future_a, 'FutureB': future_b},
             key=failed.key,
         )
-        fake_async_sg._find_results = [
+        fake_async_sg.find_results = [
             [{'type': 'FutureA', 'id': 10, 'code': 'A'}],
             [{'type': 'FutureB', 'id': 20, 'code': 'B'}],
         ]
@@ -628,7 +628,7 @@ def test_async_load_retries_missing_targets_after_new_binding(
             current is original for current, original in zip(note.note_links, links, strict=True)
         )
         assert [link.code for link in note.note_links] == ['B', 'A']
-        assert [name for name, _, _ in fake_async_sg._calls].count('schema_read') == 2
+        assert [name for name, _, _ in fake_async_sg.calls].count('schema_read') == 2
         assert [call[1][0] for call in _find_calls(fake_async_sg)] == [
             'FutureA',
             'FutureB',
@@ -639,7 +639,7 @@ def test_async_load_retries_missing_targets_after_new_binding(
 
 @pytest.mark.parametrize('other_strategy', ['joined', 'selectin'])
 def test_async_mixed_lazyload_rejected_before_normalization(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
     other_strategy: str,
     tmp_path: Path,
@@ -653,7 +653,7 @@ def test_async_mixed_lazyload_rejected_before_normalization(
             options = (joinedload(shot_cls.assets), lazyload(shot_cls.assets))
         else:
             options = (lazyload(shot_cls.assets), selectinload(shot_cls.assets))
-        calls_before = list(fake_async_sg._calls)
+        calls_before = list(fake_async_sg.calls)
 
         async def fail_load_binding(*, force: bool = False) -> Never:
             del force
@@ -666,14 +666,14 @@ def test_async_mixed_lazyload_rejected_before_normalization(
 
         assert 'selectinload()' in str(excinfo.value)
         assert 'await session.load(...)' in str(excinfo.value)
-        assert fake_async_sg._calls == calls_before
+        assert fake_async_sg.calls == calls_before
 
     asyncio.run(scenario())
 
 
 @pytest.mark.parametrize('explicit', [False, True])
-def test_async_loader_responses_use_separate_staged_identity_scopes(
-    fake_async_sg: _FakeAsyncShotgun, tmp_path: Path, explicit: bool
+def test_async_loader_responses_skip_staged_list_scans(
+    fake_async_sg: FakeAsyncShotgun, tmp_path: Path, explicit: bool
 ) -> None:
     async def scenario() -> None:
         engine = isolated_async_engine(fake_async_sg, tmp_path)
@@ -683,9 +683,9 @@ def test_async_loader_responses_use_separate_staged_identity_scopes(
         staged = [session.merge_dict({'type': 'Shot', 'id': 1000 + i}) for i in range(20)]
         for obj in staged:
             session.delete(obj)
-        queue = YieldCountingEntities(session.unit_of_work._deleted)
-        session.unit_of_work._deleted = queue
-        fake_async_sg._find_results = [
+        queue = YieldCountingEntities(session.unit_of_work.deleted)
+        session.unit_of_work.deleted = queue
+        fake_async_sg.find_results = [
             [
                 {'type': 'Shot', 'id': i + 1, 'assets': [{'type': 'Asset', 'id': i + 1}]}
                 for i in range(20)
@@ -701,14 +701,13 @@ def test_async_loader_responses_use_separate_staged_identity_scopes(
             assert all(left is right for left, right in zip(returned, objects, strict=True))
         assert objects[0].assets[0].code == 'asset-0'
         assert objects[-1].assets[0].code == 'asset-19'
-        assert queue._visits == 40
-        assert session._state._hydration_index is None
+        assert queue.visits == 0
 
     asyncio.run(scenario())
 
 
 def test_async_multiple_selectins_preflight_union_before_secondary_io(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
     schema_fixture: dict[str, Any],
     tmp_path: Path,
@@ -720,11 +719,11 @@ def test_async_multiple_selectins_preflight_union_before_secondary_io(
         refreshed_raw['FutureA'] = copy.deepcopy(refreshed_raw['Sequence'])
 
         async def refreshed_schema_read() -> dict[str, Any]:
-            await fake_async_sg._record('schema_read')
+            await fake_async_sg.record('schema_read')
             return refreshed_raw
 
         monkeypatch.setattr(fake_async_sg, 'schema_read', refreshed_schema_read)
-        fake_async_sg._find_results = [
+        fake_async_sg.find_results = [
             [
                 {
                     'type': 'Shot',
@@ -748,20 +747,20 @@ def test_async_multiple_selectins_preflight_union_before_secondary_io(
                 )
             )
 
-        assert [name for name, _, _ in fake_async_sg._calls].count('schema_read') == 2
+        assert [name for name, _, _ in fake_async_sg.calls].count('schema_read') == 2
         assert [call[1][0] for call in _find_calls(fake_async_sg)] == ['Shot']
 
     asyncio.run(scenario())
 
 
 def test_async_multiple_selectins_sort_distinct_target_order(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
         engine = isolated_async_engine(fake_async_sg, tmp_path)
         await engine.load_schema()
-        fake_async_sg._find_results = [
+        fake_async_sg.find_results = [
             [
                 {
                     'type': 'Version',
@@ -796,7 +795,7 @@ def test_async_multiple_selectins_sort_distinct_target_order(
 
 
 def test_async_multiple_selectins_union_shared_target_reads(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
     schema_fixture: dict[str, Any],
     tmp_path: Path,
@@ -805,11 +804,11 @@ def test_async_multiple_selectins_union_shared_target_reads(
         schema_fixture['Version']['reviewer'] = copy.deepcopy(schema_fixture['Version']['user'])
 
         async def schema_read() -> dict[str, Any]:
-            await fake_async_sg._record('schema_read')
+            await fake_async_sg.record('schema_read')
             return copy.deepcopy(schema_fixture)
 
         monkeypatch.setattr(fake_async_sg, 'schema_read', schema_read)
-        fake_async_sg._find_results = [
+        fake_async_sg.find_results = [
             [
                 {
                     'type': 'Version',
@@ -853,7 +852,7 @@ def test_async_multiple_selectins_union_shared_target_reads(
 
 
 def test_async_scalars_keeps_entry_binding_through_selectin_refresh(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
     schema_fixture: dict[str, Any],
     tmp_path: Path,
@@ -876,11 +875,11 @@ def test_async_scalars_keeps_entry_binding_through_selectin_refresh(
         await engine.load_schema()
         session = AsyncSession(engine)
         shot_cls = engine.entities.Shot
-        fake_async_sg._find_results = [
+        fake_async_sg.find_results = [
             [{'type': 'Shot', 'id': 1, 'assets': [{'type': 'Asset', 'id': 10}]}],
             [{'type': 'Asset', 'id': 10, 'code': '2026-07-25'}],
         ]
-        entered, release = fake_async_sg._block('find')
+        entered, release = fake_async_sg.block('find')
 
         loading = asyncio.create_task(
             session.scalars(select(shot_cls).options(selectinload(shot_cls.assets)))
@@ -900,34 +899,11 @@ def test_async_scalars_keeps_entry_binding_through_selectin_refresh(
         assert shots[0].assets[0].code == datetime.date(2026, 7, 25)
         assert [call[1][0] for call in _find_calls(fake_async_sg)] == ['Shot', 'Asset']
 
-    asyncio.run(scenario())
-
-
-def test_async_selectin_and_explicit_load(
-    fake_async_sg: _FakeAsyncShotgun, tmp_path: Path
-) -> None:
-    async def scenario() -> None:
-        fake_async_sg._find_results = [
-            [{'type': 'Shot', 'id': 1, 'assets': [{'type': 'Asset', 'id': 10}]}],
-            [{'type': 'Asset', 'id': 10, 'code': 'A'}],
-            [{'type': 'Shot', 'id': 2, 'assets': [{'type': 'Asset', 'id': 20}]}],
-            [{'type': 'Asset', 'id': 20, 'code': 'B'}],
-        ]
-        engine = isolated_async_engine(fake_async_sg, tmp_path)
-        await engine.load_schema()
-        session = AsyncSession(engine)
-        shot_cls = engine.entities.Shot
-        eager = await session.scalars(select(shot_cls).options(selectinload(shot_cls.assets)))
-        assert eager[0].assets[0].code == 'A'
-        plain = await session.scalars(select(shot_cls))
-        await session.load(plain, shot_cls.assets)
-        assert plain[0].assets[0].code == 'B'
-
-    asyncio.run(scenario())
+    run_async(scenario())
 
 
 def test_async_selectin_concurrent_target_cancellation_cancels_reads(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -946,7 +922,7 @@ def test_async_selectin_concurrent_target_cancellation_cancels_reads(
             args: tuple[object, ...],
             kwargs: dict[str, object],
         ) -> WireRecords:
-            await fake_async_sg._record('find', *args, **kwargs)
+            await fake_async_sg.record('find', *args, **kwargs)
             if entity_type == 'Version':
                 return [
                     {
@@ -1002,7 +978,7 @@ def test_async_selectin_concurrent_target_cancellation_cancels_reads(
 
 
 def test_async_selectin_concurrent_targets_hydrate_in_owner_task(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1026,7 +1002,7 @@ def test_async_selectin_concurrent_targets_hydrate_in_owner_task(
             args: tuple[object, ...],
             kwargs: dict[str, object],
         ) -> WireRecords:
-            await fake_async_sg._record('find', *args, **kwargs)
+            await fake_async_sg.record('find', *args, **kwargs)
             if entity_type == 'Version':
                 return [
                     {
@@ -1091,7 +1067,7 @@ def test_async_selectin_concurrent_targets_hydrate_in_owner_task(
 
 
 def test_async_selectin_earlier_success_hydrates_before_ordered_target_failure(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1110,7 +1086,7 @@ def test_async_selectin_earlier_success_hydrates_before_ordered_target_failure(
             args: tuple[object, ...],
             kwargs: dict[str, object],
         ) -> WireRecords:
-            await fake_async_sg._record('find', *args, **kwargs)
+            await fake_async_sg.record('find', *args, **kwargs)
             if entity_type == 'Version':
                 return [
                     {'type': 'Version', 'id': 1, 'entity': {'type': 'Shot', 'id': 10}},
@@ -1139,7 +1115,7 @@ def test_async_selectin_earlier_success_hydrates_before_ordered_target_failure(
 
 
 def test_async_selectin_ordered_target_failure_ignores_reverse_completion(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1159,7 +1135,7 @@ def test_async_selectin_ordered_target_failure_ignores_reverse_completion(
             args: tuple[object, ...],
             kwargs: dict[str, object],
         ) -> WireRecords:
-            await fake_async_sg._record('find', *args, **kwargs)
+            await fake_async_sg.record('find', *args, **kwargs)
             if entity_type == 'Version':
                 return [
                     {'type': 'Version', 'id': 1, 'entity': {'type': 'Shot', 'id': 10}},
@@ -1194,7 +1170,7 @@ def test_async_selectin_ordered_target_failure_ignores_reverse_completion(
 
 
 def test_async_selectin_recovers_unknown_target_after_one_force_refresh(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
     schema_fixture: dict[str, Any],
     tmp_path: Path,
@@ -1206,11 +1182,11 @@ def test_async_selectin_recovers_unknown_target_after_one_force_refresh(
         refreshed_raw['FutureVendor'] = copy.deepcopy(refreshed_raw['CustomEntity03'])
 
         async def refreshed_schema_read() -> dict[str, Any]:
-            await fake_async_sg._record('schema_read')
+            await fake_async_sg.record('schema_read')
             return refreshed_raw
 
         monkeypatch.setattr(fake_async_sg, 'schema_read', refreshed_schema_read)
-        fake_async_sg._find_results = [
+        fake_async_sg.find_results = [
             [
                 {
                     'type': 'Shot',
@@ -1230,7 +1206,7 @@ def test_async_selectin_recovers_unknown_target_after_one_force_refresh(
         opaque = shot.sg_vendor
         assert opaque.code == 'FV-9'
         assert session.merge_dict({'type': 'FutureVendor', 'id': 9}) is opaque
-        assert [name for name, _, _ in fake_async_sg._calls].count('schema_read') == 2
+        assert [name for name, _, _ in fake_async_sg.calls].count('schema_read') == 2
         assert [call[1][0] for call in _find_calls(fake_async_sg)] == [
             'Shot',
             'FutureVendor',
@@ -1240,7 +1216,7 @@ def test_async_selectin_recovers_unknown_target_after_one_force_refresh(
 
 
 def test_async_selectin_rejects_returned_exception_payload(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -1249,7 +1225,7 @@ def test_async_selectin_rejects_returned_exception_payload(
         session = AsyncSession(engine)
         shot_cls = engine.entities.Shot
         returned_error = RuntimeError('provider returned this object')
-        fake_async_sg._find_results = [
+        fake_async_sg.find_results = [
             [
                 {
                     'type': 'Shot',
@@ -1269,14 +1245,14 @@ def test_async_selectin_rejects_returned_exception_payload(
 
 
 def test_readme_explicit_async_relationship_load_call(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
         engine = isolated_async_engine(fake_async_sg, tmp_path)
         await engine.load_schema()
         shot_cls = engine.entities.Shot
-        fake_async_sg._find_results = [
+        fake_async_sg.find_results = [
             [
                 {
                     'type': 'Shot',

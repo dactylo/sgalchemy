@@ -7,12 +7,10 @@ from threading import Event, get_ident
 from typing import TYPE_CHECKING, Any, Never, cast
 
 import pytest
-from _fakes import _FakeAsyncShotgun, _FakeShotgun
-from _support import _preserve_signature, isolated_async_engine
 
 from sgalchemy import _errors, inspect
 from sgalchemy._core._async_engine import AsyncEngine, create_async_engine
-from sgalchemy._core._engine_common import CallProgress, EntityNamespace
+from sgalchemy._core._engine_common import AUTH_RECOVERY_NOTE, CallProgress, EntityNamespace
 from sgalchemy._core._registry import Entity, Registry, RegistryBinding, entity_state
 from sgalchemy._core._statement import select
 from sgalchemy._errors import CommitError, SgalchemyError
@@ -26,14 +24,23 @@ from sgalchemy._shotgun import (
     WireRecord,
     WireRecords,
 )
+from tests._fakes import FakeAsyncShotgun, FakeShotgun
+from tests._support import (
+    AUTHENTICATION_FAULT,
+    STAGED_RETRY_NOTE,
+    inject_faults,
+    isolated_async_engine,
+    preserve_signature,
+    run_async,
+)
 
 if TYPE_CHECKING:
     from sgalchemy._core._async_backend import NativeAsyncBackend, ThreadedSyncBackend
 
 
 async def _cold_session(
-    fake_async_sg: _FakeAsyncShotgun, tmp_path: Path
-) -> tuple[AsyncSession, AsyncEngine, _FakeAsyncShotgun]:
+    fake_async_sg: FakeAsyncShotgun, tmp_path: Path
+) -> tuple[AsyncSession, AsyncEngine, FakeAsyncShotgun]:
     registry = Registry()
     source = create_async_engine(
         connection=fake_async_sg,
@@ -57,7 +64,7 @@ def _entities(engine: AsyncEngine) -> EntityNamespace:
 
 
 def test_async_add_delete_revive_transitions_cancel_without_io(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -82,15 +89,15 @@ def test_async_add_delete_revive_transitions_cancel_without_io(
         session.revive(retired)
         session.delete(retired)
 
-        calls_before = len(fake_async_sg._calls)
+        calls_before = len(fake_async_sg.calls)
         await session.commit()
-        assert len(fake_async_sg._calls) == calls_before
+        assert len(fake_async_sg.calls) == calls_before
 
     asyncio.run(scenario())
 
 
 def test_async_ambiguous_upload_preserves_unrelated_work_and_error_snapshots(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -107,8 +114,8 @@ def test_async_ambiguous_upload_preserves_unrelated_work_and_error_snapshots(
         failed.image = failed_path
         unrelated.image = unrelated_path
         fault = RuntimeError('upload fault')
-        fake_async_sg._errors['upload_thumbnail'] = [fault]
-        fake_async_sg._find_results = [[{'type': 'Shot', 'id': 90, 'image': 'current-server'}]]
+        fake_async_sg.errors['upload_thumbnail'] = [fault]
+        fake_async_sg.find_results = [[{'type': 'Shot', 'id': 90, 'image': 'current-server'}]]
 
         with pytest.raises(CommitError) as excinfo:
             await session.commit()
@@ -127,7 +134,7 @@ def test_async_ambiguous_upload_preserves_unrelated_work_and_error_snapshots(
         assert failed.image == 'current-server'
         assert failed.code == 'failed'
         failed.description = 'still-usable'
-        fake_async_sg._find_results = [
+        fake_async_sg.find_results = [
             [{'type': 'Shot', 'id': 91, 'image': 'unrelated-server'}],
             [
                 {
@@ -154,7 +161,7 @@ def test_async_ambiguous_upload_preserves_unrelated_work_and_error_snapshots(
 
 
 def test_async_canceled_pending_reference_rejected_before_io(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -166,16 +173,41 @@ def test_async_canceled_pending_reference_rejected_before_io(
         session.add(sequence)
         session.add(shot)
         session.delete(sequence)
-        calls_before = len(fake_async_sg._calls)
+        calls_before = len(fake_async_sg.calls)
         with pytest.raises(SgalchemyError, match=r'pending relationship.*not staged'):
             await session.commit()
-        assert len(fake_async_sg._calls) == calls_before
+        assert len(fake_async_sg.calls) == calls_before
+
+    asyncio.run(scenario())
+
+
+def test_async_chunked_auth_failure_notes_match_sync(
+    fake_async_sg: FakeAsyncShotgun, tmp_path: Path
+) -> None:
+    async def scenario() -> None:
+        engine = isolated_async_engine(fake_async_sg, tmp_path)
+        await engine.load_schema()
+        session = AsyncSession(engine)
+        for index in range(4):
+            session.add(_entities(engine).Shot.new(code=f'S{index}'))
+        fault = AUTHENTICATION_FAULT('second batch authentication fault')
+        fake_async_sg.errors['batch'] = [None, fault]
+        with pytest.raises(CommitError) as excinfo:
+            await session.commit(batch_size=2)
+        assert excinfo.value.__cause__ is fault
+        assert excinfo.value.__notes__ == [
+            STAGED_RETRY_NOTE,
+            'sgalchemy: failed during batch wave 1 chunk 2 (batch_size=2)',
+            _uow._BATCH_OUTCOME_UNKNOWN_NOTE,
+            AUTH_RECOVERY_NOTE,
+        ]
+        assert fault.__notes__ == [AUTH_RECOVERY_NOTE]
 
     asyncio.run(scenario())
 
 
 def test_async_cold_commit_rejects_different_site_registry_without_schema_io(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -207,13 +239,13 @@ def test_async_cold_commit_rejects_different_site_registry_without_schema_io(
             'for a second site'
         )
 
-        assert destination_sg._calls == []
+        assert destination_sg.calls == []
 
     asyncio.run(scenario())
 
 
 def test_async_cold_local_preflight_rejects_missing_provenance_without_schema_io(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -225,13 +257,13 @@ def test_async_cold_local_preflight_rejects_missing_provenance_without_schema_io
         with pytest.raises(SgalchemyError, match='classification is missing'):
             await session.commit()
 
-        assert destination_sg._calls == []
+        assert destination_sg.calls == []
 
     asyncio.run(scenario())
 
 
 def test_async_cold_local_preflight_rejects_pending_cycle_without_schema_io(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -245,13 +277,13 @@ def test_async_cold_local_preflight_rejects_pending_cycle_without_schema_io(
         with pytest.raises(SgalchemyError, match='cycle'):
             await session.commit()
 
-        assert destination_sg._calls == []
+        assert destination_sg.calls == []
 
     asyncio.run(scenario())
 
 
 def test_async_commit_cancellation_is_never_silently_retried(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -260,7 +292,7 @@ def test_async_commit_cancellation_is_never_silently_retried(
         session = AsyncSession(engine)
         pending = _entities(engine).Shot.new(code='S')
         session.add(pending)
-        entered, _release = fake_async_sg._block('batch')
+        entered, _release = fake_async_sg.block('batch')
         task = asyncio.create_task(session.commit())
         await entered.wait()
         task.cancel()
@@ -286,13 +318,13 @@ def test_async_commit_cancellation_is_never_silently_retried(
         replacement = AsyncSession(engine)
         with pytest.raises(SgalchemyError, match='indeterminate'):
             replacement.add(pending)
-        assert [name for name, _, _ in fake_async_sg._calls].count('batch') == 1
+        assert [name for name, _, _ in fake_async_sg.calls].count('batch') == 1
 
-    asyncio.run(scenario())
+    run_async(scenario())
 
 
 def test_async_confirmed_thumbnail_clear_needs_no_recovery_read(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -312,7 +344,7 @@ def test_async_confirmed_thumbnail_clear_needs_no_recovery_read(
         state.refresh_required.update({'image', 'filmstrip_image'})
         state.unverified_writes.update({'image', 'filmstrip_image'})
         shot.image = None
-        fake_async_sg._batch_results = [[{'type': 'Shot', 'id': 51}]]
+        fake_async_sg.batch_results = [[{'type': 'Shot', 'id': 51}]]
 
         with caplog.at_level('WARNING', logger='sgalchemy.session'):
             await session.commit()
@@ -321,14 +353,14 @@ def test_async_confirmed_thumbnail_clear_needs_no_recovery_read(
         assert state.loaded['filmstrip_image'] is None
         assert state.refresh_required == set()
         assert state.unverified_writes == set()
-        assert not [call for call in fake_async_sg._calls if call[0] == 'find']
+        assert not [call for call in fake_async_sg.calls if call[0] == 'find']
         assert 'provider-response contract' in caplog.text
 
     asyncio.run(scenario())
 
 
 def test_async_confirmed_upload_readback_failure_does_not_block_final_retirement(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -340,13 +372,13 @@ def test_async_confirmed_upload_readback_failure_does_not_block_final_retirement
         path.write_bytes(b'image')
         shot.image = path
         session.delete(shot)
-        fake_async_sg._find_error = RuntimeError('readback fault')
+        fake_async_sg.find_error = RuntimeError('readback fault')
 
         await session.commit()
 
         commit_calls = [
             call
-            for call in fake_async_sg._calls
+            for call in fake_async_sg.calls
             if call[0] in {'upload_thumbnail', 'find', 'batch'}
         ]
         assert [call[0] for call in commit_calls] == ['upload_thumbnail', 'find', 'batch']
@@ -361,7 +393,7 @@ def test_async_confirmed_upload_readback_failure_does_not_block_final_retirement
     ids=['constructed', 'disposed'],
 )
 def test_async_creator_cancellation_before_submission_keeps_commit_retriable(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
     *,
     dispose_before_commit: bool,
@@ -375,7 +407,7 @@ def test_async_creator_cancellation_before_submission_keeps_commit_retriable(
             bind_default=False,
         )
         await source.load_schema()
-        created: list[_FakeAsyncShotgun] = []
+        created: list[FakeAsyncShotgun] = []
         creator_started = asyncio.Event()
         release_creator = asyncio.Event()
 
@@ -384,7 +416,7 @@ def test_async_creator_cancellation_before_submission_keeps_commit_retriable(
             await release_creator.wait()
             client = type(fake_async_sg)()
             created.append(client)
-            return cast('AsyncClosableShotgunLike', client)
+            return client
 
         engine = create_async_engine(
             fake_async_sg.base_url,
@@ -413,21 +445,21 @@ def test_async_creator_cancellation_before_submission_keeps_commit_retriable(
                 'indeterminate' not in note for note in getattr(excinfo.value, '__notes__', ())
             )
             assert not entity_state(pending).indeterminate
-            assert session.unit_of_work.new == (pending,)
+            assert session.unit_of_work.new == [pending]
             release_creator.set()
             await session.commit()
             assert pending.id is not None
             assert len(created) == 1
-            assert [name for name, _, _ in created[0]._calls].count('batch') == 1
+            assert [name for name, _, _ in created[0].calls].count('batch') == 1
         finally:
             release_creator.set()
             await engine.dispose()
 
-    asyncio.run(scenario())
+    run_async(scenario())
 
 
 def test_async_dependent_creates_and_persistent_links(
-    fake_async_sg: _FakeAsyncShotgun, tmp_path: Path
+    fake_async_sg: FakeAsyncShotgun, tmp_path: Path
 ) -> None:
     async def scenario() -> None:
         engine = isolated_async_engine(fake_async_sg, tmp_path)
@@ -439,7 +471,7 @@ def test_async_dependent_creates_and_persistent_links(
         session.add(sequence)
         session.add(shot)
         await session.commit()
-        batches = [call for call in fake_async_sg._calls if call[0] == 'batch']
+        batches = [call for call in fake_async_sg.calls if call[0] == 'batch']
         assert len(batches) == 2
         shot_data = batches[1][1][0][0]['data']
         assert shot_data['project'] == {'type': 'Project', 'id': 70}
@@ -448,43 +480,8 @@ def test_async_dependent_creates_and_persistent_links(
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize('transition', ['delete', 'revive'])
-def test_async_detached_dirty_transition_commits_in_lifecycle_order(
-    fake_async_sg: _FakeAsyncShotgun,
-    tmp_path: Path,
-    transition: str,
-) -> None:
-    async def scenario() -> None:
-        engine = isolated_async_engine(fake_async_sg, tmp_path)
-        await engine.load_schema()
-        source = AsyncSession(engine)
-        obj = source.merge_dict({'type': 'Shot', 'id': 71, 'description': 'before'})
-        await source.close()
-        obj.description = 'after'
-        entity_state(obj).deleted = transition == 'revive'
-        session = AsyncSession(engine)
-        getattr(session, transition)(obj)
-        calls_before = len(fake_async_sg._calls)
-
-        await session.commit()
-
-        commit_calls = fake_async_sg._calls[calls_before:]
-        if transition == 'delete':
-            assert [name for name, _, _ in commit_calls] == ['batch']
-            assert [request['request_type'] for request in commit_calls[0][1][0]] == [
-                'update',
-                'delete',
-            ]
-        else:
-            assert [name for name, _, _ in commit_calls] == ['revive', 'batch']
-            assert [request['request_type'] for request in commit_calls[1][1][0]] == ['update']
-        assert entity_state(obj).dirty == {}
-
-    asyncio.run(scenario())
-
-
 def test_async_dirty_delete_with_upload_defers_only_retirement(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -497,12 +494,12 @@ def test_async_dirty_delete_with_upload_defers_only_retirement(
         shot.description = 'after'
         shot.image = image_path
         session.delete(shot)
-        fake_async_sg._find_results = [[{'type': 'Shot', 'id': 73, 'image': 'server-image'}]]
-        calls_before = len(fake_async_sg._calls)
+        fake_async_sg.find_results = [[{'type': 'Shot', 'id': 73, 'image': 'server-image'}]]
+        calls_before = len(fake_async_sg.calls)
 
         await session.commit()
 
-        commit_calls = fake_async_sg._calls[calls_before:]
+        commit_calls = fake_async_sg.calls[calls_before:]
         assert [name for name, _, _ in commit_calls] == [
             'batch',
             'upload_thumbnail',
@@ -517,7 +514,7 @@ def test_async_dirty_delete_with_upload_defers_only_retirement(
 
 
 def test_async_dirty_retired_object_never_loads_schema_for_recovery(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -535,16 +532,16 @@ def test_async_dirty_retired_object_never_loads_schema_for_recovery(
             raise AssertionError('dirty retired state must not load schema')
 
         monkeypatch.setattr(engine, 'load_binding', unexpected_load)
-        calls_before = len(fake_async_sg._calls)
+        calls_before = len(fake_async_sg.calls)
         with pytest.raises(_errors.RetiredEntityWriteError, match=r'revive\(obj\).*rollback'):
             await session.commit()
-        assert len(fake_async_sg._calls) == calls_before
+        assert len(fake_async_sg.calls) == calls_before
 
     asyncio.run(scenario())
 
 
 def test_async_failed_upload_current_value_is_loaded_but_unverified(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -556,8 +553,8 @@ def test_async_failed_upload_current_value_is_loaded_but_unverified(
         image_path.write_bytes(b'image')
         shot.image = image_path
         fault = RuntimeError('upload fault')
-        fake_async_sg._errors['upload_thumbnail'] = [fault]
-        fake_async_sg._find_results = [[{'type': 'Shot', 'id': 89, 'image': 'current-server'}]]
+        fake_async_sg.errors['upload_thumbnail'] = [fault]
+        fake_async_sg.find_results = [[{'type': 'Shot', 'id': 89, 'image': 'current-server'}]]
 
         with pytest.raises(CommitError) as excinfo:
             await session.commit()
@@ -571,13 +568,13 @@ def test_async_failed_upload_current_value_is_loaded_but_unverified(
         assert state.loaded['image'] == 'current-server'
         assert state.refresh_required == set()
         assert state.unverified_writes == {'image'}
-        assert [name for name, _, _ in fake_async_sg._calls].count('find') == 1
+        assert [name for name, _, _ in fake_async_sg.calls].count('find') == 1
 
     asyncio.run(scenario())
 
 
 def test_async_failed_upload_explicit_reassignment_submits_one_new_upload(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -590,24 +587,24 @@ def test_async_failed_upload_explicit_reassignment_submits_one_new_upload(
         first_path.write_bytes(b'image')
         retry_path.write_bytes(b'image')
         shot.image = first_path
-        fake_async_sg._errors['upload_thumbnail'] = [RuntimeError('upload fault')]
+        fake_async_sg.errors['upload_thumbnail'] = [RuntimeError('upload fault')]
 
         with pytest.raises(CommitError):
             await session.commit()
         shot.image = retry_path
-        fake_async_sg._find_results = [[{'type': 'Shot', 'id': 93, 'image': 'retry-server'}]]
+        fake_async_sg.find_results = [[{'type': 'Shot', 'id': 93, 'image': 'retry-server'}]]
 
         await session.commit()
         await session.commit()
 
         assert shot.image == 'retry-server'
-        assert [name for name, _, _ in fake_async_sg._calls].count('upload_thumbnail') == 2
+        assert [name for name, _, _ in fake_async_sg.calls].count('upload_thumbnail') == 2
 
     asyncio.run(scenario())
 
 
 def test_async_failed_upload_is_never_resent_by_plain_commit(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -618,22 +615,22 @@ def test_async_failed_upload_is_never_resent_by_plain_commit(
         path = tmp_path / 'async-never-resend.jpg'
         path.write_bytes(b'image')
         shot.image = path
-        fake_async_sg._errors['upload_thumbnail'] = [RuntimeError('upload fault')]
+        fake_async_sg.errors['upload_thumbnail'] = [RuntimeError('upload fault')]
 
         with pytest.raises(CommitError):
             await session.commit()
-        calls_before = len(fake_async_sg._calls)
+        calls_before = len(fake_async_sg.calls)
 
         await session.commit()
 
-        assert len(fake_async_sg._calls) == calls_before
-        assert [name for name, _, _ in fake_async_sg._calls].count('upload_thumbnail') == 1
+        assert len(fake_async_sg.calls) == calls_before
+        assert [name for name, _, _ in fake_async_sg.calls].count('upload_thumbnail') == 1
 
     asyncio.run(scenario())
 
 
 def test_async_failed_upload_readback_preserves_callback_reassignment(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -648,7 +645,7 @@ def test_async_failed_upload_readback_preserves_callback_reassignment(
         reassigned_path.write_bytes(b'image')
         shot.image = failed_path
         fault = RuntimeError('upload fault')
-        fake_async_sg._errors['upload_thumbnail'] = [fault]
+        fake_async_sg.errors['upload_thumbnail'] = [fault]
 
         async def find_with_reassignment(
             entity_type: str,
@@ -656,7 +653,7 @@ def test_async_failed_upload_readback_preserves_callback_reassignment(
             fields: list[str] | None = None,
             **kwargs: object,
         ) -> WireRecords:
-            await fake_async_sg._record('find', entity_type, filters, fields, **kwargs)
+            await fake_async_sg.record('find', entity_type, filters, fields, **kwargs)
             shot.image = reassigned_path
             return [{'type': 'Shot', 'id': 96, 'image': 'current-server'}]
 
@@ -675,7 +672,7 @@ def test_async_failed_upload_readback_preserves_callback_reassignment(
 
 
 def test_async_failed_upload_withdraws_unsubmitted_same_owner_retirement(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     image_path = str(tmp_path / 'async-retiring-ambiguous.jpg')
@@ -688,9 +685,10 @@ def test_async_failed_upload_withdraws_unsubmitted_same_owner_retirement(
         source = AsyncSession(engine)
         shot = source.merge_dict({'type': 'Shot', 'id': 77, 'code': 'retiring'})
         await source.close()
+        session.add(shot)
         shot.image = image_path
         session.delete(shot)
-        fake_async_sg._errors['upload_thumbnail'] = [RuntimeError('upload fault')]
+        fake_async_sg.errors['upload_thumbnail'] = [RuntimeError('upload fault')]
 
         with pytest.raises(CommitError) as excinfo:
             await session.commit()
@@ -699,24 +697,24 @@ def test_async_failed_upload_withdraws_unsubmitted_same_owner_retirement(
         assert error.indeterminate == [(shot, 'image', image_path)]
         assert len(error.withdrawn) == 1
         assert getattr(error.withdrawn[0], 'request_type', None) == 'delete'
-        calls_before = len(fake_async_sg._calls)
+        calls_before = len(fake_async_sg.calls)
         await session.commit()
-        assert len(fake_async_sg._calls) == calls_before
+        assert len(fake_async_sg.calls) == calls_before
         retry_path = tmp_path / 'async-explicit-retry.jpg'
         retry_path.write_bytes(b'image')
         shot.image = retry_path
         await session.commit()
-        assert [name for name, _, _ in fake_async_sg._calls].count('upload_thumbnail') == 2
+        assert [name for name, _, _ in fake_async_sg.calls].count('upload_thumbnail') == 2
         session.delete(shot)
         await session.commit()
-        assert fake_async_sg._calls[-1][0] == 'batch'
-        assert fake_async_sg._calls[-1][1][0][0]['request_type'] == 'delete'
+        assert fake_async_sg.calls[-1][0] == 'batch'
+        assert fake_async_sg.calls[-1][1][0][0]['request_type'] == 'delete'
 
     asyncio.run(scenario())
 
 
 def test_async_false_revive_and_delete_results_are_successful_desired_states(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -726,12 +724,12 @@ def test_async_false_revive_and_delete_results_are_successful_desired_states(
         session = AsyncSession(engine)
         shot = session.merge_dict({'type': 'Shot', 'id': 75, 'code': 'active'})
         session.delete(shot)
-        fake_async_sg._batch_results = [[False]]
+        fake_async_sg.batch_results = [[False]]
         await session.commit()
         assert entity_state(shot).deleted
 
         async def already_active(entity_type: str, entity_id: int) -> bool:
-            await fake_async_sg._record('revive', entity_type, entity_id)
+            await fake_async_sg.record('revive', entity_type, entity_id)
             return False
 
         monkeypatch.setattr(fake_async_sg, 'revive', already_active)
@@ -743,7 +741,7 @@ def test_async_false_revive_and_delete_results_are_successful_desired_states(
 
 
 def test_async_indivisible_dirty_delete_rejects_too_small_batch_before_io(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -753,18 +751,18 @@ def test_async_indivisible_dirty_delete_rejects_too_small_batch_before_io(
         shot = session.merge_dict({'type': 'Shot', 'id': 74, 'description': 'before'})
         shot.description = 'after'
         session.delete(shot)
-        calls_before = len(fake_async_sg._calls)
+        calls_before = len(fake_async_sg.calls)
 
         with pytest.raises(ValueError, match=r'batch_size.*minimum.*2'):
             await session.commit(batch_size=1)
 
-        assert len(fake_async_sg._calls) == calls_before
+        assert len(fake_async_sg.calls) == calls_before
 
     asyncio.run(scenario())
 
 
 def test_async_invalid_and_noop_transitions_leave_detached_entities_reusable(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -795,7 +793,7 @@ def test_async_invalid_and_noop_transitions_leave_detached_entities_reusable(
 
 
 def test_async_later_upload_failure_reads_prior_confirmed_upload_once(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -810,8 +808,8 @@ def test_async_later_upload_failure_reads_prior_confirmed_upload_once(
         shot.image = image_path
         shot.filmstrip_image = filmstrip_path
         fault = RuntimeError('filmstrip upload fault')
-        fake_async_sg._errors['upload_filmstrip_thumbnail'] = [fault]
-        fake_async_sg._find_results = [
+        fake_async_sg.errors['upload_filmstrip_thumbnail'] = [fault]
+        fake_async_sg.find_results = [
             [
                 {
                     'type': 'Shot',
@@ -838,7 +836,7 @@ def test_async_later_upload_failure_reads_prior_confirmed_upload_once(
         assert state.loaded['filmstrip_image'] == 'current-server'
         assert state.refresh_required == set()
         assert state.unverified_writes == {'filmstrip_image'}
-        find_calls = [call for call in fake_async_sg._calls if call[0] == 'find']
+        find_calls = [call for call in fake_async_sg.calls if call[0] == 'find']
         assert len(find_calls) == 1
         assert find_calls[0][1][:3] == (
             'Shot',
@@ -850,7 +848,7 @@ def test_async_later_upload_failure_reads_prior_confirmed_upload_once(
 
 
 def test_async_later_upload_failure_reconciles_pending_readbacks_across_types(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -866,8 +864,8 @@ def test_async_later_upload_failure_reconciles_pending_readbacks_across_types(
         shot.filmstrip_image = filmstrip_path
         asset.image = image_path
         fault = RuntimeError('later cross-type upload fault')
-        fake_async_sg._errors['upload_thumbnail'] = [fault]
-        fake_async_sg._find_results = [
+        fake_async_sg.errors['upload_thumbnail'] = [fault]
+        fake_async_sg.find_results = [
             [{'type': 'Shot', 'id': 88, 'filmstrip_image': 'shot-server'}],
             [{'type': 'Asset', 'id': 89, 'image': 'asset-server'}],
         ]
@@ -882,7 +880,7 @@ def test_async_later_upload_failure_reconciles_pending_readbacks_across_types(
         ]
         assert all(isinstance(item, tuple) for item in error.indeterminate)
         assert [item[1] for item in error.indeterminate if isinstance(item, tuple)] == ['image']
-        find_calls = [call for call in fake_async_sg._calls if call[0] == 'find']
+        find_calls = [call for call in fake_async_sg.calls if call[0] == 'find']
         assert [call[1][0] for call in find_calls] == ['Shot', 'Asset']
         assert shot.filmstrip_image == 'shot-server'
         assert asset.image == 'asset-server'
@@ -902,7 +900,7 @@ def test_async_later_upload_failure_reconciles_pending_readbacks_across_types(
     ],
 )
 def test_async_malformed_successful_batch_is_not_automatically_retried(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
     case: tuple[int, int | None, list[BatchItem], int],
 ) -> None:
@@ -915,7 +913,7 @@ def test_async_malformed_successful_batch_is_not_automatically_retried(
         pending = [_entities(engine).Shot.new(code=f'S{index}') for index in range(entity_count)]
         for obj in pending:
             session.add(obj)
-        fake_async_sg._batch_results = [results]
+        fake_async_sg.batch_results = [results]
         with pytest.raises(CommitError) as excinfo:
             await session.commit(batch_size=batch_size)
         assert excinfo.value.committed == []
@@ -928,12 +926,12 @@ def test_async_malformed_successful_batch_is_not_automatically_retried(
         assert len(excinfo.value.indeterminate) == submitted_count
         assert len(excinfo.value.staged) == expected_staged
         assert all(entity_state(obj).id is None for obj in pending[:submitted_count])
-        assert not any(name == 'find' for name, _, _ in fake_async_sg._calls)
+        assert not any(name == 'find' for name, _, _ in fake_async_sg.calls)
         with pytest.raises(SgalchemyError, match='indeterminate'):
             _ = pending[0].code
-        batches_before = [call for call in fake_async_sg._calls if call[0] == 'batch']
+        batches_before = [call for call in fake_async_sg.calls if call[0] == 'batch']
         await session.commit(batch_size=batch_size)
-        batches_after = [call for call in fake_async_sg._calls if call[0] == 'batch']
+        batches_after = [call for call in fake_async_sg.calls if call[0] == 'batch']
         assert len(batches_after) == len(batches_before) + expected_staged
         if expected_staged:
             assert pending[-1].id is not None
@@ -944,7 +942,7 @@ def test_async_malformed_successful_batch_is_not_automatically_retried(
 
 
 def test_async_malformed_update_withdraws_followups_and_retries_only_unrelated(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     image_path = str(tmp_path / 'async-update-delete-ambiguous.jpg')
@@ -957,12 +955,13 @@ def test_async_malformed_update_withdraws_followups_and_retries_only_unrelated(
         source = AsyncSession(engine)
         affected = source.merge_dict({'type': 'Shot', 'id': 76, 'description': 'before'})
         await source.close()
+        session.add(affected)
         affected.description = 'after'
         affected.image = image_path
         session.delete(affected)
         independent = _entities(engine).Shot.new(code='async-independent')
         session.add(independent)
-        fake_async_sg._batch_results = [[]]
+        fake_async_sg.batch_results = [[]]
 
         with pytest.raises(CommitError) as excinfo:
             await session.commit(batch_size=1)
@@ -974,11 +973,11 @@ def test_async_malformed_update_withdraws_followups_and_retries_only_unrelated(
         assert getattr(error.withdrawn[1], 'request_type', None) == 'delete'
         assert len(error.staged) == 1
         assert getattr(error.staged[0], 'obj', None) is independent
-        calls_before = len(fake_async_sg._calls)
+        calls_before = len(fake_async_sg.calls)
 
         await session.commit(batch_size=1)
 
-        retry_calls = fake_async_sg._calls[calls_before:]
+        retry_calls = fake_async_sg.calls[calls_before:]
         assert [name for name, _, _ in retry_calls] == ['batch']
         assert independent.id is not None
         await session.close()
@@ -988,7 +987,7 @@ def test_async_malformed_update_withdraws_followups_and_retries_only_unrelated(
 
 
 def test_async_merge_delete_commit_prepares_schema_automatically(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -1000,7 +999,7 @@ def test_async_merge_delete_commit_prepares_schema_automatically(
         await session.commit()
 
         assert entity_state(shot).deleted
-        names = [name for name, _args, _kwargs in fake_async_sg._calls]
+        names = [name for name, _args, _kwargs in fake_async_sg.calls]
         assert names.count('schema_read') == 1
         assert names.count('batch') == 1
 
@@ -1008,7 +1007,7 @@ def test_async_merge_delete_commit_prepares_schema_automatically(
 
 
 def test_async_missing_write_provenance_never_loads_schema_for_recovery(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1033,14 +1032,14 @@ def test_async_missing_write_provenance_never_loads_schema_for_recovery(
         ):
             await session.commit()
 
-        assert [name for name, _, _ in fake_async_sg._calls].count('schema_read') == 1
-        assert [name for name, _, _ in fake_async_sg._calls].count('batch') == 0
+        assert [name for name, _, _ in fake_async_sg.calls].count('schema_read') == 1
+        assert [name for name, _, _ in fake_async_sg.calls].count('batch') == 0
 
     asyncio.run(scenario())
 
 
 def test_async_multistep_failure_partitions_match_sync(
-    fake_async_sg: _FakeAsyncShotgun, tmp_path: Path
+    fake_async_sg: FakeAsyncShotgun, tmp_path: Path
 ) -> None:
     async def scenario() -> None:
         engine = isolated_async_engine(fake_async_sg, tmp_path)
@@ -1048,7 +1047,7 @@ def test_async_multistep_failure_partitions_match_sync(
         session = AsyncSession(engine)
         for index in range(4):
             session.add(_entities(engine).Shot.new(code=f'S{index}'))
-        fake_async_sg._fail_on_batch_index = 1
+        fake_async_sg.fail_on_batch_index = 1
         with pytest.raises(CommitError) as excinfo:
             await session.commit(batch_size=2)
         assert len(excinfo.value.committed) == 2
@@ -1067,7 +1066,7 @@ def test_async_multistep_failure_partitions_match_sync(
     ],
 )
 def test_async_nested_foreign_registry_entities_rejected_before_io(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
     container: str,
     persistent: bool,
@@ -1104,16 +1103,16 @@ def test_async_nested_foreign_registry_entities_rejected_before_io(
             )
             local = _entities(engine).Asset.new(code='local', shots=[foreign])
         session.add(local)
-        calls_before = len(fake_async_sg._calls)
+        calls_before = len(fake_async_sg.calls)
         with pytest.raises(SgalchemyError, match='different registry'):
             await session.commit()
-        assert len(fake_async_sg._calls) == calls_before
+        assert len(fake_async_sg.calls) == calls_before
 
     asyncio.run(scenario())
 
 
 def test_async_out_of_band_interruption_quarantines_submitted_write(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -1122,7 +1121,7 @@ def test_async_out_of_band_interruption_quarantines_submitted_write(
         session = AsyncSession(engine)
         pending = _entities(engine).Shot.new(code='S')
         session.add(pending)
-        fake_async_sg._errors['batch'] = [SystemExit('out-of-band interruption')]
+        fake_async_sg.errors['batch'] = [SystemExit('out-of-band interruption')]
         with pytest.raises(SystemExit) as excinfo:
             await session.commit()
         assert any('indeterminate' in note for note in excinfo.value.__notes__)
@@ -1134,13 +1133,13 @@ def test_async_out_of_band_interruption_quarantines_submitted_write(
         replacement = AsyncSession(engine)
         with pytest.raises(SgalchemyError, match='indeterminate'):
             replacement.add(pending)
-        assert [name for name, _, _ in fake_async_sg._calls].count('batch') == 1
+        assert [name for name, _, _ in fake_async_sg.calls].count('batch') == 1
 
     asyncio.run(scenario())
 
 
 def test_async_pending_attachment_is_single_session_and_add_is_idempotent(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -1157,14 +1156,14 @@ def test_async_pending_attachment_is_single_session_and_add_is_idempotent(
         with pytest.raises(SgalchemyError, match='another open session'):
             other.delete(persistent)
         await session.commit()
-        requests = next(call for call in fake_async_sg._calls if call[0] == 'batch')[1][0]
+        requests = next(call for call in fake_async_sg.calls if call[0] == 'batch')[1][0]
         assert [request['request_type'] for request in requests] == ['create']
 
     asyncio.run(scenario())
 
 
 def test_async_provider_commit_error_retires_attempted_upload_without_rewriting_error(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -1189,7 +1188,7 @@ def test_async_provider_commit_error_retires_attempted_upload_without_rewriting_
             withdrawn=partitions[3],
         )
         fault.__cause__ = cause
-        fake_async_sg._errors['upload_thumbnail'] = [fault]
+        fake_async_sg.errors['upload_thumbnail'] = [fault]
 
         with pytest.raises(CommitError) as excinfo:
             await session.commit()
@@ -1201,19 +1200,19 @@ def test_async_provider_commit_error_retires_attempted_upload_without_rewriting_
         assert excinfo.value.indeterminate is partitions[2]
         assert excinfo.value.withdrawn is partitions[3]
         assert entity_state(shot).dirty == {}
-        assert session.unit_of_work.deleted == ()
-        calls_before = len(fake_async_sg._calls)
+        assert session.unit_of_work.deleted == []
+        calls_before = len(fake_async_sg.calls)
 
         await session.commit()
 
-        assert len(fake_async_sg._calls) == calls_before
-        assert [name for name, _, _ in fake_async_sg._calls].count('upload_thumbnail') == 1
+        assert len(fake_async_sg.calls) == calls_before
+        assert [name for name, _, _ in fake_async_sg.calls].count('upload_thumbnail') == 1
 
     asyncio.run(scenario())
 
 
 def test_async_quarantine_rejects_state_access_and_close_cleans_state(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -1224,14 +1223,14 @@ def test_async_quarantine_rejects_state_access_and_close_cleans_state(
         unsubmitted = _entities(engine).Shot.new(code='unsubmitted')
         session.add(ambiguous)
         session.add(unsubmitted)
-        fake_async_sg._errors['batch'] = [SystemExit('out-of-band interruption')]
+        fake_async_sg.errors['batch'] = [SystemExit('out-of-band interruption')]
 
         with pytest.raises(SystemExit):
             await session.commit(batch_size=1)
 
         assert session.engine is engine
         with pytest.raises(SgalchemyError, match='indeterminate'):
-            session._identity_values()
+            session.identity_values()
         with pytest.raises(SgalchemyError, match='indeterminate'):
             _ = session.unit_of_work
         with pytest.raises(SgalchemyError, match='indeterminate'):
@@ -1249,7 +1248,7 @@ def test_async_quarantine_rejects_state_access_and_close_cleans_state(
         assert ambiguous_state.access_guard is None
         assert unsubmitted_state.access_guard is None
         with pytest.raises(SgalchemyError, match='new AsyncSession'):
-            session._identity_values()
+            session.identity_values()
         replacement = AsyncSession(engine)
         with pytest.raises(SgalchemyError, match='indeterminate'):
             replacement.add(ambiguous)
@@ -1259,8 +1258,44 @@ def test_async_quarantine_rejects_state_access_and_close_cleans_state(
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize('transition', ['delete', 'revive'])
+def test_async_readded_dirty_transition_commits_in_lifecycle_order(
+    fake_async_sg: FakeAsyncShotgun,
+    tmp_path: Path,
+    transition: str,
+) -> None:
+    async def scenario() -> None:
+        engine = isolated_async_engine(fake_async_sg, tmp_path)
+        await engine.load_schema()
+        source = AsyncSession(engine)
+        obj = source.merge_dict({'type': 'Shot', 'id': 71, 'description': 'before'})
+        await source.close()
+        entity_state(obj).deleted = transition == 'revive'
+        session = AsyncSession(engine)
+        session.add(obj)
+        obj.description = 'after'
+        getattr(session, transition)(obj)
+        calls_before = len(fake_async_sg.calls)
+
+        await session.commit()
+
+        commit_calls = fake_async_sg.calls[calls_before:]
+        if transition == 'delete':
+            assert [name for name, _, _ in commit_calls] == ['batch']
+            assert [request['request_type'] for request in commit_calls[0][1][0]] == [
+                'update',
+                'delete',
+            ]
+        else:
+            assert [name for name, _, _ in commit_calls] == ['revive', 'batch']
+            assert [request['request_type'] for request in commit_calls[1][1][0]] == ['update']
+        assert entity_state(obj).dirty == {}
+
+    asyncio.run(scenario())
+
+
 def test_async_recovery_base_exception_propagates_without_resend(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     class RecoveryAbort(BaseException):
@@ -1272,9 +1307,9 @@ def test_async_recovery_base_exception_propagates_without_resend(
         session = AsyncSession(engine)
         shot = session.merge_dict({'type': 'Shot', 'id': 23, 'description': 'old'})
         shot.description = 'new'
-        fake_async_sg._batch_results = [[{'type': 'Shot', 'id': 23}]]
+        fake_async_sg.batch_results = [[{'type': 'Shot', 'id': 23}]]
         fault = RecoveryAbort()
-        fake_async_sg._find_error = fault
+        fake_async_sg.find_error = fault
 
         with pytest.raises(RecoveryAbort) as excinfo:
             await session.commit()
@@ -1285,17 +1320,17 @@ def test_async_recovery_base_exception_propagates_without_resend(
         assert state.clean == {}
         assert state.dirty_types == {}
         assert state.refresh_required == {'description'}
-        calls_before = len(fake_async_sg._calls)
+        calls_before = len(fake_async_sg.calls)
 
         await session.commit()
 
-        assert len(fake_async_sg._calls) == calls_before
+        assert len(fake_async_sg.calls) == calls_before
 
     asyncio.run(scenario())
 
 
 def test_async_recovery_failure_logs_and_continues_later_steps(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -1307,7 +1342,7 @@ def test_async_recovery_failure_logs_and_continues_later_steps(
         dependent = _entities(engine).Shot.new(code='dependent', sg_sequence=sequence)
         session.add(sequence)
         session.add(dependent)
-        fake_async_sg._batch_results = [
+        fake_async_sg.batch_results = [
             [{'type': 'Sequence', 'id': 9501}],
             [
                 {
@@ -1318,7 +1353,7 @@ def test_async_recovery_failure_logs_and_continues_later_steps(
                 }
             ],
         ]
-        fake_async_sg._find_error = RuntimeError('synthetic async recovery failure')
+        fake_async_sg.find_error = RuntimeError('synthetic async recovery failure')
 
         with caplog.at_level('WARNING', logger='sgalchemy.session'):
             await session.commit()
@@ -1329,15 +1364,15 @@ def test_async_recovery_failure_logs_and_continues_later_steps(
         assert sequence_state.dirty_types == {}
         assert sequence_state.refresh_required == {'code'}
         assert dependent.code == 'normalized-dependent'
-        assert len([call for call in fake_async_sg._calls if call[0] == 'find']) == 1
+        assert len([call for call in fake_async_sg.calls if call[0] == 'find']) == 1
         errors = [record for record in caplog.records if record.levelname == 'ERROR']
         assert len(errors) == 1
         assert errors[0].exc_info is not None
-        calls_before = len(fake_async_sg._calls)
+        calls_before = len(fake_async_sg.calls)
 
         await session.commit()
 
-        assert len(fake_async_sg._calls) == calls_before
+        assert len(fake_async_sg.calls) == calls_before
 
     asyncio.run(scenario())
 
@@ -1345,7 +1380,7 @@ def test_async_recovery_failure_logs_and_continues_later_steps(
 @pytest.mark.parametrize('recovery', ['close', 'rollback'])
 @pytest.mark.parametrize('before', ['refresh', 'unverified'])
 def test_async_recovery_restores_field_provenance(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
     recovery: str,
     before: str,
@@ -1382,13 +1417,13 @@ def test_async_recovery_restores_field_provenance(
 
 
 def test_async_retired_query_refresh_and_dirty_revival_commit(
-    fake_async_sg: _FakeAsyncShotgun, tmp_path: Path
+    fake_async_sg: FakeAsyncShotgun, tmp_path: Path
 ) -> None:
     async def scenario() -> None:
         engine = isolated_async_engine(fake_async_sg, tmp_path)
         await engine.load_schema()
         session = AsyncSession(engine)
-        fake_async_sg._find_results = [
+        fake_async_sg.find_results = [
             [{'type': 'Shot', 'id': 41, 'description': 'retired'}],
             [{'type': 'Shot', 'id': 41, 'description': 'refreshed'}],
             [{'type': 'Shot', 'id': 41, 'description': 'query-after-revive'}],
@@ -1399,26 +1434,26 @@ def test_async_retired_query_refresh_and_dirty_revival_commit(
             )
         )[0]
         await session.refresh(shot)
-        assert [call for call in fake_async_sg._calls if call[0] == 'find'][-1][2][
+        assert [call for call in fake_async_sg.calls if call[0] == 'find'][-1][2][
             'retired_only'
         ] is True
         assert shot.description == 'refreshed'
         shot.description = 'local'
-        calls_before = len(fake_async_sg._calls)
+        calls_before = len(fake_async_sg.calls)
         with pytest.raises(_errors.RetiredEntityWriteError, match=r'revive\(obj\)'):
             await session.commit()
-        assert len(fake_async_sg._calls) == calls_before
+        assert len(fake_async_sg.calls) == calls_before
         assert entity_state(shot).dirty == {'description': 'local'}
         session.revive(shot)
         assert (await session.scalars(select(engine.entities.Shot)))[0] is shot
         assert entity_state(shot).deleted is True
         assert session.unit_of_work.revived[0] is shot
-        calls_before = len(fake_async_sg._calls)
+        calls_before = len(fake_async_sg.calls)
 
         await session.commit()
 
-        assert [call[0] for call in fake_async_sg._calls[calls_before:]] == ['revive', 'batch']
-        assert fake_async_sg._calls[-1][1][0] == [
+        assert [call[0] for call in fake_async_sg.calls[calls_before:]] == ['revive', 'batch']
+        assert fake_async_sg.calls[-1][1][0] == [
             {
                 'request_type': 'update',
                 'entity_type': 'Shot',
@@ -1428,15 +1463,15 @@ def test_async_retired_query_refresh_and_dirty_revival_commit(
         ]
         assert entity_state(shot).deleted is False
         assert entity_state(shot).dirty == {}
-        assert session.unit_of_work.revived == ()
+        assert session.unit_of_work.revived == []
         await session.commit()
-        assert [call[0] for call in fake_async_sg._calls[calls_before:]] == ['revive', 'batch']
+        assert [call[0] for call in fake_async_sg.calls[calls_before:]] == ['revive', 'batch']
 
     asyncio.run(scenario())
 
 
 def test_async_revive_failure_remains_staged_without_indeterminate_state(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -1449,7 +1484,7 @@ def test_async_revive_failure_remains_staged_without_indeterminate_state(
         pending = _entities(engine).Shot.new(code='after-revive')
         session.add(pending)
         fault = RuntimeError('revive fault')
-        fake_async_sg._errors['revive'] = [fault]
+        fake_async_sg.errors['revive'] = [fault]
         with pytest.raises(CommitError) as excinfo:
             await session.commit()
         assert excinfo.value.__cause__ is fault
@@ -1468,7 +1503,7 @@ def test_async_revive_failure_remains_staged_without_indeterminate_state(
 
 
 def test_async_revive_reconciliation_failure_is_normalized(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1495,13 +1530,13 @@ def test_async_revive_reconciliation_failure_is_normalized(
         assert error.staged == [shot]
         assert error.indeterminate == []
         assert error.withdrawn == []
-        assert [name for name, _, _ in fake_async_sg._calls].count('revive') == 1
+        assert [name for name, _, _ in fake_async_sg.calls].count('revive') == 1
 
     asyncio.run(scenario())
 
 
 def test_async_schema_recovery_never_refreshes_after_first_submitted_write(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
     schema_fixture: dict[str, Any],
     tmp_path: Path,
@@ -1527,7 +1562,7 @@ def test_async_schema_recovery_never_refreshes_after_first_submitted_write(
             return original_prepared_binding()
 
         monkeypatch.setattr(engine, 'prepared_binding', tracking_prepared_binding)
-        batch_entered, release_batch = fake_async_sg._block('batch')
+        batch_entered, release_batch = fake_async_sg.block('batch')
         original_batch = fake_async_sg.batch
 
         async def batch_with_description(requests: WireRecords) -> list[BatchItem]:
@@ -1561,13 +1596,44 @@ def test_async_schema_recovery_never_refreshes_after_first_submitted_write(
         assert shot.description == '2026-07-25'
         refreshed = session.merge_dict({'type': 'Shot', 'id': 2, 'description': '2026-07-25'})
         assert refreshed.description == datetime.date(2026, 7, 25)
-        assert [name for name, _, _ in fake_async_sg._calls].count('schema_read') == 1
+        assert [name for name, _, _ in fake_async_sg.calls].count('schema_read') == 1
+
+    run_async(scenario())
+
+
+def test_async_sole_batch_failure_before_provider_call_reports_unsent(
+    fake_async_sg: FakeAsyncShotgun,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        engine = isolated_async_engine(fake_async_sg, tmp_path)
+        await engine.load_schema()
+        session = AsyncSession(engine)
+        pending = _entities(engine).Shot.new(code='unsent')
+        session.add(pending)
+        fault = RuntimeError('serialize')
+
+        def fail_serialization(*_args: object) -> Never:
+            raise fault
+
+        monkeypatch.setattr(_async_session, 'serialize_chunk', fail_serialization)
+        with pytest.raises(RuntimeError) as excinfo:
+            await session.commit()
+        assert excinfo.value is fault
+        assert fault.__notes__ == [
+            _uow.SOLE_BATCH_STAGED_NOTE,
+            _uow._BATCH_UNSENT_NOTE,
+            'sgalchemy: failed during batch wave 1 chunk 1',
+        ]
+        assert 'batch' not in [name for name, _, _ in fake_async_sg.calls]
+        assert session.unit_of_work.new == [pending]
 
     asyncio.run(scenario())
 
 
 def test_async_sole_batch_failure_passes_through_and_retries(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -1577,7 +1643,7 @@ def test_async_sole_batch_failure_passes_through_and_retries(
         pending = _entities(engine).Shot.new(code='sole-batch')
         session.add(pending)
         fault = RuntimeError('sole batch fault')
-        fake_async_sg._errors['batch'] = [fault]
+        fake_async_sg.errors['batch'] = [fault]
         with pytest.raises(RuntimeError) as excinfo:
             await session.commit()
         assert excinfo.value is fault
@@ -1586,7 +1652,7 @@ def test_async_sole_batch_failure_passes_through_and_retries(
         assert entity_state(pending).dirty == {'code': 'sole-batch'}
         await session.commit()
         assert pending.id is not None
-        assert [name for name, _, _ in fake_async_sg._calls].count('batch') == 2
+        assert [name for name, _, _ in fake_async_sg.calls].count('batch') == 2
 
     asyncio.run(scenario())
 
@@ -1597,7 +1663,7 @@ def test_async_sole_batch_failure_passes_through_and_retries(
     ids=['runtime-error', 'commit-error'],
 )
 def test_async_sole_batch_local_failure_after_response_is_indeterminate(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     fault: Exception,
@@ -1629,19 +1695,19 @@ def test_async_sole_batch_local_failure_after_response_is_indeterminate(
         assert entity_state(pending).session is None
         assert entity_state(pending).access_guard is None
         assert entity_state(pending).id is None
-        assert not any(name == 'find' for name, _, _ in fake_async_sg._calls)
+        assert not any(name == 'find' for name, _, _ in fake_async_sg.calls)
         with pytest.raises(SgalchemyError, match='indeterminate'):
             _ = pending.code
 
         await session.commit()
-        assert [name for name, _, _ in fake_async_sg._calls].count('batch') == 1
+        assert [name for name, _, _ in fake_async_sg.calls].count('batch') == 1
         await session.close()
 
     asyncio.run(scenario())
 
 
 def test_async_staging_rejects_foreign_registry(
-    fake_async_sg: _FakeAsyncShotgun, tmp_path: Path
+    fake_async_sg: FakeAsyncShotgun, tmp_path: Path
 ) -> None:
     async def scenario() -> None:
         engine = create_async_engine(
@@ -1673,7 +1739,7 @@ def test_async_staging_rejects_foreign_registry(
 
 
 def test_async_successful_revive_and_upload_are_not_repeated(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -1688,7 +1754,7 @@ def test_async_successful_revive_and_upload_are_not_repeated(
         shot.image = image_path
         await session.commit()
         await session.commit()
-        names = [name for name, _, _ in fake_async_sg._calls]
+        names = [name for name, _, _ in fake_async_sg.calls]
         assert names.count('revive') == 1
         assert names.count('upload_thumbnail') == 1
         assert not entity_state(shot).deleted
@@ -1708,7 +1774,7 @@ def test_async_successful_revive_and_upload_are_not_repeated(
     ids=['missing-row', 'missing-field', 'malformed-row', 'read-exception'],
 )
 def test_async_successful_upload_readback_failure_requires_refresh(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     readback: list[dict[str, object]],
@@ -1722,21 +1788,21 @@ def test_async_successful_upload_readback_failure_requires_refresh(
         image_path = tmp_path / 'async-successful-unreadable.jpg'
         image_path.write_bytes(b'image')
         shot.image = image_path
-        fake_async_sg._find_results = [readback]
+        fake_async_sg.find_results = [readback]
         if raises:
-            fake_async_sg._find_error = RuntimeError('readback fault')
-        confirmed: list[tuple[_uow.UploadPlanItem, CommitOutcome]] = []
-        original_confirm = CommitOutcome._confirm
+            fake_async_sg.find_error = RuntimeError('readback fault')
+        confirmed: list[tuple[_uow._UploadPlanItem, CommitOutcome]] = []
+        original_confirm = CommitOutcome.confirm
 
         def capture_confirm(
             outcome: CommitOutcome,
-            items: tuple[Entity | _uow._Op | _uow.UploadPlanItem, ...],
+            items: tuple[Entity | _uow._Op | _uow._UploadPlanItem, ...],
         ) -> None:
             original_confirm(outcome, items)
-            if isinstance(items[0], _uow.UploadPlanItem):
+            if isinstance(items[0], _uow._UploadPlanItem):
                 confirmed.append((items[0], outcome))
 
-        monkeypatch.setattr(CommitOutcome, '_confirm', capture_confirm)
+        monkeypatch.setattr(CommitOutcome, 'confirm', capture_confirm)
 
         await session.commit()
 
@@ -1748,14 +1814,14 @@ def test_async_successful_upload_readback_failure_requires_refresh(
         upload, outcome = confirmed[0]
         assert outcome.committed[0] is upload
         assert outcome.indeterminate == []
-        assert [name for name, _, _ in fake_async_sg._calls].count('find') == 1
+        assert [name for name, _, _ in fake_async_sg.calls].count('find') == 1
 
     asyncio.run(scenario())
 
 
 @pytest.mark.parametrize('server_value', [None, 'server-image'])
 def test_async_successful_upload_reads_exact_provider_value(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
     server_value: object,
 ) -> None:
@@ -1767,7 +1833,7 @@ def test_async_successful_upload_reads_exact_provider_value(
         image_path = tmp_path / 'async-successful-upload.jpg'
         image_path.write_bytes(b'image')
         shot.image = image_path
-        fake_async_sg._find_results = [[{'type': 'Shot', 'id': 81, 'image': server_value}]]
+        fake_async_sg.find_results = [[{'type': 'Shot', 'id': 81, 'image': server_value}]]
 
         await session.commit()
 
@@ -1776,7 +1842,7 @@ def test_async_successful_upload_reads_exact_provider_value(
         assert state.refresh_required == set()
         assert state.unverified_writes == set()
         assert state.dirty == {}
-        find_calls = [call for call in fake_async_sg._calls if call[0] == 'find']
+        find_calls = [call for call in fake_async_sg.calls if call[0] == 'find']
         assert len(find_calls) == 1
         assert find_calls[0][1][:3] == ('Shot', [['id', 'in', [81]]], ['image'])
 
@@ -1784,7 +1850,7 @@ def test_async_successful_upload_reads_exact_provider_value(
 
 
 def test_async_successful_uploads_are_confirmed_before_later_awaits(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1800,23 +1866,23 @@ def test_async_successful_uploads_are_confirmed_before_later_awaits(
         second_path.write_bytes(b'image')
         first.image = first_path
         second.image = second_path
-        fake_async_sg._find_results = [
+        fake_async_sg.find_results = [
             [
                 {'type': 'Shot', 'id': 83, 'image': 'first-server'},
                 {'type': 'Shot', 'id': 84, 'image': 'second-server'},
             ]
         ]
         original_upload = fake_async_sg.upload_thumbnail
-        original_confirm = CommitOutcome._confirm
-        confirmed: list[tuple[_uow.UploadPlanItem, CommitOutcome]] = []
+        original_confirm = CommitOutcome.confirm
+        confirmed: list[tuple[_uow._UploadPlanItem, CommitOutcome]] = []
         calls = 0
 
         def capture_confirm(
             outcome: CommitOutcome,
-            items: tuple[Entity | _uow._Op | _uow.UploadPlanItem, ...],
+            items: tuple[Entity | _uow._Op | _uow._UploadPlanItem, ...],
         ) -> None:
             original_confirm(outcome, items)
-            if isinstance(items[0], _uow.UploadPlanItem):
+            if isinstance(items[0], _uow._UploadPlanItem):
                 confirmed.append((items[0], outcome))
 
         async def observe_second_upload(
@@ -1835,7 +1901,7 @@ def test_async_successful_uploads_are_confirmed_before_later_awaits(
                 assert outcome.committed[0] is upload
             return await original_upload(entity_type, entity_id, path)
 
-        monkeypatch.setattr(CommitOutcome, '_confirm', capture_confirm)
+        monkeypatch.setattr(CommitOutcome, 'confirm', capture_confirm)
         monkeypatch.setattr(fake_async_sg, 'upload_thumbnail', observe_second_upload)
 
         await session.commit()
@@ -1847,7 +1913,7 @@ def test_async_successful_uploads_are_confirmed_before_later_awaits(
 
 
 def test_async_thin_echo_recovery_applies_normalized_value(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -1857,8 +1923,8 @@ def test_async_thin_echo_recovery_applies_normalized_value(
         session = AsyncSession(engine)
         shot = session.merge_dict({'type': 'Shot', 'id': 23, 'description': 'old'})
         shot.description = 'submitted-secret'
-        fake_async_sg._batch_results = [[{'type': 'Shot', 'id': 23}]]
-        fake_async_sg._find_results = [[{'type': 'Shot', 'id': 23, 'description': 'normalized'}]]
+        fake_async_sg.batch_results = [[{'type': 'Shot', 'id': 23}]]
+        fake_async_sg.find_results = [[{'type': 'Shot', 'id': 23, 'description': 'normalized'}]]
 
         with caplog.at_level('WARNING', logger='sgalchemy.session'):
             await session.commit()
@@ -1875,7 +1941,7 @@ def test_async_thin_echo_recovery_applies_normalized_value(
 
 @pytest.mark.parametrize('discard', ['rollback', 'close'])
 def test_async_thumbnail_clear_restores_only_ordinary_snapshot(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
     discard: str,
 ) -> None:
@@ -1906,8 +1972,58 @@ def test_async_thumbnail_clear_restores_only_ordinary_snapshot(
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize(
+    'fault',
+    [RuntimeError('before filmstrip upload'), KeyboardInterrupt('before filmstrip upload')],
+    ids=['ordinary', 'interrupt'],
+)
+def test_async_confirmed_clear_rebases_pending_filmstrip_snapshot(
+    fake_async_sg: FakeAsyncShotgun,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: BaseException,
+) -> None:
+    async def scenario() -> None:
+        engine = isolated_async_engine(fake_async_sg, tmp_path)
+        await engine.load_schema()
+        session = AsyncSession(engine)
+        shot = session.merge_dict(
+            {'type': 'Shot', 'id': 53, 'image': 'old-image', 'filmstrip_image': 'old-strip'}
+        )
+        strip = tmp_path / 'strip.jpg'
+        strip.write_bytes(b'image')
+        shot.image = None
+        shot.filmstrip_image = strip
+        original_call = engine.call_with_progress
+
+        async def fail_before_filmstrip_upload(
+            method: str,
+            args: tuple[Any, ...],
+            kwargs: dict[str, Any],
+            progress: CallProgress | None,
+        ) -> object:
+            if method == 'upload_filmstrip_thumbnail':
+                raise fault
+            return await original_call(method, args, kwargs, progress)
+
+        monkeypatch.setattr(engine, 'call_with_progress', fail_before_filmstrip_upload)
+        expected = CommitError if isinstance(fault, Exception) else KeyboardInterrupt
+
+        with pytest.raises(expected):
+            await session.commit()
+        session.rollback()
+
+        state = entity_state(shot)
+        assert state.loaded['image'] is None
+        assert state.loaded['filmstrip_image'] is None
+        assert 'filmstrip_image' not in state.refresh_required
+        assert 'filmstrip_image' not in state.unverified_writes
+
+    asyncio.run(scenario())
+
+
 def test_async_upload_cancellation_is_raw_without_recovery_read(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -1918,7 +2034,7 @@ def test_async_upload_cancellation_is_raw_without_recovery_read(
         path = tmp_path / 'async-cancel-upload.jpg'
         path.write_bytes(b'image')
         shot.image = path
-        entered, _release = fake_async_sg._block('upload_thumbnail')
+        entered, _release = fake_async_sg.block('upload_thumbnail')
         committing = asyncio.create_task(session.commit())
         await entered.wait()
 
@@ -1926,18 +2042,18 @@ def test_async_upload_cancellation_is_raw_without_recovery_read(
         with pytest.raises(asyncio.CancelledError):
             await committing
 
-        assert not [call for call in fake_async_sg._calls if call[0] == 'find']
+        assert not [call for call in fake_async_sg.calls if call[0] == 'find']
         with pytest.raises(SgalchemyError, match='indeterminate'):
             _ = shot.code
         with pytest.raises(SgalchemyError, match='indeterminate'):
             await session.commit()
-        assert [name for name, _, _ in fake_async_sg._calls].count('upload_thumbnail') == 1
+        assert [name for name, _, _ in fake_async_sg.calls].count('upload_thumbnail') == 1
 
-    asyncio.run(scenario())
+    run_async(scenario())
 
 
 def test_async_upload_failure_partitions_and_clears_local_paths(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -1953,7 +2069,7 @@ def test_async_upload_failure_partitions_and_clears_local_paths(
         shot.filmstrip_image = filmstrip_path
         session.delete(shot)
         fault = RuntimeError('upload fault')
-        fake_async_sg._errors['upload_thumbnail'] = [fault]
+        fake_async_sg.errors['upload_thumbnail'] = [fault]
         with pytest.raises(CommitError) as excinfo:
             await session.commit()
         assert excinfo.value.__cause__ is fault
@@ -1977,13 +2093,13 @@ def test_async_upload_failure_partitions_and_clears_local_paths(
         assert state.refresh_required == {'image'}
         assert state.unverified_writes == set()
         assert state.dirty == {}
-        assert [name for name, _, _ in fake_async_sg._calls].count('find') == 1
+        assert [name for name, _, _ in fake_async_sg.calls].count('find') == 1
 
     asyncio.run(scenario())
 
 
 def test_async_upload_path_preflight_normalizes_custom_pathlike(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     class CustomPath:
@@ -2005,7 +2121,7 @@ def test_async_upload_path_preflight_normalizes_custom_pathlike(
 
         await session.commit()
 
-        upload = next(call for call in fake_async_sg._calls if call[0] == 'upload_thumbnail')
+        upload = next(call for call in fake_async_sg.calls if call[0] == 'upload_thumbnail')
         provider_path = upload[1][2]
         assert type(provider_path) is str
         assert os.fsencode(provider_path) == os.fsencode(path)
@@ -2015,7 +2131,7 @@ def test_async_upload_path_preflight_normalizes_custom_pathlike(
 
 @pytest.mark.parametrize('bad_path_kind', ['missing', 'directory', 'empty', 'unreadable'])
 def test_async_upload_path_preflight_precedes_revive_and_preserves_staging(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     bad_path_kind: str,
@@ -2031,7 +2147,7 @@ def test_async_upload_path_preflight_precedes_revive_and_preserves_staging(
             real_open = _uow.os.open
             target_path = path
 
-            @_preserve_signature(real_open)
+            @preserve_signature(real_open)
             def fail_target_open(
                 path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
                 flags: int,
@@ -2054,13 +2170,13 @@ def test_async_upload_path_preflight_precedes_revive_and_preserves_staging(
         session.revive(revived)
         upload = session.merge_dict({'type': 'Shot', 'id': 50, 'code': 'upload'})
         upload.image = path
-        calls_before = len(fake_async_sg._calls)
+        calls_before = len(fake_async_sg.calls)
 
         with pytest.raises(SgalchemyError, match=r'Shot\.image.*readable regular file'):
             await session.commit()
 
-        assert len(fake_async_sg._calls) == calls_before
-        assert session.unit_of_work.revived == (revived,)
+        assert len(fake_async_sg.calls) == calls_before
+        assert session.unit_of_work.revived == [revived]
         assert entity_state(upload).dirty == {'image': path}
 
     asyncio.run(scenario())
@@ -2068,8 +2184,8 @@ def test_async_upload_path_preflight_precedes_revive_and_preserves_staging(
 
 @pytest.mark.parametrize('threaded', [False, True])
 def test_async_unsent_upload_acquisition_failure_preserves_intent_for_retry(
-    fake_async_sg: _FakeAsyncShotgun,
-    fake_sg: _FakeShotgun,
+    fake_async_sg: FakeAsyncShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
     threaded: bool,
 ) -> None:
@@ -2080,12 +2196,12 @@ def test_async_unsent_upload_acquisition_failure_preserves_intent_for_retry(
         def creator() -> ClosableShotgunLike:
             if failing:
                 raise fault
-            return cast('ClosableShotgunLike', fake_sg)
+            return fake_sg
 
         async def async_creator() -> AsyncClosableShotgunLike:
             if failing:
                 raise fault
-            return cast('AsyncClosableShotgunLike', fake_async_sg)
+            return fake_async_sg
 
         if threaded:
             engine = create_async_engine(
@@ -2128,11 +2244,11 @@ def test_async_unsent_upload_acquisition_failure_preserves_intent_for_retry(
             )
             await engine.dispose()
             failing = True
-            provider._calls.clear()
+            provider.calls.clear()
             with pytest.raises(CommitError) as excinfo:
                 await session.commit()
             assert excinfo.value.__cause__ is fault
-            assert provider._calls == []
+            assert provider.calls == []
             assert (
                 dict(state.dirty),
                 dict(state.clean),
@@ -2145,9 +2261,9 @@ def test_async_unsent_upload_acquisition_failure_preserves_intent_for_retry(
             assert state.dirty['image'] is path
             assert (excinfo.value.indeterminate, excinfo.value.withdrawn) == ([], [])
             failing = False
-            provider._find_results = [[{'type': 'Shot', 'id': 90, 'image': 'uploaded'}]]
+            provider.find_results = [[{'type': 'Shot', 'id': 90, 'image': 'uploaded'}]]
             await session.commit()
-            assert [name for name, _, _ in provider._calls] == ['upload_thumbnail', 'find']
+            assert [name for name, _, _ in provider.calls] == ['upload_thumbnail', 'find']
             assert shot.image == 'uploaded'
         finally:
             await engine.dispose()
@@ -2156,7 +2272,7 @@ def test_async_unsent_upload_acquisition_failure_preserves_intent_for_retry(
 
 
 def test_async_upload_preflight_does_not_block_loop(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2178,7 +2294,7 @@ def test_async_upload_preflight_does_not_block_loop(
         real_open = _uow.os.open
         target_path = path
 
-        @_preserve_signature(real_open)
+        @preserve_signature(real_open)
         def blocking_target_open(
             path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
             flags: int,
@@ -2217,7 +2333,7 @@ def test_async_upload_preflight_does_not_block_loop(
 
 
 def test_async_upload_readbacks_group_entities_and_types(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -2233,7 +2349,7 @@ def test_async_upload_readbacks_group_entities_and_types(
         for path in paths:
             path.write_bytes(b'image')
         first.image, second.image, asset.image = paths
-        fake_async_sg._find_results = [
+        fake_async_sg.find_results = [
             [
                 {'type': 'Shot', 'id': 85, 'image': 'first-server'},
                 {'type': 'Shot', 'id': 86, 'image': 'second-server'},
@@ -2243,7 +2359,7 @@ def test_async_upload_readbacks_group_entities_and_types(
 
         await session.commit()
 
-        find_calls = [call for call in fake_async_sg._calls if call[0] == 'find']
+        find_calls = [call for call in fake_async_sg.calls if call[0] == 'find']
         assert [call[1][0] for call in find_calls] == ['Shot', 'Asset']
         assert find_calls[0][1][1:3] == ([['id', 'in', [85, 86]]], ['image'])
         assert find_calls[1][1][1:3] == ([['id', 'in', [87]]], ['image'])
@@ -2255,7 +2371,7 @@ def test_async_upload_readbacks_group_entities_and_types(
 
 
 def test_async_validated_chunk_hydration_failure_confirms_all_and_continues(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
@@ -2270,7 +2386,7 @@ def test_async_validated_chunk_hydration_failure_confirms_all_and_continues(
         session.add(first)
         session.add(second)
         session.add(dependent)
-        fake_async_sg._batch_results = [
+        fake_async_sg.batch_results = [
             [
                 {'type': 'Sequence', 'id': 9301, 'code': 'normalized-first'},
                 {'type': 'Sequence', 'id': 9302, 'code': 'normalized-second'},
@@ -2284,16 +2400,16 @@ def test_async_validated_chunk_hydration_failure_confirms_all_and_continues(
                 }
             ],
         ]
-        new_queue = session.unit_of_work._new
-        original_confirm = CommitOutcome._confirm
+        new_queue = session.unit_of_work.new
+        original_confirm = CommitOutcome.confirm
         original_hydrate = session.hydrate_record
         confirmed_before_hydration = False
-        first_chunk: tuple[Entity | _uow._Op | _uow.UploadPlanItem, ...] = ()
+        first_chunk: tuple[Entity | _uow._Op | _uow._UploadPlanItem, ...] = ()
         active_outcome: CommitOutcome | None = None
 
         def capture_confirm(
             outcome: CommitOutcome,
-            items: tuple[Entity | _uow._Op | _uow.UploadPlanItem, ...],
+            items: tuple[Entity | _uow._Op | _uow._UploadPlanItem, ...],
         ) -> None:
             nonlocal active_outcome, first_chunk
             original_confirm(outcome, items)
@@ -2311,14 +2427,14 @@ def test_async_validated_chunk_hydration_failure_confirms_all_and_continues(
                 confirmed_before_hydration = (
                     active_outcome is not None
                     and active_outcome.contains_committed(first_chunk)
-                    and session.unit_of_work._new is new_queue
+                    and session.unit_of_work.new is new_queue
                     and [id(obj) for obj in new_queue] == [id(dependent)]
                     and all(entity_state(obj).dirty == {} for obj in (first, second))
                 )
                 raise RuntimeError('synthetic async echo hydration failure')
             return original_hydrate(entity_type, record, binding)
 
-        monkeypatch.setattr(CommitOutcome, '_confirm', capture_confirm)
+        monkeypatch.setattr(CommitOutcome, 'confirm', capture_confirm)
         monkeypatch.setattr(session, 'hydrate_record', hydrate_with_fault)
         with caplog.at_level('ERROR', logger='sgalchemy.session'):
             await session.commit()
@@ -2332,21 +2448,21 @@ def test_async_validated_chunk_hydration_failure_confirms_all_and_continues(
         assert first_state.refresh_required == {'code'}
         assert second.code == 'normalized-second'
         assert dependent.code == 'normalized-dependent'
-        assert len([call for call in fake_async_sg._calls if call[0] == 'batch']) == 2
+        assert len([call for call in fake_async_sg.calls if call[0] == 'batch']) == 2
         errors = [record for record in caplog.records if record.levelname == 'ERROR']
         assert len(errors) == 1
         assert errors[0].exc_info is not None
-        calls_before = len(fake_async_sg._calls)
+        calls_before = len(fake_async_sg.calls)
 
         await session.commit()
 
-        assert len(fake_async_sg._calls) == calls_before
+        assert len(fake_async_sg.calls) == calls_before
 
     asyncio.run(scenario())
 
 
 def test_async_validated_chunk_phase_one_failure_keeps_confirmed_partition(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2360,18 +2476,18 @@ def test_async_validated_chunk_phase_one_failure_keeps_confirmed_partition(
         session.add(first)
         session.add(second)
         session.add(dependent)
-        fake_async_sg._batch_results = [
+        fake_async_sg.batch_results = [
             [
                 {'type': 'Sequence', 'id': 9401, 'code': 'first'},
                 {'type': 'Sequence', 'id': 9402, 'code': 'second'},
             ]
         ]
         fault = RuntimeError('synthetic async phase one invariant failure')
-
-        def fail_reconciliation(*_args: object) -> Never:
-            raise fault
-
-        monkeypatch.setattr(_uow, '_apply_deterministic_thumbnail_clear', fail_reconciliation)
+        monkeypatch.setattr(
+            _uow,
+            '_apply_deterministic_thumbnail_clear',
+            inject_faults(_uow._apply_deterministic_thumbnail_clear, [fault]),
+        )
 
         with pytest.raises(CommitError) as excinfo:
             await session.commit()
@@ -2391,12 +2507,27 @@ def test_async_validated_chunk_phase_one_failure_keeps_confirmed_partition(
         assert error.indeterminate == []
         assert error.withdrawn == []
         assert not any('nothing committed' in note for note in error.__notes__)
+        assert (first.id, second.id) == (9401, 9402)
+        fake_async_sg.batch_results = [
+            [
+                {
+                    'type': 'Shot',
+                    'id': 9403,
+                    'code': 'dependent',
+                    'sg_sequence': {'type': 'Sequence', 'id': 9402},
+                }
+            ]
+        ]
+
+        await session.commit()
+
+        assert dependent.id == 9403
 
     asyncio.run(scenario())
 
 
 def test_async_validated_chunk_phase_one_failure_retires_confirmed_updates(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2408,19 +2539,18 @@ def test_async_validated_chunk_phase_one_failure_retires_confirmed_updates(
         second = session.merge_dict({'type': 'Shot', 'id': 100, 'description': 'old-second'})
         first.description = 'new-first'
         second.description = 'new-second'
-        fake_async_sg._batch_results = [
+        fake_async_sg.batch_results = [
             [
                 {'type': 'Shot', 'id': 99, 'description': 'new-first'},
                 {'type': 'Shot', 'id': 100, 'description': 'new-second'},
             ]
         ]
         fault = RuntimeError('synthetic async confirmed reconciliation failure')
-        original_apply = _uow._apply_deterministic_thumbnail_clear
-
-        def fail_reconciliation(*_args: object) -> Never:
-            raise fault
-
-        monkeypatch.setattr(_uow, '_apply_deterministic_thumbnail_clear', fail_reconciliation)
+        monkeypatch.setattr(
+            _uow,
+            '_apply_deterministic_thumbnail_clear',
+            inject_faults(_uow._apply_deterministic_thumbnail_clear, [fault]),
+        )
 
         with pytest.raises(CommitError) as excinfo:
             await session.commit()
@@ -2428,12 +2558,11 @@ def test_async_validated_chunk_phase_one_failure_retires_confirmed_updates(
         assert excinfo.value.__cause__ is fault
         assert len(excinfo.value.committed) == 2
         assert excinfo.value.staged == []
-        monkeypatch.setattr(_uow, '_apply_deterministic_thumbnail_clear', original_apply)
-        calls_before = len(fake_async_sg._calls)
+        calls_before = len(fake_async_sg.calls)
 
         await session.commit()
 
-        assert len(fake_async_sg._calls) == calls_before
+        assert len(fake_async_sg.calls) == calls_before
         assert entity_state(first).dirty == {}
         assert entity_state(second).dirty == {}
 
@@ -2441,7 +2570,7 @@ def test_async_validated_chunk_phase_one_failure_retires_confirmed_updates(
 
 
 def test_automatic_cleanup_is_idempotent_and_preserves_quarantine(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -2453,12 +2582,12 @@ def test_automatic_cleanup_is_idempotent_and_preserves_quarantine(
         unsubmitted = _entities(engine).Shot.new(code='unsubmitted-secret')
         session.add(ambiguous)
         session.add(unsubmitted)
-        fake_async_sg._errors['batch'] = [SystemExit('out-of-band interruption')]
+        fake_async_sg.errors['batch'] = [SystemExit('out-of-band interruption')]
 
         with pytest.raises(SystemExit):
             await session.commit(batch_size=1)
 
-        calls_before = len(fake_async_sg._calls)
+        calls_before = len(fake_async_sg.calls)
         _async_session.automatic_cleanup(
             session,
             task_name='quarantined-worker',
@@ -2476,9 +2605,9 @@ def test_automatic_cleanup_is_idempotent_and_preserves_quarantine(
         assert not unsubmitted_state.indeterminate
         assert ambiguous_state.session is None
         assert unsubmitted_state.session is None
-        assert len(fake_async_sg._calls) == calls_before
+        assert len(fake_async_sg.calls) == calls_before
         with pytest.raises(SgalchemyError, match='new AsyncSession'):
-            session._identity_values()
+            session.identity_values()
         replacement = AsyncSession(engine)
         with pytest.raises(SgalchemyError, match='indeterminate'):
             replacement.add(ambiguous)
@@ -2506,8 +2635,8 @@ def test_automatic_cleanup_is_idempotent_and_preserves_quarantine(
     assert 'unsubmitted-secret' not in warnings[0]
 
 
-def test_automatic_cleanup_restores_interrupted_detached_dirty_revive(
-    fake_async_sg: _FakeAsyncShotgun,
+def test_automatic_cleanup_restores_interrupted_readded_dirty_revive(
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -2517,24 +2646,25 @@ def test_automatic_cleanup_restores_interrupted_detached_dirty_revive(
         source = AsyncSession(engine)
         shot = source.merge_dict({'type': 'Shot', 'id': 101, 'description': 'old-revive-secret'})
         await source.close()
-        shot.description = 'new-revive-secret'
         state = entity_state(shot)
         state.deleted = True
         session = AsyncSession(engine)
+        session.add(shot)
+        shot.description = 'new-revive-secret'
         session.revive(shot)
         fault = asyncio.CancelledError('revive interrupted')
-        fake_async_sg._errors['revive'] = [fault]
+        fake_async_sg.errors['revive'] = [fault]
 
         with pytest.raises(asyncio.CancelledError) as excinfo:
             await session.commit()
 
         assert excinfo.value is fault
-        unit_of_work = object.__getattribute__(session, '_unit_of_work')
-        assert unit_of_work.revived == ()
+        unit_of_work = object.__getattribute__(session, 'raw_unit_of_work')
+        assert unit_of_work.revived == []
         assert state.session is session
         assert state.dirty == {'description': 'new-revive-secret'}
         assert state.indeterminate
-        calls_before_cleanup = list(fake_async_sg._calls)
+        calls_before_cleanup = list(fake_async_sg.calls)
 
         _async_session.automatic_cleanup(
             session,
@@ -2547,15 +2677,15 @@ def test_automatic_cleanup_restores_interrupted_detached_dirty_revive(
             cancelled=True,
         )
 
-        assert fake_async_sg._calls == calls_before_cleanup
-        assert [name for name, _, _ in fake_async_sg._calls].count('revive') == 1
+        assert fake_async_sg.calls == calls_before_cleanup
+        assert [name for name, _, _ in fake_async_sg.calls].count('revive') == 1
         assert state.loaded['description'] == 'old-revive-secret'
         assert state.dirty == {}
         assert state.clean == {}
         assert state.session is None
         assert state.indeterminate
         with pytest.raises(SgalchemyError, match='new AsyncSession'):
-            session._identity_values()
+            session.identity_values()
 
     with caplog.at_level('WARNING', logger='sgalchemy.session'):
         asyncio.run(scenario())
@@ -2581,8 +2711,8 @@ def test_automatic_cleanup_restores_interrupted_detached_dirty_revive(
 
 @pytest.mark.parametrize('threaded', [False, True])
 def test_cancelled_commit_waiting_for_reset_preserves_upload_for_retry(
-    fake_async_sg: _FakeAsyncShotgun,
-    fake_sg: _FakeShotgun,
+    fake_async_sg: FakeAsyncShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     threaded: bool,
@@ -2617,7 +2747,7 @@ def test_cancelled_commit_waiting_for_reset_preserves_upload_for_retry(
         monkeypatch.setattr(backend._reset_gate._done, 'wait', observed_wait)
         backend._reset_gate._resetting = True
         backend._reset_gate._done.clear()
-        provider._calls.clear()
+        provider.calls.clear()
         committing = asyncio.create_task(session.commit())
         try:
             await asyncio.wait_for(waiting.wait(), 2)
@@ -2626,13 +2756,13 @@ def test_cancelled_commit_waiting_for_reset_preserves_upload_for_retry(
                 await committing
             assert entity_state(shot).dirty['image'] is path
             assert not entity_state(shot).indeterminate
-            assert provider._calls == []
+            assert provider.calls == []
             backend._reset_gate._resetting = False
             backend._reset_gate._done.set()
-            provider._find_results = [[{'type': 'Shot', 'id': 90, 'image': 'uploaded'}]]
+            provider.find_results = [[{'type': 'Shot', 'id': 90, 'image': 'uploaded'}]]
             await session.commit()
             assert shot.image == 'uploaded'
-            assert [name for name, _, _ in provider._calls] == ['upload_thumbnail', 'find']
+            assert [name for name, _, _ in provider.calls] == ['upload_thumbnail', 'find']
         finally:
             backend._reset_gate._resetting = False
             backend._reset_gate._done.set()
@@ -2646,8 +2776,8 @@ def test_cancelled_commit_waiting_for_reset_preserves_upload_for_retry(
     [(False, RuntimeError), (True, RuntimeError), (False, CommitError), (True, CommitError)],
 )
 def test_async_uninvoked_later_upload_recovers_confirmed_prefix_only(
-    fake_async_sg: _FakeAsyncShotgun,
-    fake_sg: _FakeShotgun,
+    fake_async_sg: FakeAsyncShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     case: tuple[bool, type[RuntimeError | CommitError]],
@@ -2686,8 +2816,8 @@ def test_async_uninvoked_later_upload_recovers_confirmed_prefix_only(
             return original
 
         monkeypatch.setattr(type(provider), 'upload_thumbnail', property(resolve))
-        provider._calls.clear()
-        provider._find_results = [[{'type': 'Shot', 'id': 88, 'image': 'confirmed'}]]
+        provider.calls.clear()
+        provider.find_results = [[{'type': 'Shot', 'id': 88, 'image': 'confirmed'}]]
         try:
             with pytest.raises(CommitError) as excinfo:
                 await session.commit()
@@ -2703,16 +2833,16 @@ def test_async_uninvoked_later_upload_recovers_confirmed_prefix_only(
             assert objects[0].image == 'confirmed'
             assert entity_state(objects[1]).dirty['image'] is paths[1]
             assert entity_state(objects[2]).dirty['image'] is paths[2]
-            assert [name for name, _, _ in provider._calls] == ['upload_thumbnail', 'find']
-            assert provider._calls[-1][1][:3] == ('Shot', [['id', 'in', [88]]], ['image'])
-            provider._find_results = [
+            assert [name for name, _, _ in provider.calls] == ['upload_thumbnail', 'find']
+            assert provider.calls[-1][1][:3] == ('Shot', [['id', 'in', [88]]], ['image'])
+            provider.find_results = [
                 [
                     {'type': 'Shot', 'id': 89, 'image': 'second'},
                     {'type': 'Shot', 'id': 90, 'image': 'third'},
                 ]
             ]
             await session.commit()
-            uploads = [args[1] for name, args, _ in provider._calls if name == 'upload_thumbnail']
+            uploads = [args[1] for name, args, _ in provider.calls if name == 'upload_thumbnail']
             assert uploads == [88, 89, 90]
         finally:
             await engine.dispose()
@@ -2721,7 +2851,7 @@ def test_async_uninvoked_later_upload_recovers_confirmed_prefix_only(
 
 
 def test_concurrent_task_cannot_commit_or_mutate_unit_of_work(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -2729,12 +2859,14 @@ def test_concurrent_task_cannot_commit_or_mutate_unit_of_work(
         await engine.load_schema()
         session = AsyncSession(engine)
         session.add(_entities(engine).Shot.new(code='first'))
-        entered, release = fake_async_sg._block('batch')
+        entered, release = fake_async_sg.block('batch')
         committing = asyncio.create_task(session.commit())
         await entered.wait()
         second = _entities(engine).Shot.new(code='second')
         with pytest.raises(SgalchemyError, match='concurrent task'):
             session.add(second)
+        with pytest.raises(SgalchemyError, match='concurrent task'):
+            _ = session.unit_of_work
         assert entity_state(second).session is None
         with pytest.raises(SgalchemyError, match='concurrent task'):
             session.rollback()
@@ -2743,11 +2875,11 @@ def test_concurrent_task_cannot_commit_or_mutate_unit_of_work(
         release.set()
         await committing
 
-    asyncio.run(scenario())
+    run_async(scenario())
 
 
 def test_interrupted_detached_delete_remains_owned_until_close(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -2758,7 +2890,7 @@ def test_interrupted_detached_delete_remains_owned_until_close(
         await source.close()
         session = AsyncSession(engine)
         session.delete(shot)
-        entered, _release = fake_async_sg._block('batch')
+        entered, _release = fake_async_sg.block('batch')
         committing = asyncio.create_task(session.commit())
         await entered.wait()
         committing.cancel()
@@ -2768,16 +2900,16 @@ def test_interrupted_detached_delete_remains_owned_until_close(
 
         state = entity_state(shot)
         assert state.session is session
-        assert any(candidate is shot for candidate in session._cleanup_anchors)
+        assert any(candidate is shot for candidate in session.cleanup_anchors)
         await session.close()
         assert state.session is None
         assert state.access_guard is None
 
-    asyncio.run(scenario())
+    run_async(scenario())
 
 
 def test_native_cancelled_upload_acquisition_preserves_intent(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -2789,7 +2921,7 @@ def test_native_cancelled_upload_acquisition_preserves_intent(
             if not preparing:
                 entered.set()
                 await release.wait()
-            return cast('AsyncClosableShotgunLike', fake_async_sg)
+            return fake_async_sg
 
         engine = create_async_engine(
             fake_async_sg.base_url,
@@ -2806,7 +2938,7 @@ def test_native_cancelled_upload_acquisition_preserves_intent(
         shot.image = path
         await engine.dispose()
         preparing = False
-        fake_async_sg._calls.clear()
+        fake_async_sg.calls.clear()
         committing = asyncio.create_task(session.commit())
         try:
             await asyncio.wait_for(entered.wait(), 2)
@@ -2815,12 +2947,12 @@ def test_native_cancelled_upload_acquisition_preserves_intent(
                 await committing
             assert entity_state(shot).dirty['image'] is path
             assert not entity_state(shot).indeterminate
-            assert fake_async_sg._calls == []
+            assert fake_async_sg.calls == []
             release.set()
-            fake_async_sg._find_results = [[{'type': 'Shot', 'id': 90, 'image': 'uploaded'}]]
+            fake_async_sg.find_results = [[{'type': 'Shot', 'id': 90, 'image': 'uploaded'}]]
             await session.commit()
             assert shot.image == 'uploaded'
-            assert [name for name, _, _ in fake_async_sg._calls] == ['upload_thumbnail', 'find']
+            assert [name for name, _, _ in fake_async_sg.calls] == ['upload_thumbnail', 'find']
         finally:
             release.set()
             await engine.dispose()
@@ -2829,13 +2961,13 @@ def test_native_cancelled_upload_acquisition_preserves_intent(
 
 
 def test_threaded_cancelled_commit_is_drained_without_duplicate_submission(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
         entered = Event()
         release = Event()
-        fake_sg._block_next('batch', entered=entered, release=release)
+        fake_sg.block_next('batch', entered=entered, release=release)
         engine = create_async_engine(
             sync_connection=fake_sg,
             strategy='threaded',
@@ -2866,13 +2998,13 @@ def test_threaded_cancelled_commit_is_drained_without_duplicate_submission(
             if task is not None:
                 await asyncio.gather(task, return_exceptions=True)
             await engine.dispose()
-        assert [name for name, _, _ in fake_sg._calls].count('batch') == 1
+        assert [name for name, _, _ in fake_sg.calls].count('batch') == 1
 
     asyncio.run(scenario())
 
 
 def test_threaded_queued_upload_cancellation_quarantines_before_provider_entry(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2892,7 +3024,7 @@ def test_threaded_queued_upload_cancellation_quarantines_before_provider_entry(
         shot.image = path
         entered = Event()
         release = Event()
-        fake_sg._block_next('schema_read', entered=entered, release=release)
+        fake_sg.block_next('schema_read', entered=entered, release=release)
         blocker = asyncio.create_task(engine.call('schema_read'))
         queued = asyncio.Event()
         observations: list[CallProgress] = []
@@ -2929,8 +3061,8 @@ def test_threaded_queued_upload_cancellation_quarantines_before_provider_entry(
             await engine.dispose()
             assert observations[0].invoked.is_set()
             assert entity_state(shot).loaded == quarantined_values
-            assert [name for name, _, _ in fake_sg._calls].count('upload_thumbnail') == 1
-            assert not any(name == 'find' for name, _, _ in fake_sg._calls)
+            assert [name for name, _, _ in fake_sg.calls].count('upload_thumbnail') == 1
+            assert not any(name == 'find' for name, _, _ in fake_sg.calls)
             with pytest.raises(SgalchemyError, match='indeterminate'):
                 await session.commit()
         finally:

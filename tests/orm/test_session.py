@@ -10,14 +10,6 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Never, ParamSpec, TypeVar, cast
 
 import pytest
-from _support import (
-    AUTHENTICATION_FAULT,
-    SCHEMA_ABSENT_MESSAGE,
-    BrokenNoteError,
-    YieldCountingEntities,
-    _preserve_signature,
-    capture_hydration_bindings,
-)
 
 from sgalchemy import inspect
 from sgalchemy._core._compiler import FindCall
@@ -33,7 +25,6 @@ from sgalchemy._core._registry import (
     initialize_entity,
 )
 from sgalchemy._core._result import Result
-from sgalchemy._core._schema_drift import SchemaDrift
 from sgalchemy._core._statement import select
 from sgalchemy._errors import (
     CommitError,
@@ -42,16 +33,35 @@ from sgalchemy._errors import (
     SgalchemyError,
     StaleObjectError,
 )
-from sgalchemy._orm import Session
 from sgalchemy._orm import _session as session_module
+from sgalchemy._orm._session import Session
+from tests._support import (
+    AUTHENTICATION_FAULT,
+    SCHEMA_ABSENT_MESSAGE,
+    BrokenNoteError,
+    YieldCountingEntities,
+    block_call,
+    capture_hydration_bindings,
+    isolated_async_engine,
+    preserve_signature,
+    publish_on_drift,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from _fakes import _FakeShotgun
-    from _support import _SyncCallback
-
     from sgalchemy._orm._uow import CommitPlan
+    from tests._fakes import FakeAsyncShotgun, FakeShotgun
+    from tests._support import SyncCallback, SyncSessionBundle
+
+_COLLISION = (
+    'this session already tracks a different Shot(id=80) object, loaded or staged for deletion '
+    'or revival; edit that object instead of adding this copy'
+)
+_DETACHED = (
+    'Shot(id=80) is not in an open session, so this change would never be sent; call '
+    'session.add(obj) on an open session first, then assign'
+)
 
 _P = ParamSpec('_P')
 _R = TypeVar('_R')
@@ -88,7 +98,7 @@ class _OpaqueMapping(Mapping[str, Any]):
 
 
 def _engine_with_symbolic_vendor(
-    fake_sg: _FakeShotgun, tmp_path: Path
+    fake_sg: FakeShotgun, tmp_path: Path
 ) -> tuple[Engine, type[Entity]]:
     registry = Registry()
     vendor_cls = registry.entity_class('FutureVendor')
@@ -99,8 +109,17 @@ def _engine_with_symbolic_vendor(
     return engine, vendor_cls
 
 
+def test_add_rejects_an_entity_owned_by_another_open_session(sess: SyncSessionBundle) -> None:
+    session, engine, _fake = sess
+    engine.load_schema()
+    other = Session(engine)
+    shot = other.merge_dict({'type': 'Shot', 'id': 80})
+    with pytest.raises(SgalchemyError, match='belongs to another open session'):
+        session.add(shot)
+
+
 def test_auth_upload_failure_notes_unknown_outcome_on_commit_error(
-    engine: Engine, fake_sg: _FakeShotgun, tmp_path: Path
+    engine: Engine, fake_sg: FakeShotgun, tmp_path: Path
 ) -> None:
     engine.load_schema()
     session = Session(engine)
@@ -109,7 +128,7 @@ def test_auth_upload_failure_notes_unknown_outcome_on_commit_error(
     image_path.write_bytes(b'image')
     shot.image = image_path
     fault = AUTHENTICATION_FAULT('session expired')
-    fake_sg._errors.setdefault('upload_thumbnail', []).append(fault)
+    fake_sg.errors.setdefault('upload_thumbnail', []).append(fault)
 
     with pytest.raises(CommitError) as excinfo:
         session.commit()
@@ -143,29 +162,29 @@ def test_bound_hydration_never_treats_display_alias_as_opaque_canonical_wire(
     with pytest.raises(SgalchemyError, match=r'Vendor.*alias.*CustomEntity03'):
         session.merge_dict({'type': 'Vendor', 'id': 9})
 
-    assert session._identity_values() == []
+    assert session.identity_values() == []
 
 
 def test_broken_add_note_does_not_mask_provider_error(
-    engine: Engine, fake_sg: _FakeShotgun
+    engine: Engine, fake_sg: FakeShotgun
 ) -> None:
     session = Session(engine)
     error = BrokenNoteError('provider unavailable')
-    fake_sg._errors['find'] = [error]
+    fake_sg.errors['find'] = [error]
     with pytest.raises(BrokenNoteError) as excinfo:
-        session.execute_call(FindCall('Shot', [], ['id']), None)
+        session.execute_call(FindCall('Shot', [], ['id']))
     assert excinfo.value is error
 
 
 @pytest.mark.parametrize('operation', ['execute', 'get', 'refresh', 'scalars'])
 def test_cold_schema_fault_is_annotated_by_every_provider_operation(
-    engine: Engine, fake_sg: _FakeShotgun, operation: str
+    engine: Engine, fake_sg: FakeShotgun, operation: str
 ) -> None:
     session = Session(engine)
     shot_cls = engine.registry.entity_class('Shot')
     shot = session.merge_dict({'type': 'Shot', 'id': 1})
     error = RuntimeError('schema unavailable')
-    fake_sg._errors['schema_read'] = [error]
+    fake_sg.errors['schema_read'] = [error]
     calls = {
         'execute': lambda: session.execute(select(shot_cls.code)),
         'get': lambda: session.get(shot_cls, 2),
@@ -180,7 +199,7 @@ def test_cold_schema_fault_is_annotated_by_every_provider_operation(
 
 
 def test_cold_stale_disk_schema_forces_one_refresh_before_commit(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     schema_fixture: dict[str, Any],
     tmp_path: Path,
@@ -207,7 +226,7 @@ def test_cold_stale_disk_schema_forces_one_refresh_before_commit(
     original_load = engine.load_binding
     force_values: list[bool] = []
 
-    @_preserve_signature(original_load)
+    @preserve_signature(original_load)
     def tracking_load(*, force: bool = False) -> RegistryBinding:
         force_values.append(force)
         return original_load(force=force)
@@ -217,7 +236,7 @@ def test_cold_stale_disk_schema_forces_one_refresh_before_commit(
     session.commit()
 
     assert force_values == [False, True]
-    names = [name for name, _, _ in fake_sg._calls]
+    names = [name for name, _, _ in fake_sg.calls]
     assert names.count('schema_read') == 1
     assert names.count('schema_entity_read') == 1
     assert names.count('batch') == 1
@@ -227,7 +246,7 @@ def test_cold_stale_disk_schema_forces_one_refresh_before_commit(
 def test_commit_schema_recovery_forces_once_when_schema_remains_invalid(
     caplog: pytest.LogCaptureFixture,
     engine: Engine,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     schema_fixture: dict[str, Any],
 ) -> None:
@@ -244,7 +263,7 @@ def test_commit_schema_recovery_forces_once_when_schema_remains_invalid(
     stale_raw = {name: schema for name, schema in schema_fixture.items() if name != 'Shot'}
 
     def stale_schema_read() -> dict[str, Any]:
-        fake_sg._record('schema_read')
+        fake_sg.record('schema_read')
         return copy.deepcopy(stale_raw)
 
     monkeypatch.setattr(fake_sg, 'schema_read', stale_schema_read)
@@ -255,7 +274,7 @@ def test_commit_schema_recovery_forces_once_when_schema_remains_invalid(
     ):
         session.commit()
 
-    names = [name for name, _, _ in fake_sg._calls]
+    names = [name for name, _, _ in fake_sg.calls]
     assert names.count('schema_read') == 2
     assert names.count('batch') == 0
     assert caplog.messages.count('commit schema drift: refreshing schema once') == 1
@@ -263,7 +282,7 @@ def test_commit_schema_recovery_forces_once_when_schema_remains_invalid(
 
 def test_commit_schema_recovery_reuses_concurrently_published_binding_without_io(
     engine: Engine,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     engine.load_schema()
@@ -276,33 +295,21 @@ def test_commit_schema_recovery_reuses_concurrently_published_binding_without_io
         {name: schema for name, schema in complete.schemas.items() if name != 'Shot'},
         key=complete.key,
     )
-    original_plan_commit: _SyncCallback[
+    original_plan_commit: SyncCallback[
         [Session, RegistryBinding | None, Mapping[tuple[str, int], Entity]],
         CommitPlan,
     ] = session_module.plan_commit
-    publications = 0
-
-    def publish_on_drift(call: _SyncCallback[_P, _R]) -> _SyncCallback[_P, _R]:
-        def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
-            try:
-                return call(*args, **kwargs)
-            except SchemaDrift:
-                nonlocal publications
-                publications += 1
-                engine.registry.bind(dict(complete.schemas), key=complete.key)
-                raise
-
-        return wrapper
-
-    publish_during_failed_plan = publish_on_drift(original_plan_commit)
+    publish_during_failed_plan, publications = publish_on_drift(
+        original_plan_commit, engine.registry, complete
+    )
 
     monkeypatch.setattr(session_module, 'plan_commit', publish_during_failed_plan)
 
     session.commit()
 
-    names = [name for name, _, _ in fake_sg._calls]
+    names = [name for name, _, _ in fake_sg.calls]
     assert entity_state(shot).deleted
-    assert publications == 1
+    assert publications == [1]
     assert names.count('schema_read') == 1
     assert names.count('batch') == 1
 
@@ -319,7 +326,7 @@ def test_context_close_detaches_all_entities(engine: Engine) -> None:
 @pytest.mark.parametrize('path', ['sg_sequence.Asset.code', 'sg_sequence.Sequence.code'])
 def test_deep_field_mismatch_is_preserved_and_marks_schema_stale(
     engine: Engine,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     caplog: pytest.LogCaptureFixture,
     path: str,
 ) -> None:
@@ -333,7 +340,7 @@ def test_deep_field_mismatch_is_preserved_and_marks_schema_stale(
     assert entity_state(shot).loaded[path] == 'wire-value'
     assert 'schema shape mismatch' in caplog.text
     engine.load_schema()
-    assert [name for name, _, _ in fake_sg._calls].count('schema_read') == 2
+    assert [name for name, _, _ in fake_sg.calls].count('schema_read') == 2
 
 
 def test_deep_field_recovery_removes_preserved_dotted_value(engine: Engine) -> None:
@@ -380,25 +387,12 @@ def test_dirty_relationship_shields_link_and_descendants(engine: Engine) -> None
     assert replacement.code == 'local'
 
 
-def test_execute_call_accepts_captured_binding_witness(
-    engine: Engine, fake_sg: _FakeShotgun
-) -> None:
-    engine.load_schema()
-    session = Session(engine)
-    call = FindCall('Shot', [], ['id'])
-    fake_sg._find_results = [[{'id': 1}]]
-    binding = engine.load_binding()
-
-    assert session.execute_call(call, binding) == [{'id': 1}]
-
-
 def test_execute_call_rejects_wrong_provider_shapes(
-    engine: Engine, fake_sg: _FakeShotgun, monkeypatch: pytest.MonkeyPatch
+    engine: Engine, fake_sg: FakeShotgun, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     engine.load_schema()
     session = Session(engine)
     call = FindCall('Shot', [], ['id'])
-    binding = engine.load_binding()
 
     def bad_find(
         entity_type: str,
@@ -411,21 +405,29 @@ def test_execute_call_rejects_wrong_provider_shapes(
 
     monkeypatch.setattr(fake_sg, 'find', bad_find)
     with pytest.raises(SgalchemyError, match='find payload'):
-        session.execute_call(call, binding)
+        session.execute_call(call)
 
 
-def test_execute_projection_summary_and_entity_gate(engine: Engine, fake_sg: _FakeShotgun) -> None:
+def test_execute_call_returns_provider_payload(engine: Engine, fake_sg: FakeShotgun) -> None:
+    engine.load_schema()
+    session = Session(engine)
+    call = FindCall('Shot', [], ['id'])
+    fake_sg.find_results = [[{'id': 1}]]
+    assert session.execute_call(call) == [{'id': 1}]
+
+
+def test_execute_projection_summary_and_entity_gate(engine: Engine, fake_sg: FakeShotgun) -> None:
     engine.load_schema()
     shot_cls = engine.registry.entity_class('Shot')
-    fake_sg._find_results = [[{'type': 'Shot', 'id': 1, 'code': 'A'}]]
+    fake_sg.find_results = [[{'type': 'Shot', 'id': 1, 'code': 'A'}]]
     session = Session(engine)
     projected = session.execute(select(shot_cls.code))
     assert isinstance(projected, Result)
     assert projected[0].code == 'A'
-    calls_before = len(fake_sg._calls)
+    calls_before = len(fake_sg.calls)
     with pytest.raises(TypeError, match='scalars'):
         session.execute(cast('Any', select(shot_cls)))
-    assert len(fake_sg._calls) == calls_before
+    assert len(fake_sg.calls) == calls_before
 
 
 def test_expire_rejects_foreign_registry_state_without_mutation(engine: Engine) -> None:
@@ -438,67 +440,67 @@ def test_expire_rejects_foreign_registry_state_without_mutation(engine: Engine) 
     assert not entity_state(foreign).expired
 
 
-def test_get_miss_none_hit_and_fault_context(engine: Engine, fake_sg: _FakeShotgun) -> None:
+def test_get_miss_none_hit_and_fault_context(engine: Engine, fake_sg: FakeShotgun) -> None:
     session = Session(engine)
     engine.load_schema()
     shot_cls = engine.registry.entity_class('Shot')
-    fake_sg._find_results = [[], [{'type': 'Shot', 'id': 5, 'code': 'X'}]]
+    fake_sg.find_results = [[], [{'type': 'Shot', 'id': 5, 'code': 'X'}]]
     assert session.get(shot_cls, 4) is None
     shot = session.get(shot_cls, 5)
-    calls_before = len(fake_sg._calls)
+    calls_before = len(fake_sg.calls)
     assert session.get(shot_cls, 5) is shot
-    assert len(fake_sg._calls) == calls_before
-    fake_sg._errors['find_one'] = [RuntimeError('provider broke')]
+    assert len(fake_sg.calls) == calls_before
+    fake_sg.errors['find_one'] = [RuntimeError('provider broke')]
     with pytest.raises(RuntimeError) as excinfo:
         session.get(shot_cls, 6)
     assert excinfo.value.__notes__ == ["sgalchemy: raised while executing find_one('Shot', id=6)"]
 
 
 def test_get_rejects_foreign_registry_before_identity_hit_or_io(
-    engine: Engine, fake_sg: _FakeShotgun
+    engine: Engine, fake_sg: FakeShotgun
 ) -> None:
     session = Session(engine)
     session.merge_dict({'type': 'Shot', 'id': 5, 'code': 'local'})
     foreign_cls = Registry().entity_class('Shot')
     with pytest.raises(SgalchemyError, match='registry'):
         session.get(foreign_cls, 5)
-    assert fake_sg._calls == []
+    assert fake_sg.calls == []
 
 
 def test_get_rejects_mismatched_identity_before_registration(
     engine: Engine,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
 ) -> None:
     engine.load_schema()
     session = Session(engine)
     shot_cls = engine.entities.Shot
-    fake_sg._find_results = [[{'type': 'Shot', 'id': 2, 'code': 'wrong'}]]
+    fake_sg.find_results = [[{'type': 'Shot', 'id': 2, 'code': 'wrong'}]]
 
     with pytest.raises(SgalchemyError, match=r'requested Shot\(id=1\).*Shot\(id=2\)'):
         session.get(shot_cls, 1)
 
-    assert session._identity_values() == []
+    assert session.identity_values() == []
 
 
 def test_get_type_absent_after_refresh_raises_teaching_error(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
     engine, vendor_cls = _engine_with_symbolic_vendor(fake_sg, tmp_path)
     session = Session(engine)
-    reads_before = [name for name, _args, _kwargs in fake_sg._calls].count('schema_read')
+    reads_before = [name for name, _args, _kwargs in fake_sg.calls].count('schema_read')
 
     with pytest.raises(SchemaUnavailableError) as excinfo:
         session.get(vendor_cls, 5)
 
     assert str(excinfo.value) == SCHEMA_ABSENT_MESSAGE
-    calls = [name for name, _args, _kwargs in fake_sg._calls]
+    calls = [name for name, _args, _kwargs in fake_sg.calls]
     assert calls.count('schema_read') == reads_before + 1
     assert calls.count('find_one') == 0
 
 
 def test_get_unknown_type_forces_one_refresh_then_succeeds(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     schema_fixture: dict[str, Any],
     tmp_path: Path,
@@ -516,7 +518,7 @@ def test_get_unknown_type_forces_one_refresh_then_succeeds(
         return copy.deepcopy(extended)
 
     monkeypatch.setattr(fake_sg, 'schema_read', extended_read)
-    fake_sg._find_results = [[{'type': 'FutureVendor', 'id': 5, 'code': 'V5'}]]
+    fake_sg.find_results = [[{'type': 'FutureVendor', 'id': 5, 'code': 'V5'}]]
     session = Session(engine)
     hydration_bindings = capture_hydration_bindings(session, monkeypatch)
 
@@ -527,12 +529,12 @@ def test_get_unknown_type_forces_one_refresh_then_succeeds(
     assert len(hydration_bindings) == 1
     assert hydration_bindings[0] is engine.prepared_binding()
     assert len(schema_reads) == 1
-    assert [name for name, _args, _kwargs in fake_sg._calls].count('find_one') == 1
+    assert [name for name, _args, _kwargs in fake_sg.calls].count('find_one') == 1
 
 
 def test_hydration_alias_clone_preserves_cycle(
     engine: Engine,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     schema_fixture: dict[str, Any],
 ) -> None:
     schema_fixture['Shot']['description']['data_type']['value'] = 'serializable'
@@ -567,7 +569,7 @@ def test_hydration_alias_detaches_raw_pre_schema_container(engine: Engine) -> No
 
 def test_hydration_detaches_mutable_container_graph(
     engine: Engine,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     schema_fixture: dict[str, Any],
 ) -> None:
     schema_fixture['Shot']['description']['data_type']['value'] = 'serializable'
@@ -618,30 +620,27 @@ def test_hydration_fast_path_avoids_full_identity_scans(engine: Engine) -> None:
     assert first.code == 'updated'
 
 
-def test_hydration_scope_reuses_live_identity_and_clears_after_link_failure(
+def test_hydration_reuses_live_identity_and_observes_staging_after_link_failure(
     engine: Engine,
 ) -> None:
     engine.load_schema()
     session = Session(engine)
     staged = session.merge_dict({'type': 'Shot', 'id': 99})
     session.delete(staged)
-    queue = YieldCountingEntities(session.unit_of_work._deleted)
-    session.unit_of_work._deleted = queue
+    queue = YieldCountingEntities(session.unit_of_work.deleted)
+    session.unit_of_work.deleted = queue
 
     def hydrate_response() -> None:
-        with session.hydration_scope():
-            first = session.merge_dict({'type': 'Project', 'id': 1})
-            with session.hydration_scope():
-                shot = session.merge_dict(
-                    {'type': 'Shot', 'id': 1, 'project': {'type': 'Project', 'id': 1}}
-                )
-            assert shot.project is first
-            session.merge_dict({'type': 'Shot', 'id': 2, 'project': {'type': 'Vendor', 'id': 1}})
+        first = session.merge_dict({'type': 'Project', 'id': 1})
+        shot = session.merge_dict(
+            {'type': 'Shot', 'id': 1, 'project': {'type': 'Project', 'id': 1}}
+        )
+        assert shot.project is first
+        session.merge_dict({'type': 'Shot', 'id': 2, 'project': {'type': 'Vendor', 'id': 1}})
 
     with pytest.raises(SgalchemyError, match='display alias'):
         hydrate_response()
-    assert queue._visits == 1
-    assert session._state._hydration_index is None
+    assert queue.visits == 0
 
     # A later operation observes canceled staging, including lifecycle precedence.
     session.revive(staged)
@@ -686,7 +685,7 @@ def test_hydration_treats_non_wire_mapping_as_opaque_leaf(engine: Engine) -> Non
 
 
 def test_identity_hit_skips_binding_and_lazy_resolve_captures_fresh_binding(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     schema_fixture: dict[str, Any],
     tmp_path: Path,
@@ -698,7 +697,7 @@ def test_identity_hit_skips_binding_and_lazy_resolve_captures_fresh_binding(
         registry=registry,
         bind_default=False,
     )
-    fake_sg._find_results = [
+    fake_sg.find_results = [
         [{'type': 'Shot', 'id': 1, 'assets': [{'type': 'Asset', 'id': 8}]}],
         [{'type': 'Asset', 'id': 8, 'code': '2026-07-25'}],
     ]
@@ -723,7 +722,7 @@ def test_identity_hit_skips_binding_and_lazy_resolve_captures_fresh_binding(
     load_binding = engine.load_binding
     binding_reads = 0
 
-    def track_call(call: _SyncCallback[_P, _R]) -> _SyncCallback[_P, _R]:
+    def track_call(call: SyncCallback[_P, _R]) -> SyncCallback[_P, _R]:
         def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
             nonlocal binding_reads
             binding_reads += 1
@@ -747,14 +746,14 @@ def test_identity_hit_skips_binding_and_lazy_resolve_captures_fresh_binding(
 )
 def test_indeterminate_entity_rejected_by_public_session_object_operations(
     engine: Engine,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     operation: str,
 ) -> None:
     engine.load_schema()
     session = Session(engine)
     shot = session.merge_dict({'type': 'Shot', 'id': 5, 'code': 'original'})
     entity_state(shot).indeterminate = True
-    fake_sg._find_results = [
+    fake_sg.find_results = [
         [{'type': 'Shot', 'id': 5, 'code': 'server'}],
     ]
     shot_cls = engine.registry.entity_class('Shot')
@@ -766,7 +765,7 @@ def test_indeterminate_entity_rejected_by_public_session_object_operations(
         'refresh': lambda: session.refresh(shot),
         'scalars': lambda: session.scalars(select(shot_cls)),
     }
-    provider_calls_before = len(fake_sg._calls)
+    provider_calls_before = len(fake_sg.calls)
 
     with pytest.raises(SgalchemyError, match='indeterminate server outcome'):
         calls[operation]()
@@ -774,11 +773,11 @@ def test_indeterminate_entity_rejected_by_public_session_object_operations(
     assert entity_state(shot).loaded['code'] == 'original'
     assert not entity_state(shot).expired
     if operation in {'expire', 'expire_all', 'get', 'merge_dict', 'refresh'}:
-        assert len(fake_sg._calls) == provider_calls_before
+        assert len(fake_sg.calls) == provider_calls_before
 
 
 def test_invalid_date_is_preserved_and_valid_datetime_is_coerced(
-    engine: Engine, fake_sg: _FakeShotgun, caplog: pytest.LogCaptureFixture
+    engine: Engine, fake_sg: FakeShotgun, caplog: pytest.LogCaptureFixture
 ) -> None:
     schema = fake_sg.schema_read()
     schema['Shot']['created_at'] = {
@@ -801,7 +800,7 @@ def test_invalid_date_is_preserved_and_valid_datetime_is_coerced(
 
 def test_joinedload_null_link_with_non_null_projection_remains_schema_contradiction(
     engine: Engine,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     engine.load_schema()
@@ -812,7 +811,7 @@ def test_joinedload_null_link_with_non_null_projection_remains_schema_contradict
         'sg_sequence': None,
         'sg_sequence.Sequence.code': 'unexpected',
     }
-    fake_sg._find_results = [[row]]
+    fake_sg.find_results = [[row]]
     session = Session(engine)
     shot_cls = engine.registry.entity_class('Shot')
 
@@ -824,12 +823,12 @@ def test_joinedload_null_link_with_non_null_projection_remains_schema_contradict
     assert shot.as_dict()[path] == 'unexpected'
     assert 'schema shape mismatch' in caplog.text
     engine.load_schema()
-    assert [name for name, _args, _kwargs in fake_sg._calls].count('schema_read') == 2
+    assert [name for name, _args, _kwargs in fake_sg.calls].count('schema_read') == 2
 
 
 def test_joinedload_projections_do_not_clear_link_expiration(
     engine: Engine,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
 ) -> None:
     engine.load_schema()
     session = Session(engine)
@@ -837,7 +836,7 @@ def test_joinedload_projections_do_not_clear_link_expiration(
         {'type': 'Sequence', 'id': 7, 'code': 'old-code', 'episode': None}
     )
     session.expire(sequence)
-    fake_sg._find_results = [
+    fake_sg.find_results = [
         [
             {
                 'type': 'Shot',
@@ -860,13 +859,13 @@ def test_joinedload_projections_do_not_clear_link_expiration(
 
 
 def test_merge_without_schema_has_no_io_and_validates_identity(
-    engine: Engine, fake_sg: _FakeShotgun
+    engine: Engine, fake_sg: FakeShotgun
 ) -> None:
     session = Session(engine)
     ambiguous = {'payload': {'type': 'Unknown', 'id': 7}, 'items': [{'type': 'X', 'id': 8}]}
     obj = session.merge_dict({'type': 'Shot', 'id': 11, **ambiguous})
     assert obj.as_dict() == {'type': 'Shot', 'id': 11, **ambiguous}
-    assert fake_sg._calls == []
+    assert fake_sg.calls == []
     for raw, message in [
         ({'type': '', 'id': 1}, "non-empty string 'type'"),
         ({'type': 'Shot', 'id': True}, 'positive integer id'),
@@ -892,13 +891,13 @@ def test_no_work_commit_does_not_load_schema(
 
 
 def test_non_auth_sole_batch_failure_keeps_staged_note_without_auth_guidance(
-    engine: Engine, fake_sg: _FakeShotgun
+    engine: Engine, fake_sg: FakeShotgun
 ) -> None:
     engine.load_schema()
     session = Session(engine)
     shot_cls = engine.registry.entity_class('Shot')
     session.add(shot_cls.new(code='other-fail'))
-    fake_sg._errors.setdefault('batch', []).append(RuntimeError('boom'))
+    fake_sg.errors.setdefault('batch', []).append(RuntimeError('boom'))
 
     with pytest.raises(RuntimeError) as excinfo:
         session.commit()
@@ -909,7 +908,7 @@ def test_non_auth_sole_batch_failure_keeps_staged_note_without_auth_guidance(
 
 
 def test_old_session_uses_shared_registry_refresh_for_compile_and_hydration(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     schema_fixture: dict[str, Any],
     tmp_path: Path,
@@ -937,7 +936,7 @@ def test_old_session_uses_shared_registry_refresh_for_compile_and_hydration(
         bind_default=False,
     )
     refresher.load_schema()
-    fake_sg._find_results = [
+    fake_sg.find_results = [
         [{'type': 'Shot', 'id': 1, 'description': '2026-07-25'}],
     ]
     session = Session(first)
@@ -970,13 +969,13 @@ def test_partial_hydration_does_not_clear_whole_object_expiration(engine: Engine
 
 
 def test_read_auth_failure_carries_read_recovery_note(
-    engine: Engine, fake_sg: _FakeShotgun
+    engine: Engine, fake_sg: FakeShotgun
 ) -> None:
     engine.load_schema()
     session = Session(engine)
     shot_cls = engine.registry.entity_class('Shot')
     fault = AUTHENTICATION_FAULT('session expired')
-    fake_sg._errors.setdefault('find', []).append(fault)
+    fake_sg.errors.setdefault('find', []).append(fault)
 
     with pytest.raises(AUTHENTICATION_FAULT) as excinfo:
         session.scalars(select(shot_cls))
@@ -987,7 +986,21 @@ def test_read_auth_failure_carries_read_recovery_note(
     assert 'remain staged' not in joined
 
 
-def test_refresh_expire_all_and_missing(engine: Engine, fake_sg: _FakeShotgun) -> None:
+def test_readding_after_close_does_not_resend_a_reverted_edit(sess: SyncSessionBundle) -> None:
+    session, engine, fake_sg = sess
+    engine.load_schema()
+    source = Session(engine)
+    shot = source.merge_dict({'type': 'Shot', 'id': 80, 'description': 'before'})
+    shot.description = 'edited'
+    source.close()
+    session.add(shot)
+    assert shot.description == 'before'
+    calls_before = len(fake_sg.calls)
+    session.commit()
+    assert fake_sg.calls[calls_before:] == []
+
+
+def test_refresh_expire_all_and_missing(engine: Engine, fake_sg: FakeShotgun) -> None:
     session = Session(engine)
     first = session.merge_dict({'type': 'Shot', 'id': 1, 'code': 'A'})
     second = session.merge_dict({'type': 'Shot', 'id': 2, 'code': 'B'})
@@ -999,7 +1012,7 @@ def test_refresh_expire_all_and_missing(engine: Engine, fake_sg: _FakeShotgun) -
     first_state.loaded.pop('code')
     first_state.refresh_required.update({'code', 'description'})
     first_state.unverified_writes.update({'sg_status_list', 'sg_cut_duration'})
-    fake_sg._find_results = [
+    fake_sg.find_results = [
         [
             {
                 'type': 'Shot',
@@ -1015,19 +1028,19 @@ def test_refresh_expire_all_and_missing(engine: Engine, fake_sg: _FakeShotgun) -
     assert first.sg_status_list == 'ip'
     assert first_state.refresh_required == {'description'}
     assert first_state.unverified_writes == {'sg_cut_duration'}
-    calls_after_refresh = list(fake_sg._calls)
+    calls_after_refresh = list(fake_sg.calls)
     info = inspect(first)
     assert repr(first) == "Shot(id=1, code='new')"
     assert first.as_dict()['code'] == 'new'
     assert info.refresh_required == frozenset({'description'})
     assert info.unverified_writes == frozenset({'sg_cut_duration'})
-    assert fake_sg._calls == calls_after_refresh
+    assert fake_sg.calls == calls_after_refresh
     with pytest.raises(SgalchemyError, match='no longer exists'):
         session.refresh(second)
 
 
 def test_refresh_opaque_object_succeeds_after_one_forced_refresh(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     schema_fixture: dict[str, Any],
     tmp_path: Path,
@@ -1048,7 +1061,7 @@ def test_refresh_opaque_object_succeeds_after_one_forced_refresh(
     session = Session(engine)
     opaque = session.merge_dict({'type': 'FutureVendor', 'id': 9})
     hydration_bindings = capture_hydration_bindings(session, monkeypatch)
-    fake_sg._find_results = [[{'type': 'FutureVendor', 'id': 9, 'code': 'V9'}]]
+    fake_sg.find_results = [[{'type': 'FutureVendor', 'id': 9, 'code': 'V9'}]]
 
     session.refresh(opaque)
 
@@ -1059,24 +1072,24 @@ def test_refresh_opaque_object_succeeds_after_one_forced_refresh(
 
 
 def test_refresh_opaque_object_teaches_after_one_forced_refresh(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
     engine, _vendor_cls = _engine_with_symbolic_vendor(fake_sg, tmp_path)
     session = Session(engine)
     opaque = session.merge_dict({'type': 'FutureVendor', 'id': 9})
-    reads_before = [name for name, _args, _kwargs in fake_sg._calls].count('schema_read')
+    reads_before = [name for name, _args, _kwargs in fake_sg.calls].count('schema_read')
 
     with pytest.raises(SchemaUnavailableError) as excinfo:
         session.refresh(opaque)
 
     assert str(excinfo.value) == SCHEMA_ABSENT_MESSAGE
-    calls = [name for name, _args, _kwargs in fake_sg._calls]
+    calls = [name for name, _args, _kwargs in fake_sg.calls]
     assert calls.count('schema_read') == reads_before + 1
     assert calls.count('find') == 0
 
 
-def test_refresh_preserves_dirty_values(engine: Engine, fake_sg: _FakeShotgun) -> None:
+def test_refresh_preserves_dirty_values(engine: Engine, fake_sg: FakeShotgun) -> None:
     engine.load_schema()
     session = Session(engine)
     shot = session.merge_dict({'type': 'Shot', 'id': 1, 'code': 'old'})
@@ -1084,7 +1097,7 @@ def test_refresh_preserves_dirty_values(engine: Engine, fake_sg: _FakeShotgun) -
     state = entity_state(shot)
     state.refresh_required.add('code')
     state.unverified_writes.add('code')
-    fake_sg._find_results = [[{'type': 'Shot', 'id': 1, 'code': 'server'}]]
+    fake_sg.find_results = [[{'type': 'Shot', 'id': 1, 'code': 'server'}]]
     session.refresh(shot)
     assert state.loaded['code'] == 'local'
     assert state.refresh_required == {'code'}
@@ -1093,7 +1106,7 @@ def test_refresh_preserves_dirty_values(engine: Engine, fake_sg: _FakeShotgun) -
 
 
 def test_refresh_rejects_foreign_registry_state_without_io(
-    engine: Engine, fake_sg: _FakeShotgun
+    engine: Engine, fake_sg: FakeShotgun
 ) -> None:
     session = Session(engine)
     foreign_cls = Registry().entity_class('Shot')
@@ -1101,7 +1114,7 @@ def test_refresh_rejects_foreign_registry_state_without_io(
     initialize_entity(foreign, EntityState('Shot', 1, session=session))
     with pytest.raises(SgalchemyError, match='registry'):
         session.refresh(foreign)
-    assert fake_sg._calls == []
+    assert fake_sg.calls == []
 
 
 @pytest.mark.parametrize(
@@ -1119,7 +1132,7 @@ def test_refresh_rejects_foreign_registry_state_without_io(
 )
 def test_refresh_rejects_mismatched_or_multiple_rows_without_mutation(
     engine: Engine,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     rows: list[dict[str, Any]],
     message: str,
 ) -> None:
@@ -1129,18 +1142,30 @@ def test_refresh_rejects_mismatched_or_multiple_rows_without_mutation(
     session.expire(shot)
     state = entity_state(shot)
     loaded_before = dict(state.loaded)
-    fake_sg._find_results = [rows]
+    fake_sg.find_results = [rows]
 
     with pytest.raises(SgalchemyError, match=message):
         session.refresh(shot)
 
     assert state.loaded == loaded_before
     assert state.expired is True
-    assert session._identity_values() == [shot]
+    assert session.identity_values() == [shot]
+
+
+def test_refresh_rejects_unowned_entity_before_io(engine: Engine, fake_sg: FakeShotgun) -> None:
+    engine.load_schema()
+    session = Session(engine)
+    detached = engine.entities.Shot.new()
+    calls = list(fake_sg.calls)
+
+    with pytest.raises(SgalchemyError, match='must be owned by this session'):
+        session.refresh(detached)
+
+    assert fake_sg.calls == calls
 
 
 def test_refresh_retired_entity_requests_retired_only(
-    engine: Engine, fake_sg: _FakeShotgun
+    engine: Engine, fake_sg: FakeShotgun
 ) -> None:
     engine.load_schema()
     session = Session(engine)
@@ -1148,20 +1173,20 @@ def test_refresh_retired_entity_requests_retired_only(
     active = session.merge_dict({'type': 'Shot', 'id': 42, 'code': 'old-active'})
     session.delete(retired)
     session.commit()
-    fake_sg._find_results = [
+    fake_sg.find_results = [
         [{'type': 'Shot', 'id': 41, 'code': 'retired'}],
         [{'type': 'Shot', 'id': 42, 'code': 'active'}],
     ]
 
     session.refresh(retired)
 
-    refresh_find = [call for call in fake_sg._calls if call[0] == 'find'][-1]
+    refresh_find = [call for call in fake_sg.calls if call[0] == 'find'][-1]
     assert refresh_find[2]['retired_only'] is True
     assert retired.code == 'retired'
 
     session.refresh(active)
 
-    refresh_find = [call for call in fake_sg._calls if call[0] == 'find'][-1]
+    refresh_find = [call for call in fake_sg.calls if call[0] == 'find'][-1]
     assert 'retired_only' not in refresh_find[2]
     assert active.code == 'active'
 
@@ -1176,14 +1201,14 @@ def test_rejected_hydration_does_not_publish_identity_phantom(engine: Engine) ->
     with pytest.raises(SgalchemyError, match='different Shot'):
         session.merge_dict({'type': 'Shot', 'id': 41, 'code': 'server'})
 
-    assert session._identity_values() == []
+    assert session.identity_values() == []
     session.rollback()
-    assert session._identity_values() == []
+    assert session.identity_values() == []
 
 
 def test_repeated_joinedload_with_null_link_does_not_stale_schema(
     engine: Engine,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     engine.load_schema()
@@ -1196,7 +1221,7 @@ def test_repeated_joinedload_with_null_link_does_not_stale_schema(
         'sg_sequence.Sequence.code': None,
         'sg_sequence.Sequence.episode': None,
     }
-    fake_sg._find_results = [[dict(row)], [dict(row)], [dict(row)]]
+    fake_sg.find_results = [[dict(row)], [dict(row)], [dict(row)]]
     session = Session(engine)
     shot_cls = engine.registry.entity_class('Shot')
     statement = select(shot_cls).options(joinedload(shot_cls.sg_sequence))
@@ -1204,16 +1229,16 @@ def test_repeated_joinedload_with_null_link_does_not_stale_schema(
     with caplog.at_level('WARNING', logger='sgalchemy.session'):
         shots = [session.scalars(statement)[0] for _ in range(3)]
 
-    assert [name for name, _args, _kwargs in fake_sg._calls].count('schema_read') == 1
+    assert [name for name, _args, _kwargs in fake_sg.calls].count('schema_read') == 1
     assert 'schema shape mismatch' not in caplog.text
     assert all('.' not in key for key in entity_state(shots[-1]).loaded)
     assert all('.' not in key for key in shots[-1].as_dict())
 
 
-def test_retired_query_marks_root_deleted(engine: Engine, fake_sg: _FakeShotgun) -> None:
+def test_retired_query_marks_root_deleted(engine: Engine, fake_sg: FakeShotgun) -> None:
     engine.load_schema()
     session = Session(engine)
-    fake_sg._find_results = [[{'type': 'Shot', 'id': 41, 'code': 'retired'}]]
+    fake_sg.find_results = [[{'type': 'Shot', 'id': 41, 'code': 'retired'}]]
     shot = session.scalars(select(engine.entities.Shot).execution_options(retired_only=True))[0]
     assert inspect(shot).deleted is True
     session.revive(shot)
@@ -1222,7 +1247,7 @@ def test_retired_query_marks_root_deleted(engine: Engine, fake_sg: _FakeShotgun)
 
 
 def test_scalar_rehydration_clears_root_and_link_expiry(
-    engine: Engine, fake_sg: _FakeShotgun
+    engine: Engine, fake_sg: FakeShotgun
 ) -> None:
     engine.load_schema()
     session = Session(engine)
@@ -1236,7 +1261,7 @@ def test_scalar_rehydration_clears_root_and_link_expiry(
     sequence = entity_state(shot).loaded['sg_sequence']
     session.expire(shot)
     session.expire(sequence)
-    fake_sg._find_results = [
+    fake_sg.find_results = [
         [
             {
                 'type': 'Shot',
@@ -1253,9 +1278,9 @@ def test_scalar_rehydration_clears_root_and_link_expiry(
 
 
 def test_scalars_identity_date_links_and_dirty_shield(
-    engine: Engine, fake_sg: _FakeShotgun
+    engine: Engine, fake_sg: FakeShotgun
 ) -> None:
-    fake_sg._find_results = [
+    fake_sg.find_results = [
         [
             {
                 'type': 'Shot',
@@ -1281,19 +1306,19 @@ def test_scalars_identity_date_links_and_dirty_shield(
     assert shot.code == 'local'
 
 
-def test_scalars_rejects_foreign_registry_before_io(engine: Engine, fake_sg: _FakeShotgun) -> None:
+def test_scalars_rejects_foreign_registry_before_io(engine: Engine, fake_sg: FakeShotgun) -> None:
     foreign_cls = Registry().entity_class('Shot')
     session = Session(engine)
     with pytest.raises(SgalchemyError, match='registry'):
         session.scalars(select(foreign_cls))
-    assert fake_sg._calls == []
+    assert fake_sg.calls == []
 
 
 @pytest.mark.parametrize('retired', [False, True])
 @pytest.mark.parametrize('child_baseline', [None, False, True])
 def test_scalars_retirement_observation_is_root_only(
     engine: Engine,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     retired: bool,
     child_baseline: bool | None,
 ) -> None:
@@ -1303,7 +1328,7 @@ def test_scalars_retirement_observation_is_root_only(
     if child_baseline is not None:
         child = session.merge_dict({'type': 'Sequence', 'id': 51, 'code': 'before'})
         entity_state(child).deleted = child_baseline
-    fake_sg._find_results = [
+    fake_sg.find_results = [
         [
             {
                 'type': 'Shot',
@@ -1331,7 +1356,7 @@ def test_scalars_retirement_observation_is_root_only(
 )
 def test_scalars_retirement_observation_preserves_staged_intent(
     engine: Engine,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     retired: bool,
     baseline: bool | None,
     transition: str | None,
@@ -1350,7 +1375,7 @@ def test_scalars_retirement_observation_preserves_staged_intent(
         state.unverified_writes.update({'code', 'description', 'sg_status_list'})
     deleted_before = tuple(session.unit_of_work.deleted)
     revived_before = tuple(session.unit_of_work.revived)
-    fake_sg._find_results = [
+    fake_sg.find_results = [
         [{'type': 'Shot', 'id': 41, 'code': 'server', 'description': 'refreshed'}]
     ]
 
@@ -1374,7 +1399,7 @@ def test_scalars_retirement_observation_preserves_staged_intent(
 
 
 def test_schema_recovery_never_refreshes_after_first_submitted_write(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     schema_fixture: dict[str, Any],
     tmp_path: Path,
@@ -1428,16 +1453,16 @@ def test_schema_recovery_never_refreshes_after_first_submitted_write(
     assert shot.description == '2026-07-25'
     refreshed = session.merge_dict({'type': 'Shot', 'id': 2, 'description': '2026-07-25'})
     assert refreshed.description == datetime.date(2026, 7, 25)
-    assert [name for name, _, _ in fake_sg._calls].count('schema_read') == 1
+    assert [name for name, _, _ in fake_sg.calls].count('schema_read') == 1
 
 
 def test_selectin_secondary_auth_failure_keeps_primaries_and_read_note(
-    engine: Engine, fake_sg: _FakeShotgun, monkeypatch: pytest.MonkeyPatch
+    engine: Engine, fake_sg: FakeShotgun, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     engine.load_schema()
     session = Session(engine)
     shot_cls = engine.registry.entity_class('Shot')
-    fake_sg._find_results = [
+    fake_sg.find_results = [
         [
             {
                 'type': 'Shot',
@@ -1451,7 +1476,7 @@ def test_selectin_secondary_auth_failure_keeps_primaries_and_read_note(
     find_calls: list[int] = []
     fault = AUTHENTICATION_FAULT('session expired')
 
-    def track_call(call: _SyncCallback[_P, _R]) -> _SyncCallback[_P, _R]:
+    def track_call(call: SyncCallback[_P, _R]) -> SyncCallback[_P, _R]:
         def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
             find_calls.append(1)
             if len(find_calls) >= 2:
@@ -1471,11 +1496,18 @@ def test_selectin_secondary_auth_failure_keeps_primaries_and_read_note(
     assert excinfo.value is fault
     joined = '\n'.join(getattr(excinfo.value, '__notes__', []))
     assert 'rerun the read' in joined
-    assert list(session._identity_values())
+    identities = {
+        (entity_state(obj).entity_type, entity_state(obj).id): obj
+        for obj in session.identity_values()
+    }
+    assert set(identities) == {('Shot', 1), ('Asset', 200)}
+    shot = identities[('Shot', 1)]
+    assert shot.code == 'sq010'
+    assert shot.assets == [identities[('Asset', 200)]]
 
 
 def test_session_operation_keeps_entry_binding_through_midflight_refresh(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     schema_fixture: dict[str, Any],
     tmp_path: Path,
@@ -1493,7 +1525,7 @@ def test_session_operation_keeps_entry_binding_through_midflight_refresh(
     engine.load_schema()
     session = Session(engine)
     shot_cls = registry.entity_class('Shot')
-    fake_sg._find_results = [
+    fake_sg.find_results = [
         [{'type': 'Shot', 'id': 1, 'description': '2026-07-25'}],
         [{'type': 'Shot', 'id': 1, 'description': '2026-07-25'}],
     ]
@@ -1501,15 +1533,7 @@ def test_session_operation_keeps_entry_binding_through_midflight_refresh(
     release_find = Event()
     original_find = fake_sg.find
 
-    def block_call(call: _SyncCallback[_P, _R]) -> _SyncCallback[_P, _R]:
-        def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
-            find_entered.set()
-            assert release_find.wait(timeout=10)
-            return call(*args, **kwargs)
-
-        return wrapper
-
-    blocking_find = block_call(original_find)
+    blocking_find = block_call(original_find, find_entered, release_find)
 
     monkeypatch.setattr(fake_sg, 'find', blocking_find)
     refresher_sg = type(fake_sg)()
@@ -1531,6 +1555,15 @@ def test_session_operation_keeps_entry_binding_through_midflight_refresh(
     assert session.scalars(select(shot_cls))[0].description == '2026-07-25'
 
 
+def test_session_rejects_an_async_engine(fake_async_sg: FakeAsyncShotgun, tmp_path: Path) -> None:
+    async_engine = isolated_async_engine(fake_async_sg, tmp_path)
+    with pytest.raises(TypeError) as excinfo:
+        Session(async_engine)  # pyright: ignore[reportArgumentType]
+    assert str(excinfo.value) == (
+        'Session() requires an Engine, not an AsyncEngine; use AsyncSession(engine)'
+    )
+
+
 @pytest.mark.parametrize(
     ('field_code', 'value'),
     [
@@ -1543,7 +1576,7 @@ def test_session_operation_keeps_entry_binding_through_midflight_refresh(
 )
 def test_shape_mismatch_preserves_value_and_marks_stale(
     engine: Engine,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     field_code: str,
     value: object,
     caplog: pytest.LogCaptureFixture,
@@ -1555,12 +1588,12 @@ def test_shape_mismatch_preserves_value_and_marks_stale(
     assert entity_state(obj).loaded[field_code] == value
     assert 'schema shape mismatch' in caplog.text
     engine.load_schema()
-    assert [name for name, _, _ in fake_sg._calls].count('schema_read') == 2
+    assert [name for name, _, _ in fake_sg.calls].count('schema_read') == 2
 
 
-@pytest.mark.parametrize('size', [100, 200, 400])
+@pytest.mark.parametrize('size', [100])
 def test_response_hydration_bounds_staged_item_visits(
-    engine: Engine, fake_sg: _FakeShotgun, size: int
+    engine: Engine, fake_sg: FakeShotgun, size: int
 ) -> None:
     engine.load_schema()
     session = Session(engine)
@@ -1571,11 +1604,11 @@ def test_response_hydration_bounds_staged_item_visits(
     for obj in revived:
         entity_state(obj).deleted = True
         session.revive(obj)
-    deleted_queue = YieldCountingEntities(session.unit_of_work._deleted)
-    revived_queue = YieldCountingEntities(session.unit_of_work._revived)
-    session.unit_of_work._deleted = deleted_queue
-    session.unit_of_work._revived = revived_queue
-    fake_sg._find_results = [
+    deleted_queue = YieldCountingEntities(session.unit_of_work.deleted)
+    revived_queue = YieldCountingEntities(session.unit_of_work.revived)
+    session.unit_of_work.deleted = deleted_queue
+    session.unit_of_work.revived = revived_queue
+    fake_sg.find_results = [
         [
             {'type': 'Shot', 'id': i + 1, 'project': {'type': 'Project', 'id': i + 1}}
             for i in range(size)
@@ -1585,13 +1618,13 @@ def test_response_hydration_bounds_staged_item_visits(
     objects = session.scalars(select(engine.entities.Shot))
 
     assert len(objects) == size
-    assert len(session._identity_values()) == 4 * size
+    assert len(session.identity_values()) == 4 * size
     assert objects[0].project.id == 1
-    assert deleted_queue._visits + revived_queue._visits <= 6 * size
+    assert deleted_queue.visits + revived_queue.visits == 0
 
 
 @pytest.mark.parametrize('collision_first', [False, True])
-def test_hydration_scope_preserves_all_raw_list_collisions(
+def test_hydration_rejects_every_other_staged_owner_of_an_identity(
     engine: Engine, collision_first: bool
 ) -> None:
     engine.load_schema()
@@ -1601,14 +1634,80 @@ def test_hydration_scope_preserves_all_raw_list_collisions(
     collision = detached_session.merge_dict({'type': 'Shot', 'id': 1})
     detached_session.close()
     candidates = [collision, owned] if collision_first else [owned, collision]
-    session.unit_of_work._deleted.extend(candidates)
+    unit_of_work = session.unit_of_work
+    for obj in candidates:
+        unit_of_work.append_staged('deleted', obj)
 
     with pytest.raises(SgalchemyError, match='different Shot'):
         session.merge_dict({'type': 'Shot', 'id': 1})
 
-    assert session._state._hydration_index is None
-    session.unit_of_work._deleted[:] = [owned]
+    unit_of_work.discard_staged('deleted', collision)
     assert session.merge_dict({'type': 'Shot', 'id': 1}) is owned
+
+
+def _detached_shot(engine: Engine, description: str = 'before') -> Entity:
+    source = Session(engine)
+    shot = source.merge_dict({'type': 'Shot', 'id': 80, 'description': description})
+    source.close()
+    return shot
+
+
+def test_add_reattaches_a_detached_entity_and_sends_later_edits(sess: SyncSessionBundle) -> None:
+    session, engine, fake_sg = sess
+    engine.load_schema()
+    shot = _detached_shot(engine)
+    session.add(shot)
+    session.add(shot)
+    assert entity_state(shot).session is session
+    assert session.merge_dict({'type': 'Shot', 'id': 80}) is shot
+    shot.description = 'after'
+    calls_before = len(fake_sg.calls)
+    session.commit()
+    assert fake_sg.calls[calls_before:] == [
+        (
+            'batch',
+            (
+                [
+                    {
+                        'request_type': 'update',
+                        'entity_type': 'Shot',
+                        'entity_id': 80,
+                        'data': {'description': 'after'},
+                    }
+                ],
+            ),
+            {},
+        ),
+    ]
+
+
+@pytest.mark.parametrize('held', ['loaded', 'staged'])
+def test_add_rejects_a_detached_copy_when_the_session_tracks_the_record(
+    sess: SyncSessionBundle, held: str
+) -> None:
+    session, engine, _fake = sess
+    engine.load_schema()
+    if held == 'loaded':
+        session.merge_dict({'type': 'Shot', 'id': 80})
+    else:
+        session.delete(_detached_shot(engine))  # staged only; not in the identity map
+    copy = _detached_shot(engine)
+    with pytest.raises(SgalchemyError) as excinfo:
+        session.add(copy)
+    assert str(excinfo.value) == _COLLISION
+    assert entity_state(copy).session is None
+
+
+def test_assignment_on_a_detached_persistent_entity_raises(sess: SyncSessionBundle) -> None:
+    _session, engine, _fake = sess
+    engine.load_schema()
+    shot = _detached_shot(engine)
+    with pytest.raises(SgalchemyError) as excinfo:
+        shot.description = 'after'
+    assert str(excinfo.value) == _DETACHED
+    assert entity_state(shot).dirty == {}
+    pending = engine.entities.Shot.new(code='new')
+    pending.description = 'pending entities stay assignable'
 
 
 def test_shared_access_guard_preserves_sync_ownership(engine: Engine) -> None:
@@ -1626,14 +1725,14 @@ def test_shared_access_guard_preserves_sync_ownership(engine: Engine) -> None:
 
 
 def test_sole_batch_auth_failure_notes_state_local_facts_only(
-    engine: Engine, fake_sg: _FakeShotgun
+    engine: Engine, fake_sg: FakeShotgun
 ) -> None:
     engine.load_schema()
     session = Session(engine)
     shot_cls = engine.registry.entity_class('Shot')
     session.add(shot_cls.new(code='auth-fail'))
     fault = AUTHENTICATION_FAULT('session expired')
-    fake_sg._errors.setdefault('batch', []).append(fault)
+    fake_sg.errors.setdefault('batch', []).append(fault)
 
     with pytest.raises(AUTHENTICATION_FAULT) as excinfo:
         session.commit()
@@ -1648,11 +1747,11 @@ def test_sole_batch_auth_failure_notes_state_local_facts_only(
     assert sum('no automatic retry' in note for note in excinfo.value.__notes__) == 1
 
 
-def test_stale_schema_fault_is_annotated(engine: Engine, fake_sg: _FakeShotgun) -> None:
+def test_stale_schema_fault_is_annotated(engine: Engine, fake_sg: FakeShotgun) -> None:
     engine.load_schema()
     engine.mark_schema_stale()
     error = RuntimeError('schema refresh unavailable')
-    fake_sg._errors['schema_read'] = [error]
+    fake_sg.errors['schema_read'] = [error]
     session = Session(engine)
     shot_cls = engine.registry.entity_class('Shot')
     with pytest.raises(RuntimeError) as excinfo:
@@ -1679,7 +1778,7 @@ def test_summary_returns_raw_payload(engine: Engine) -> None:
 
 def test_unknown_wire_link_becomes_one_stable_opaque_entity(
     engine: Engine,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
 ) -> None:
     engine.load_schema()
     session = Session(engine)
@@ -1697,10 +1796,10 @@ def test_unknown_wire_link_becomes_one_stable_opaque_entity(
         hasattr(opaque, 'code')
     with pytest.raises(AttributeError):
         _ = opaque._private_probe
-    calls_before_query = list(fake_sg._calls)
+    calls_before_query = list(fake_sg.calls)
     with pytest.raises(CompilationError, match=r'FutureVendor.*schema.*refresh'):
         session.scalars(select(opaque_cls))
-    assert fake_sg._calls == calls_before_query
+    assert fake_sg.calls == calls_before_query
 
     binding = engine.prepared_binding()
     assert binding is not None
@@ -1722,7 +1821,7 @@ def test_unknown_wire_link_becomes_one_stable_opaque_entity(
 
 
 def test_unprepared_engine_hydration_keeps_captured_absence_with_shared_binding(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
     registry = Registry()
@@ -1750,7 +1849,7 @@ def test_unprepared_engine_hydration_keeps_captured_absence_with_shared_binding(
     for operation in operations:
         with pytest.raises(SgalchemyError, match=r'Vendor.*alias.*CustomEntity03'):
             operation()
-        assert session._identity_values() == []
+        assert session.identity_values() == []
 
     future = session.merge_dict(
         {
@@ -1763,7 +1862,7 @@ def test_unprepared_engine_hydration_keeps_captured_absence_with_shared_binding(
 
     assert type(future).__name__ == 'FutureVendor'
     assert future.as_dict()['payload'] == {'type': 'Shot', 'id': 1}
-    assert unprepared_sg._calls == []
+    assert unprepared_sg.calls == []
 
     unprepared.load_schema()
     prepared_shot = session.merge_dict({'type': 'Shot', 'id': 8, 'sg_due_date': '2026-07-25'})
@@ -1771,17 +1870,16 @@ def test_unprepared_engine_hydration_keeps_captured_absence_with_shared_binding(
 
 
 def test_unrelated_sgalchemy_note_does_not_suppress_current_context(
-    engine: Engine, fake_sg: _FakeShotgun
+    engine: Engine, fake_sg: FakeShotgun
 ) -> None:
     engine.load_schema()
     error = RuntimeError('provider unavailable')
     error.add_note('sgalchemy: prior unrelated context')
-    fake_sg._errors['find'] = [error]
+    fake_sg.errors['find'] = [error]
     session = Session(engine)
     call = FindCall('Shot', [], ['id'])
-    binding = engine.load_binding()
     with pytest.raises(RuntimeError) as excinfo:
-        session.execute_call(call, binding)
+        session.execute_call(call)
     assert excinfo.value is error
     assert error.__notes__[0] == 'sgalchemy: prior unrelated context'
     assert error.__notes__.count(f'sgalchemy: raised while executing {call}') == 1

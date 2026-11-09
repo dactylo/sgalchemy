@@ -7,25 +7,18 @@ import inspect
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
+from itertools import repeat
 from pathlib import Path
 from threading import Event
 from typing import Any, Never, ParamSpec, TypeVar, cast
 from weakref import ReferenceType, ref
 
 import pytest
-from _fakes import _FakeShotgun
-from _support import (
-    _SyncCallback,
-    _SyncExecutionEnvironment,
-    _SyncSessionFactory,
-    assert_disjoint_commit_outcome,
-    entity_namespace_scope,
-    reset_default_registry_state,
-)
 
 import sgalchemy
 from sgalchemy._core import _registry
 from sgalchemy._core._engine import Engine
+from sgalchemy._core._engine_common import AUTH_RECOVERY_NOTE
 from sgalchemy._core._registry import (
     Entity,
     Registry,
@@ -37,6 +30,22 @@ from sgalchemy._orm import _scoping, _session, _uow
 from sgalchemy._orm._scoping import _ConnectOptions
 from sgalchemy._orm._session import Session
 from sgalchemy._shotgun import ShotgunLike
+from tests._fakes import FakeAsyncShotgun, FakeShotgun
+from tests._support import (
+    AUTHENTICATION_FAULT,
+    SAVED_BATCH_NOTE,
+    STAGED_RETRY_NOTE,
+    UNFINISHED_BATCH_NOTE,
+    SyncCallback,
+    SyncExecutionEnvironment,
+    SyncSessionFactory,
+    assert_disjoint_commit_outcome,
+    block_call,
+    entity_namespace_scope,
+    inject_faults,
+    isolated_async_engine,
+    reset_default_registry_state,
+)
 
 _P = ParamSpec('_P')
 _R = TypeVar('_R')
@@ -57,22 +66,8 @@ _SCOPED_SESSION_METHODS = (
 )
 
 
-def _block_call(
-    call: _SyncCallback[_P, _R],
-    entered: Event,
-    release: Event,
-) -> _SyncCallback[_P, _R]:
-
-    def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
-        entered.set()
-        assert release.wait(timeout=10)
-        return call(*args, **kwargs)
-
-    return wrapper
-
-
 def _connect(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
     *,
     force: bool = False,
@@ -87,7 +82,7 @@ def _connect(
 
 
 def _execution_error_body(
-    environment: _SyncExecutionEnvironment,
+    environment: SyncExecutionEnvironment,
     monkeypatch: pytest.MonkeyPatch,
     route: str,
     error: CommitError,
@@ -100,7 +95,7 @@ def _execution_error_body(
         def fail_second_batch(requests: list[dict[str, Any]]) -> list[Any]:
             nonlocal calls
             if calls == 1:
-                fake_sg._errors['batch'] = [error]
+                fake_sg.errors['batch'] = [error]
             calls += 1
             return original_batch(requests)
 
@@ -114,7 +109,7 @@ def _execution_error_body(
 
         return stage_batch
     if route == 'revive':
-        fake_sg._errors['revive'] = [error]
+        fake_sg.errors['revive'] = [error]
 
         def stage_revive(session: sgalchemy.Session) -> None:
             shot = session.merge_dict({'type': 'Shot', 'id': 37, 'image': 'old'})
@@ -124,7 +119,7 @@ def _execution_error_body(
         return stage_revive
     upload_path = tmp_path / 'existing-commit-error.jpg'
     upload_path.write_bytes(b'image')
-    fake_sg._errors['upload_thumbnail'] = [error]
+    fake_sg.errors['upload_thumbnail'] = [error]
 
     def stage_upload(session: sgalchemy.Session) -> None:
         shot = session.merge_dict({'type': 'Shot', 'id': 37, 'image': 'old'})
@@ -134,9 +129,9 @@ def _execution_error_body(
 
 
 def _make_factory(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
-) -> tuple[Engine, _SyncSessionFactory]:
+) -> tuple[Engine, SyncSessionFactory]:
     engine = sgalchemy.create_engine(
         connection=fake_sg,
         cache_root=tmp_path,
@@ -157,7 +152,7 @@ def _replacement_schema(schema_fixture: dict[str, Any]) -> dict[str, Any]:
 
 
 def _run_commit_on_success(
-    factory: _SyncSessionFactory,
+    factory: SyncSessionFactory,
     body: Callable[[Session], None],
 ) -> None:
     with factory.commit_on_success() as session:
@@ -165,7 +160,7 @@ def _run_commit_on_success(
 
 
 def _run_direct_commit(
-    factory: _SyncSessionFactory,
+    factory: SyncSessionFactory,
     body: Callable[[Session], None],
 ) -> None:
     session = factory()
@@ -177,7 +172,7 @@ def _run_direct_commit(
 
 
 def _use_replacement_schema(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     schema_fixture: dict[str, Any],
 ) -> None:
@@ -202,7 +197,7 @@ def clean_default(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
 
 def test_admission_base_exception_after_reservation_rolls_back(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
     def interrupted_selection(
@@ -220,13 +215,13 @@ def test_admission_base_exception_after_reservation_rolls_back(
         with pytest.raises(KeyboardInterrupt):
             sgalchemy.connect(connection=fake_sg, cache_root=tmp_path)
 
-    assert vars(_registry)['_DEFAULT_TRANSITION']['reserved'] is False
+    assert not vars(_registry)['_DEFAULT_TRANSITION_OWNER']
     retry = sgalchemy.connect(connection=fake_sg, cache_root=tmp_path)
     assert retry is _scoping._default_session()
 
 
 def test_admission_interruption_after_reservation_mutation_recovers_and_retries(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
     original_reserve = _scoping.reserve_default_registry_transition
@@ -244,34 +239,40 @@ def test_admission_interruption_after_reservation_mutation_recovers_and_retries(
         with pytest.raises(KeyboardInterrupt):
             sgalchemy.connect(connection=fake_sg, cache_root=tmp_path)
 
-    assert vars(_registry)['_DEFAULT_TRANSITION']['reserved'] is False
+    assert not vars(_registry)['_DEFAULT_TRANSITION_OWNER']
     retry = sgalchemy.connect(connection=fake_sg, cache_root=tmp_path)
     assert retry is _scoping._default_session()
 
 
 def test_admission_interruption_during_reservation_mutation_recovers_and_retries(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    class InterruptingTransition(dict[str, object]):
+    class InterruptingTransition:
         def __init__(self) -> None:
-            super().__init__(reserved=False)
+            self._owners: list[object] = []
             self._interrupt = True
 
-        def __setitem__(self, key: str, value: object) -> None:
-            super().__setitem__(key, value)
-            if self._interrupt and key == 'reserved' and value is True:
+        def __bool__(self) -> bool:
+            return bool(self._owners)
+
+        def __getitem__(self, index: int) -> object:
+            return self._owners[index]
+
+        def __setitem__(self, index: slice, owners: list[object]) -> None:
+            self._owners[index] = owners
+            if self._interrupt and owners:
                 raise KeyboardInterrupt
 
     transition = InterruptingTransition()
-    monkeypatch.setattr(_registry, '_DEFAULT_TRANSITION', transition)
+    monkeypatch.setattr(_registry, '_DEFAULT_TRANSITION_OWNER', transition)
 
     with pytest.raises(KeyboardInterrupt):
         sgalchemy.connect(connection=fake_sg, cache_root=tmp_path)
 
-    assert vars(_registry)['_DEFAULT_TRANSITION']['reserved'] is False
-    assert transition['reserved'] is False
+    assert not vars(_registry)['_DEFAULT_TRANSITION_OWNER']
+    assert not transition
     transition._interrupt = False
     retry = sgalchemy.connect(connection=fake_sg, cache_root=tmp_path)
     assert retry is _scoping._default_session()
@@ -280,7 +281,7 @@ def test_admission_interruption_during_reservation_mutation_recovers_and_retries
 @pytest.mark.parametrize('route', ['multi_batch', 'revive', 'upload'])
 @pytest.mark.parametrize('through_factory', [False, True], ids=['direct', 'factory'])
 def test_commit_error_from_execution_passes_through_unchanged(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     route: str,
@@ -320,13 +321,13 @@ def test_commit_error_from_execution_passes_through_unchanged(
         expected_notes += (_scoping._COMMIT_FAILURE_CLOSE_NOTE,)
     assert tuple(existing.__notes__) == expected_notes
     if route == 'upload':
-        names = [name for name, _args, _kwargs in fake_sg._calls]
+        names = [name for name, _args, _kwargs in fake_sg.calls]
         assert names.count('upload_thumbnail') == 1
         assert 'find' not in names
 
 
 def test_commit_failure_after_same_site_refresh_preserves_transition_state(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     schema_fixture: dict[str, Any],
     tmp_path: Path,
@@ -346,7 +347,7 @@ def test_commit_failure_after_same_site_refresh_preserves_transition_state(
         default_bound: bool,
         publish: Callable[[], None],
     ) -> None:
-        _registry.release_default_registry_transition(_registry._DEFAULT_TRANSITION['owner'])
+        _registry.release_default_registry_transition(_registry._DEFAULT_TRANSITION_OWNER[0])
         original_commit(
             target,
             default_bound=default_bound,
@@ -396,7 +397,7 @@ def test_commit_failure_after_same_site_refresh_preserves_transition_state(
 
 
 def test_commit_failure_releases_transition_and_retry_succeeds(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -428,10 +429,45 @@ def test_commit_failure_releases_transition_and_retry_succeeds(
     assert retry.engine.registry is current
 
 
+def test_commit_on_success_auth_failure_keeps_only_the_engine_note_on_the_cause(
+    fake_sg: FakeShotgun,
+    tmp_path: Path,
+) -> None:
+    engine, factory = _make_factory(fake_sg, tmp_path)
+    fault = AUTHENTICATION_FAULT('expired')
+    fake_sg.errors['batch'] = [fault]
+    pending = engine.entities.Shot.new(code='unsent')
+
+    with pytest.raises(CommitError) as excinfo:
+        _run_commit_on_success(factory, lambda session: session.add(pending))
+
+    error = excinfo.value
+    assert error.__cause__ is fault
+    assert error.__notes__ == [
+        STAGED_RETRY_NOTE,
+        'sgalchemy: failed during batch wave 1 chunk 1',
+        _uow._BATCH_OUTCOME_UNKNOWN_NOTE,
+        AUTH_RECOVERY_NOTE,
+        _scoping._COMMIT_FAILURE_CLOSE_NOTE,
+    ]
+    assert getattr(fault, '__notes__', []) == [AUTH_RECOVERY_NOTE]
+    assert error.committed == []
+    assert len(error.staged) == 1
+    staged = error.staged[0]
+    assert isinstance(staged, _uow._Op)
+    assert staged.obj is pending
+    assert error.indeterminate == []
+    assert error.withdrawn == []
+    assert_disjoint_commit_outcome(error)
+    assert [name for name, _args, _kwargs in fake_sg.calls].count('batch') == 1
+    assert entity_state(pending).session is None
+    assert not entity_state(pending).dirty
+
+
 @pytest.mark.parametrize('exception_type', [RuntimeError, KeyboardInterrupt])
 def test_commit_on_success_body_failure_skips_commit_and_stays_primary(
     exception_type: type[BaseException],
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
     engine, factory = _make_factory(fake_sg, tmp_path)
@@ -454,14 +490,14 @@ def test_commit_on_success_body_failure_skips_commit_and_stays_primary(
             _run_commit_on_success(factory, fail_body)
 
     assert excinfo.value is fault
-    assert [name for name, _args, _kwargs in fake_sg._calls].count('batch') == 0
+    assert [name for name, _args, _kwargs in fake_sg.calls].count('batch') == 0
     assert len(close_calls) == 1
     assert entity_state(pending).session is None
     assert not entity_state(pending).dirty
 
 
 def test_commit_on_success_body_failure_stays_primary_when_close_fails(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -490,12 +526,15 @@ def test_commit_on_success_body_failure_stays_primary_when_close_fails(
     assert excinfo.value is body_fault
     assert close_calls == 1
     assert entity_state(pending).session is None
-    assert [name for name, _args, _kwargs in fake_sg._calls].count('batch') == 0
+    assert [name for name, _args, _kwargs in fake_sg.calls].count('batch') == 0
     assert any('close failed' in note for note in body_fault.__notes__)
+    assert _scoping._CLOSE_UNFINISHED_NOTE in body_fault.__notes__
+    assert not any('explicitly restage' in note for note in body_fault.__notes__)
+    assert _scoping._COMMIT_FAILURE_CLOSE_NOTE not in body_fault.__notes__
 
 
 def test_commit_on_success_close_failure_propagates_inside_outer_except(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -521,16 +560,98 @@ def test_commit_on_success_close_failure_propagates_inside_outer_except(
         close_inside_outer_except()
 
     assert getattr(outer, '__notes__', []) == []
-    assert [name for name, _args, _kwargs in fake_sg._calls].count('batch') == 1
+    assert [name for name, _args, _kwargs in fake_sg.calls].count('batch') == 1
+
+
+def test_commit_on_success_close_interruption_keeps_primary_as_context(
+    fake_sg: FakeShotgun,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    engine, factory = _make_factory(fake_sg, tmp_path)
+    monkeypatch.setattr(
+        _uow,
+        '_install_accepted_identities',
+        inject_faults(_uow._install_accepted_identities, repeat(RuntimeError('persistent'))),
+    )
+    monkeypatch.setattr(
+        _uow,
+        '_mark_outdated',
+        inject_faults(_uow._mark_outdated, [KeyboardInterrupt('release')]),
+    )
+    created = [engine.entities.Sequence.new(code=f'created-{index}') for index in range(2)]
+
+    def stage(session: Session) -> None:
+        for obj in created:
+            session.add(obj)
+
+    with pytest.raises(KeyboardInterrupt) as excinfo:
+        _run_commit_on_success(factory, stage)
+
+    assert isinstance(excinfo.value.__context__, CommitError)
+    assert (
+        'sgalchemy: close() did not finish; call rollback() or close() on this session '
+        'again before using it'
+    ) in excinfo.value.__notes__
+
+
+def test_commit_on_success_closes_after_unfinished_saved_batch(
+    fake_sg: FakeShotgun,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    engine, factory = _make_factory(fake_sg, tmp_path)
+    monkeypatch.setattr(
+        _uow,
+        '_install_accepted_identities',
+        inject_faults(_uow._install_accepted_identities, repeat(RuntimeError('persistent'))),
+    )
+    created = [engine.entities.Sequence.new(code=f'created-{index}') for index in range(2)]
+    captured_session: Session | None = None
+
+    def stage(session: Session) -> None:
+        nonlocal captured_session
+        captured_session = session
+        for obj in created:
+            session.add(obj)
+
+    with pytest.raises(CommitError) as excinfo:
+        _run_commit_on_success(factory, stage)
+
+    error = excinfo.value
+    assert error.__notes__.index(SAVED_BATCH_NOTE) < error.__notes__.index(UNFINISHED_BATCH_NOTE)
+    assert error.__notes__.index(UNFINISHED_BATCH_NOTE) < error.__notes__.index(
+        _scoping._COMMIT_FAILURE_CLOSE_NOTE
+    )
+    assert all(repr(obj).endswith(', outdated)') for obj in created)
+    assert captured_session is not None
+    with pytest.raises(SgalchemyError, match='is outdated: SG saved your change'):
+        Session(engine).add(created[0])
+    with pytest.raises(SgalchemyError, match='is outdated: SG saved your change'):
+        captured_session.refresh(created[1])
+    for obj in created:
+        with pytest.raises(SgalchemyError, match='is outdated: SG saved your change'):
+            _ = obj.code
+        with pytest.raises(SgalchemyError, match='is outdated: SG saved your change'):
+            captured_session.delete(obj)
+        with pytest.raises(SgalchemyError, match='is outdated: SG saved your change'):
+            captured_session.revive(obj)
+        entity_id = entity_state(obj).id
+        assert entity_id is not None
+        fake_sg.find_results = [[{'type': 'Sequence', 'id': entity_id, 'code': 'server'}]]
+        fresh = captured_session.get(type(obj), entity_id)
+        assert fresh is not obj
+        assert fresh is not None
+        assert fresh.code == 'server'
 
 
 def test_commit_on_success_commit_base_exception_stays_raw_and_closes(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
     engine, factory = _make_factory(fake_sg, tmp_path)
     fault = SystemExit('commit interrupted')
-    fake_sg._errors['batch'] = [fault]
+    fake_sg.errors['batch'] = [fault]
     pending = engine.entities.Shot.new(code='interrupted')
 
     with pytest.raises(SystemExit) as excinfo:
@@ -538,21 +659,30 @@ def test_commit_on_success_commit_base_exception_stays_raw_and_closes(
 
     assert excinfo.value is fault
     assert excinfo.value.__cause__ is None
-    assert [name for name, _args, _kwargs in fake_sg._calls].count('batch') == 1
+    assert [name for name, _args, _kwargs in fake_sg.calls].count('batch') == 1
     assert entity_state(pending).session is None
     assert entity_state(pending).indeterminate
     assert any('explicitly restage' in note for note in fault.__notes__)
 
 
+@pytest.mark.parametrize('broken_message', [False, True])
 def test_commit_on_success_commit_failure_stays_primary_when_close_fails(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    broken_message: bool,
 ) -> None:
     engine, factory = _make_factory(fake_sg, tmp_path)
     commit_fault = RuntimeError('commit failed')
-    close_fault = RuntimeError('close failed')
-    fake_sg._errors['batch'] = [commit_fault]
+
+    class CloseError(RuntimeError):
+        def __str__(self) -> str:
+            if broken_message:
+                raise ValueError('cannot format close failure')
+            return super().__str__()
+
+    close_fault = CloseError('close failed')
+    fake_sg.errors['batch'] = [commit_fault]
     original_close = sgalchemy.Session.close
     close_calls = 0
 
@@ -572,12 +702,14 @@ def test_commit_on_success_commit_failure_stays_primary_when_close_fails(
     assert error.__cause__ is commit_fault
     assert close_calls == 1
     assert entity_state(pending).session is None
-    assert [name for name, _args, _kwargs in fake_sg._calls].count('batch') == 1
-    assert any('explicitly restage' in note for note in error.__notes__)
-    assert any('close failed' in note for note in error.__notes__)
+    assert [name for name, _args, _kwargs in fake_sg.calls].count('batch') == 1
+    assert _scoping._CLOSE_UNFINISHED_RESTAGE_NOTE in error.__notes__
+    assert _scoping._COMMIT_FAILURE_CLOSE_NOTE not in error.__notes__
+    expected_detail = 'details unavailable' if broken_message else 'CloseError: close failed'
+    assert any(expected_detail in note for note in error.__notes__)
 
 
-def test_commit_on_success_commits_once_and_closes(fake_sg: _FakeShotgun, tmp_path: Path) -> None:
+def test_commit_on_success_commits_once_and_closes(fake_sg: FakeShotgun, tmp_path: Path) -> None:
     engine, factory = _make_factory(fake_sg, tmp_path)
     close_calls: list[sgalchemy.Session] = []
     original_close = sgalchemy.Session.close
@@ -594,12 +726,12 @@ def test_commit_on_success_commits_once_and_closes(fake_sg: _FakeShotgun, tmp_pa
 
     assert pending.id is not None
     assert entity_state(pending).session is None
-    assert [name for name, _args, _kwargs in fake_sg._calls].count('batch') == 1
+    assert [name for name, _args, _kwargs in fake_sg.calls].count('batch') == 1
     assert close_calls == [session]
 
 
 def test_commit_on_success_does_not_claim_to_undo_inner_commit(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
     engine, factory = _make_factory(fake_sg, tmp_path)
@@ -617,12 +749,12 @@ def test_commit_on_success_does_not_claim_to_undo_inner_commit(
     assert excinfo.value is fault
     assert pending.id is not None
     assert entity_state(pending).session is None
-    assert [name for name, _args, _kwargs in fake_sg._calls].count('batch') == 1
+    assert [name for name, _args, _kwargs in fake_sg.calls].count('batch') == 1
     assert not any('rollback' in note.lower() for note in getattr(fault, '__notes__', ()))
 
 
 def test_commit_on_success_keeps_multi_step_failure_partitions(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -634,7 +766,7 @@ def test_commit_on_success_keeps_multi_step_failure_partitions(
     def fail_second_batch(requests: list[dict[str, Any]]) -> list[Any]:
         nonlocal calls
         if calls == 1:
-            fake_sg._errors['batch'] = [fault]
+            fake_sg.errors['batch'] = [fault]
         calls += 1
         return original_batch(requests)
 
@@ -668,7 +800,7 @@ def test_commit_on_success_keeps_multi_step_failure_partitions(
 
 
 def test_commit_on_success_preserves_existing_commit_error(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -684,7 +816,7 @@ def test_commit_on_success_preserves_existing_commit_error(
         attempts += 1
         raise existing
 
-    monkeypatch.setattr(sgalchemy.Session, '_plan_commit', fail_plan)
+    monkeypatch.setattr(sgalchemy.Session, 'plan_commit', fail_plan)
 
     with pytest.raises(CommitError) as excinfo:
         _run_commit_on_success(factory, lambda session: session.add(pending))
@@ -701,7 +833,7 @@ def test_commit_on_success_preserves_existing_commit_error(
 
 
 def test_commit_on_success_propagates_close_failure_when_it_is_sole_failure(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -726,11 +858,44 @@ def test_commit_on_success_propagates_close_failure_when_it_is_sole_failure(
     assert close_calls == 1
     assert pending.id is not None
     assert entity_state(pending).session is None
-    assert [name for name, _args, _kwargs in fake_sg._calls].count('batch') == 1
+    assert [name for name, _args, _kwargs in fake_sg.calls].count('batch') == 1
+    assert _scoping._CLOSE_UNFINISHED_NOTE not in getattr(fault, '__notes__', ())
+    assert _scoping._CLOSE_UNFINISHED_RESTAGE_NOTE not in getattr(fault, '__notes__', ())
+
+
+def test_commit_on_success_reports_unfinished_close(
+    fake_sg: FakeShotgun,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    engine, factory = _make_factory(fake_sg, tmp_path)
+    monkeypatch.setattr(
+        _uow,
+        '_install_accepted_identities',
+        inject_faults(_uow._install_accepted_identities, repeat(RuntimeError('persistent'))),
+    )
+    monkeypatch.setattr(
+        _uow,
+        '_mark_outdated',
+        inject_faults(_uow._mark_outdated, [RuntimeError('release failed')]),
+    )
+    created = [engine.entities.Sequence.new(code=f'created-{index}') for index in range(2)]
+
+    def stage(session: Session) -> None:
+        for obj in created:
+            session.add(obj)
+
+    with pytest.raises(CommitError) as excinfo:
+        _run_commit_on_success(factory, stage)
+
+    notes = excinfo.value.__notes__
+    assert 'sgalchemy: Session.close() also failed: RuntimeError: release failed' in notes
+    assert _scoping._CLOSE_UNFINISHED_RESTAGE_NOTE in notes
+    assert _scoping._COMMIT_FAILURE_CLOSE_NOTE not in notes
 
 
 def test_commit_on_success_success_inside_outer_except_adds_no_note(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
     engine, factory = _make_factory(fake_sg, tmp_path)
@@ -745,11 +910,11 @@ def test_commit_on_success_success_inside_outer_except_adds_no_note(
 
     assert pending.id is not None
     assert getattr(outer, '__notes__', []) == []
-    assert [name for name, _args, _kwargs in fake_sg._calls].count('batch') == 1
+    assert [name for name, _args, _kwargs in fake_sg.calls].count('batch') == 1
 
 
 def test_commit_on_success_wraps_schema_preparation_failure_without_replanning(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
     registry = Registry()
@@ -770,7 +935,7 @@ def test_commit_on_success_wraps_schema_preparation_failure_without_replanning(
     factory = sgalchemy.sessionmaker(destination)
     pending = source.entities.Shot.new(code='cold staged intent')
     fault = RuntimeError('schema preparation failed')
-    destination_sg._errors['schema_read'] = [fault]
+    destination_sg.errors['schema_read'] = [fault]
 
     with pytest.raises(CommitError) as excinfo:
         _run_commit_on_success(factory, lambda session: session.add(pending))
@@ -782,13 +947,13 @@ def test_commit_on_success_wraps_schema_preparation_failure_without_replanning(
     assert error.indeterminate == []
     assert error.withdrawn == []
     assert_disjoint_commit_outcome(error)
-    assert [name for name, _args, _kwargs in destination_sg._calls].count('schema_read') == 1
-    assert not any(name == 'batch' for name, _args, _kwargs in destination_sg._calls)
+    assert [name for name, _args, _kwargs in destination_sg.calls].count('schema_read') == 1
+    assert not any(name == 'batch' for name, _args, _kwargs in destination_sg.calls)
     assert entity_state(pending).session is None
 
 
 def test_commit_on_success_wraps_sole_batch_failure_reports_unsent(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -806,8 +971,12 @@ def test_commit_on_success_wraps_sole_batch_failure_reports_unsent(
 
     error = excinfo.value
     assert error.__cause__ is fault
-    assert error.__notes__.count(_uow._BATCH_UNSENT_NOTE) == 1
-    assert _uow.SOLE_BATCH_STAGED_NOTE not in error.__notes__
+    assert error.__notes__ == [
+        STAGED_RETRY_NOTE,
+        'sgalchemy: failed during batch wave 1 chunk 1',
+        _uow._BATCH_UNSENT_NOTE,
+        _scoping._COMMIT_FAILURE_CLOSE_NOTE,
+    ]
     assert error.committed == []
     assert len(error.staged) == 1
     staged = error.staged[0]
@@ -816,23 +985,18 @@ def test_commit_on_success_wraps_sole_batch_failure_reports_unsent(
     assert error.indeterminate == []
     assert error.withdrawn == []
     assert_disjoint_commit_outcome(error)
-    assert [name for name, _args, _kwargs in fake_sg._calls].count('batch') == 0
+    assert [name for name, _args, _kwargs in fake_sg.calls].count('batch') == 0
     assert entity_state(pending).session is None
     assert not entity_state(pending).dirty
-    assert any(
-        'if this session remains open and usable, a later commit may retry' in note
-        for note in error.__notes__
-    )
-    assert any('explicitly restage' in note for note in error.__notes__)
 
 
 def test_commit_on_success_wraps_sole_batch_failure_with_failure_time_evidence(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
     engine, factory = _make_factory(fake_sg, tmp_path)
     fault = RuntimeError('sole batch fault')
-    fake_sg._errors['batch'] = [fault]
+    fake_sg.errors['batch'] = [fault]
     pending = engine.entities.Shot.new(code='unsent')
 
     with pytest.raises(CommitError) as excinfo:
@@ -840,8 +1004,16 @@ def test_commit_on_success_wraps_sole_batch_failure_with_failure_time_evidence(
 
     error = excinfo.value
     assert error.__cause__ is fault
-    assert error.__notes__.count(_uow._BATCH_OUTCOME_UNKNOWN_NOTE) == 1
-    assert _uow.SOLE_BATCH_STAGED_NOTE not in error.__notes__
+    assert error.__notes__ == [
+        STAGED_RETRY_NOTE,
+        'sgalchemy: failed during batch wave 1 chunk 1',
+        _uow._BATCH_OUTCOME_UNKNOWN_NOTE,
+        _scoping._COMMIT_FAILURE_CLOSE_NOTE,
+    ]
+    cause_notes = getattr(fault, '__notes__', [])
+    assert _uow.SOLE_BATCH_STAGED_NOTE not in cause_notes
+    assert 'sgalchemy: failed during batch wave 1 chunk 1' not in cause_notes
+    assert _uow._BATCH_OUTCOME_UNKNOWN_NOTE not in cause_notes
     assert error.committed == []
     assert len(error.staged) == 1
     staged = error.staged[0]
@@ -850,14 +1022,9 @@ def test_commit_on_success_wraps_sole_batch_failure_with_failure_time_evidence(
     assert error.indeterminate == []
     assert error.withdrawn == []
     assert_disjoint_commit_outcome(error)
-    assert [name for name, _args, _kwargs in fake_sg._calls].count('batch') == 1
+    assert [name for name, _args, _kwargs in fake_sg.calls].count('batch') == 1
     assert entity_state(pending).session is None
     assert not entity_state(pending).dirty
-    assert any(
-        'if this session remains open and usable, a later commit may retry' in note
-        for note in error.__notes__
-    )
-    assert any('explicitly restage' in note for note in error.__notes__)
 
 
 @pytest.mark.parametrize(
@@ -869,7 +1036,7 @@ def test_commit_on_success_wraps_sole_batch_failure_with_failure_time_evidence(
     ],
 )
 def test_concurrent_connect_combinations_admit_exactly_one(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     scenario: tuple[bool, bool, bool, str],
     tmp_path: Path,
@@ -884,10 +1051,7 @@ def test_concurrent_connect_combinations_admit_exactly_one(
     release = Event()
     original = active_sg.schema_read
 
-    def blocking_schema_read() -> dict[str, Any]:
-        entered.set()
-        assert release.wait(timeout=10)
-        return original()
+    blocking_schema_read = block_call(original, entered, release)
 
     monkeypatch.setattr(active_sg, 'schema_read', blocking_schema_read)
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -918,12 +1082,12 @@ def test_concurrent_connect_combinations_admit_exactly_one(
         installed = active.result(timeout=2)
 
     assert _scoping._default_session().engine is installed.engine
-    assert rejected_sg._calls == []
-    assert third_sg._calls == []
+    assert rejected_sg.calls == []
+    assert third_sg.calls == []
 
 
 def test_concurrent_non_force_connect_rejects_loser_before_provider_io(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -931,16 +1095,13 @@ def test_concurrent_non_force_connect_rejects_loser_before_provider_io(
     release_schema = Event()
     first_schema_read = fake_sg.schema_read
 
-    def blocking_schema_read() -> dict[str, Any]:
-        schema_entered.set()
-        assert release_schema.wait(timeout=10)
-        return first_schema_read()
+    blocking_schema_read = block_call(first_schema_read, schema_entered, release_schema)
 
     monkeypatch.setattr(fake_sg, 'schema_read', blocking_schema_read)
     create_engine = _scoping.create_engine
     engine_connections: list[object] = []
 
-    def track_call(call: _SyncCallback[_P, _R]) -> _SyncCallback[_P, _R]:
+    def track_call(call: SyncCallback[_P, _R]) -> SyncCallback[_P, _R]:
         def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
             engine_connections.append(kwargs.get('connection'))
             return call(*args, **kwargs)
@@ -964,14 +1125,14 @@ def test_concurrent_non_force_connect_rejects_loser_before_provider_io(
 
     assert _scoping._default_session().engine is installed.engine
     assert engine_connections == [fake_sg]
-    assert rejected_sg._calls == []
+    assert rejected_sg.calls == []
 
 
 def test_connect_installs_default_session_and_finder_supports_aliases(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
-    fake_sg._find_results = [[{'type': 'Shot', 'id': 1, 'code': 'A'}]]
+    fake_sg.find_results = [[{'type': 'Shot', 'id': 1, 'code': 'A'}]]
     session = _connect(fake_sg, tmp_path)
     assert session is _scoping._default_session()
     shot_cls = session.engine.registry.entity_class('Shot')
@@ -979,7 +1140,7 @@ def test_connect_installs_default_session_and_finder_supports_aliases(
     shots = shot_cls.find(shot_cls.sg_cut_duration > 1, status_list='ip', vendor=None)
 
     assert shots[0].code == 'A'
-    _name, args, _kwargs = next(call for call in fake_sg._calls if call[0] == 'find')
+    _name, args, _kwargs = next(call for call in fake_sg.calls if call[0] == 'find')
     assert args[1] == [
         ['sg_cut_duration', 'greater_than', 1],
         ['sg_status_list', 'is', 'ip'],
@@ -988,7 +1149,7 @@ def test_connect_installs_default_session_and_finder_supports_aliases(
 
 
 def test_connect_rejects_second_install_before_io_and_force_preserves_old_session(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
     first = _connect(fake_sg, tmp_path / 'first')
@@ -999,7 +1160,7 @@ def test_connect_rejects_second_install_before_io_and_force_preserves_old_sessio
 
     with pytest.raises(SgalchemyError, match='force=True'):
         _connect(replacement_sg, tmp_path / 'second')
-    assert replacement_sg._calls == []
+    assert replacement_sg.calls == []
     assert _scoping._default_session() is first
     assert entity_state(pending).session is first
 
@@ -1014,7 +1175,7 @@ def test_connect_rejects_second_install_before_io_and_force_preserves_old_sessio
 
 
 def test_default_session_stays_prompt_during_first_connect_provider_io(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1022,10 +1183,7 @@ def test_default_session_stays_prompt_during_first_connect_provider_io(
     release = Event()
     original = fake_sg.schema_read
 
-    def blocking_schema_read() -> dict[str, Any]:
-        entered.set()
-        assert release.wait(timeout=10)
-        return original()
+    blocking_schema_read = block_call(original, entered, release)
 
     monkeypatch.setattr(fake_sg, 'schema_read', blocking_schema_read)
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -1045,7 +1203,7 @@ def test_default_session_stays_prompt_during_first_connect_provider_io(
 
 
 def test_default_session_stays_prompt_during_force_provider_io(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1055,10 +1213,7 @@ def test_default_session_stays_prompt_during_force_provider_io(
     release = Event()
     original = replacement_sg.schema_read
 
-    def blocking_schema_read() -> dict[str, Any]:
-        entered.set()
-        assert release.wait(timeout=10)
-        return original()
+    blocking_schema_read = block_call(original, entered, release)
 
     monkeypatch.setattr(replacement_sg, 'schema_read', blocking_schema_read)
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -1083,7 +1238,7 @@ def test_default_session_without_connect_teaches() -> None:
 
 
 def test_different_site_force_after_materialization_teaches_without_provider_io(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
     entities = importlib.import_module('sgalchemy.entities')
@@ -1100,14 +1255,14 @@ def test_different_site_force_after_materialization_teaches_without_provider_io(
             force=True,
         )
 
-    assert replacement_sg._calls == []
+    assert replacement_sg.calls == []
     assert _registry.default_registry() is registry
     assert _scoping._default_session() is first
     assert entities.Shot is shot_cls
 
 
 def test_different_site_force_with_empty_class_cache_publishes_fresh_registry(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
     first = sgalchemy.connect(connection=fake_sg, cache_root=tmp_path / 'first')
@@ -1136,22 +1291,8 @@ def test_entity_find_without_installed_callback_teaches(
         shot_cls.find()
 
 
-def test_entity_namespace_scope_clears_materialized_class(
-    fake_sg: _FakeShotgun,
-    tmp_path: Path,
-) -> None:
-    with entity_namespace_scope(('Shot',)) as entities:
-        session = sgalchemy.connect(connection=fake_sg, cache_root=tmp_path)
-        try:
-            _ = entities.Shot
-        finally:
-            session.close()
-
-    assert 'Shot' not in vars(entities)
-
-
 def test_explicit_default_registry_spelling_is_reserved_and_paired(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1160,10 +1301,7 @@ def test_explicit_default_registry_spelling_is_reserved_and_paired(
     release = Event()
     original = fake_sg.schema_read
 
-    def blocking_schema_read() -> dict[str, Any]:
-        entered.set()
-        assert release.wait(timeout=10)
-        return original()
+    blocking_schema_read = block_call(original, entered, release)
 
     monkeypatch.setattr(fake_sg, 'schema_read', blocking_schema_read)
     with ThreadPoolExecutor(max_workers=1) as pool:
@@ -1187,14 +1325,14 @@ def test_explicit_default_registry_spelling_is_reserved_and_paired(
 
 
 def test_failed_force_connect_keeps_old_default_and_state(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
     first = _connect(fake_sg, tmp_path / 'first')
     pending = first.engine.entities.Shot.new(code='pending')
     first.add(pending)
     replacement_sg = type(fake_sg)()
-    replacement_sg._errors['schema_read'] = [RuntimeError('schema unavailable')]
+    replacement_sg.errors['schema_read'] = [RuntimeError('schema unavailable')]
 
     with ThreadPoolExecutor(max_workers=1) as pool:
         failed = pool.submit(_connect, replacement_sg, tmp_path / 'second', force=True)
@@ -1206,7 +1344,7 @@ def test_failed_force_connect_keeps_old_default_and_state(
 
 
 def test_failure_after_same_site_refresh_keeps_refresh_and_old_scoped_default(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     schema_fixture: dict[str, Any],
     tmp_path: Path,
@@ -1246,22 +1384,24 @@ def test_failure_after_same_site_refresh_keeps_refresh_and_old_scoped_default(
     assert retry.engine.registry is registry
 
 
+@pytest.mark.parametrize('field', ['not_a_field', 'new', 'find', 'as_dict', 'mro'])
 def test_find_unknown_equality_field_fails_before_provider_find(
-    fake_sg: _FakeShotgun,
+    field: str,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
     session = _connect(fake_sg, tmp_path)
     shot_cls = session.engine.registry.entity_class('Shot')
-    find_calls_before = sum(name == 'find' for name, _args, _kwargs in fake_sg._calls)
+    find_calls_before = sum(name == 'find' for name, _args, _kwargs in fake_sg.calls)
 
-    with pytest.raises(AttributeError, match='no field or field alias'):
-        shot_cls.find(not_a_field='value')
+    with pytest.raises(AttributeError, match=f"Shot has no field or field alias '{field}'"):
+        shot_cls.find(**{field: 'value'})
 
-    assert sum(name == 'find' for name, _args, _kwargs in fake_sg._calls) == find_calls_before
+    assert sum(name == 'find' for name, _args, _kwargs in fake_sg.calls) == find_calls_before
 
 
 def test_force_connect_does_not_call_old_session_close(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1291,7 +1431,7 @@ def test_force_connect_does_not_call_old_session_close(
 
 @pytest.mark.parametrize('registry_mode', ['explicit', 'private'])
 def test_force_connect_nondefault_registry_preserves_process_default(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     registry_mode: str,
     tmp_path: Path,
 ) -> None:
@@ -1317,7 +1457,7 @@ def test_force_connect_nondefault_registry_preserves_process_default(
 
 
 def test_force_connect_preserves_sessions_owned_by_other_threads(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
     first = _connect(fake_sg, tmp_path / 'first')
@@ -1363,20 +1503,20 @@ def test_force_connect_preserves_sessions_owned_by_other_threads(
 
 
 def test_in_flight_old_query_finishes_while_force_replaces_future_default(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     first = _connect(fake_sg, tmp_path / 'first')
     old_shot_cls = first.engine.entities.Shot
-    fake_sg._find_results = [[{'type': 'Shot', 'id': 1, 'code': 'old'}]]
+    fake_sg.find_results = [[{'type': 'Shot', 'id': 1, 'code': 'old'}]]
     find_entered = Event()
     release_find = Event()
     original_find = fake_sg.find
     closed_sessions: list[sgalchemy.Session] = []
     original_close = sgalchemy.Session.close
 
-    blocking_find = _block_call(original_find, find_entered, release_find)
+    blocking_find = block_call(original_find, find_entered, release_find)
 
     def tracking_close(session: sgalchemy.Session) -> None:
         closed_sessions.append(session)
@@ -1395,7 +1535,7 @@ def test_in_flight_old_query_finishes_while_force_replaces_future_default(
         try:
             assert find_entered.wait(timeout=2)
             replacement_sg = type(fake_sg)()
-            replacement_sg._find_results = [[{'type': 'Shot', 'id': 2, 'code': 'new'}]]
+            replacement_sg.find_results = [[{'type': 'Shot', 'id': 2, 'code': 'new'}]]
             replacement = _connect(
                 replacement_sg,
                 tmp_path / 'second',
@@ -1416,15 +1556,15 @@ def test_in_flight_old_query_finishes_while_force_replaces_future_default(
 
 
 def test_interrupted_connect_releases_admission_and_retry_succeeds(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
-    fake_sg._errors['schema_read'] = [KeyboardInterrupt()]
+    fake_sg.errors['schema_read'] = [KeyboardInterrupt()]
 
     with pytest.raises(KeyboardInterrupt):
         sgalchemy.connect(connection=fake_sg, cache_root=tmp_path)
 
-    assert vars(_registry)['_DEFAULT_TRANSITION']['reserved'] is False
+    assert not vars(_registry)['_DEFAULT_TRANSITION_OWNER']
     with pytest.raises(SgalchemyError, match='connect'):
         _scoping._default_session()
     retry = sgalchemy.connect(connection=fake_sg, cache_root=tmp_path)
@@ -1432,12 +1572,12 @@ def test_interrupted_connect_releases_admission_and_retry_succeeds(
 
 
 def test_interrupted_force_connect_keeps_old_default_and_allows_retry(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
     first = sgalchemy.connect(connection=fake_sg, cache_root=tmp_path / 'first')
     replacement_sg = type(fake_sg)()
-    replacement_sg._errors['schema_read'] = [KeyboardInterrupt()]
+    replacement_sg.errors['schema_read'] = [KeyboardInterrupt()]
 
     with pytest.raises(KeyboardInterrupt):
         sgalchemy.connect(
@@ -1446,7 +1586,7 @@ def test_interrupted_force_connect_keeps_old_default_and_allows_retry(
             force=True,
         )
 
-    assert vars(_registry)['_DEFAULT_TRANSITION']['reserved'] is False
+    assert not vars(_registry)['_DEFAULT_TRANSITION_OWNER']
     assert _scoping._default_session() is first
     retry = sgalchemy.connect(
         connection=type(fake_sg)(),
@@ -1457,10 +1597,10 @@ def test_interrupted_force_connect_keeps_old_default_and_allows_retry(
 
 
 def test_preparation_failure_releases_transition_and_retry_succeeds(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
-    fake_sg._errors['schema_read'] = [RuntimeError('preparation failed')]
+    fake_sg.errors['schema_read'] = [RuntimeError('preparation failed')]
 
     with pytest.raises(RuntimeError, match='preparation failed'):
         sgalchemy.connect(connection=fake_sg, cache_root=tmp_path)
@@ -1474,7 +1614,7 @@ def test_preparation_failure_releases_transition_and_retry_succeeds(
 
 
 def test_private_default_session_can_repair_pairing_before_materialization(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
     first = sgalchemy.connect(connection=fake_sg, cache_root=tmp_path / 'first')
@@ -1501,7 +1641,7 @@ def test_private_default_session_can_repair_pairing_before_materialization(
 
 
 def test_private_default_session_stays_split_until_force_recovery(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
     entities = importlib.import_module('sgalchemy.entities')
@@ -1544,7 +1684,7 @@ def test_private_default_session_stays_split_until_force_recovery(
 
 
 def test_same_site_force_reuses_registry_and_refreshes_old_sessions(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     schema_fixture: dict[str, Any],
     tmp_path: Path,
@@ -1560,8 +1700,8 @@ def test_same_site_force_reuses_registry_and_refreshes_old_sessions(
     first.add(old_pending)
     replacement_sg = type(fake_sg)()
     _use_replacement_schema(replacement_sg, monkeypatch, schema_fixture)
-    fake_sg._find_results = [[{'type': 'Shot', 'id': 1, 'sg_new_field': 'old session'}]]
-    replacement_sg._find_results = [[{'type': 'Shot', 'id': 2, 'sg_new_field': 'new session'}]]
+    fake_sg.find_results = [[{'type': 'Shot', 'id': 1, 'sg_new_field': 'old session'}]]
+    replacement_sg.find_results = [[{'type': 'Shot', 'id': 2, 'sg_new_field': 'new session'}]]
 
     replacement = sgalchemy.connect(
         connection=replacement_sg,
@@ -1587,7 +1727,7 @@ def test_same_site_force_reuses_registry_and_refreshes_old_sessions(
 
 
 def test_scoped_session_does_not_retain_dead_thread_session(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
     engine = sgalchemy.create_engine(
@@ -1609,7 +1749,7 @@ def test_scoped_session_does_not_retain_dead_thread_session(
 
 
 def test_scoped_session_dynamic_fallback_delegates_unknown_public_method(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1659,7 +1799,7 @@ def test_scoped_session_explicit_method_signatures_match_session() -> None:
         ]
 
 
-def test_scoped_session_is_thread_local(fake_sg: _FakeShotgun, tmp_path: Path) -> None:
+def test_scoped_session_is_thread_local(fake_sg: FakeShotgun, tmp_path: Path) -> None:
     engine = sgalchemy.create_engine(
         connection=fake_sg,
         cache_root=tmp_path,
@@ -1727,8 +1867,37 @@ def test_scoped_session_underscore_probes_do_not_allocate() -> None:
     assert factory_calls == 0
 
 
+def test_scoped_writes_forward_operations_and_batch_size(
+    engine: Engine, fake_sg: FakeShotgun
+) -> None:
+    engine.load_schema()
+    scoped = sgalchemy.scoped_session(sgalchemy.sessionmaker(engine))
+    first = scoped.merge_dict({'type': 'Shot', 'id': 1})
+    second = scoped.merge_dict({'type': 'Shot', 'id': 2})
+    try:
+        scoped.delete(first)
+        scoped.delete(second)
+        scoped.commit(batch_size=1)
+
+        assert [args[0] for name, args, _ in fake_sg.calls if name == 'batch'] == [
+            [{'request_type': 'delete', 'entity_type': 'Shot', 'entity_id': 1}],
+            [{'request_type': 'delete', 'entity_type': 'Shot', 'entity_id': 2}],
+        ]
+        assert entity_state(first).deleted is True
+        assert entity_state(second).deleted is True
+
+        scoped.revive(first)
+        scoped.commit()
+
+        assert ('revive', ('Shot', 1), {}) in fake_sg.calls
+        assert entity_state(first).deleted is False
+        assert entity_state(second).deleted is True
+    finally:
+        scoped.remove()
+
+
 def test_sessionmaker_and_scoped_passthrough_remove_reset_local_state(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
     engine = sgalchemy.create_engine(
@@ -1755,7 +1924,7 @@ def test_sessionmaker_and_scoped_passthrough_remove_reset_local_state(
 
 
 def test_sessionmaker_forwards_only_supported_defaults(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
     engine = sgalchemy.create_engine(
@@ -1777,7 +1946,7 @@ def test_sessionmaker_forwards_only_supported_defaults(
 
 
 def test_sessionmaker_has_no_begin_and_probe_does_not_allocate_or_perform_io(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
     engine = sgalchemy.create_engine(
@@ -1787,15 +1956,15 @@ def test_sessionmaker_has_no_begin_and_probe_does_not_allocate_or_perform_io(
         bind_default=False,
     )
     factory = sgalchemy.sessionmaker(engine)
-    calls_before = list(fake_sg._calls)
+    calls_before = list(fake_sg.calls)
 
     assert not hasattr(factory, 'begin')
-    assert fake_sg._calls == calls_before
+    assert fake_sg.calls == calls_before
 
 
 @pytest.mark.parametrize('private', [False, True])
 def test_setter_rejects_every_inflight_connection_transition(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     private: bool,
     tmp_path: Path,
@@ -1804,10 +1973,7 @@ def test_setter_rejects_every_inflight_connection_transition(
     release = Event()
     original = fake_sg.schema_read
 
-    def blocking_schema_read() -> dict[str, Any]:
-        entered.set()
-        assert release.wait(timeout=10)
-        return original()
+    blocking_schema_read = block_call(original, entered, release)
 
     monkeypatch.setattr(fake_sg, 'schema_read', blocking_schema_read)
     target = Registry() if private else _registry.default_registry()
@@ -1835,7 +2001,7 @@ def test_setter_rejects_every_inflight_connection_transition(
 
 
 def test_standalone_default_binding_accepts_equivalent_connection_site_spelling(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
     standalone = sgalchemy.create_engine(
@@ -1856,7 +2022,7 @@ def test_standalone_default_binding_accepts_equivalent_connection_site_spelling(
 
 
 def test_standalone_default_binding_rejects_different_site_non_force(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
     standalone = sgalchemy.create_engine(
@@ -1869,30 +2035,11 @@ def test_standalone_default_binding_rejects_different_site_non_force(
 
     with pytest.raises(SgalchemyError, match=r'engine\.entities|registry=Registry'):
         sgalchemy.connect(connection=other, cache_root=tmp_path / 'other')
-    assert other._calls == []
-
-
-def test_standalone_default_binding_routes_connect_by_site(
-    fake_sg: _FakeShotgun,
-    tmp_path: Path,
-) -> None:
-    standalone = sgalchemy.create_engine(
-        connection=fake_sg,
-        cache_root=tmp_path / 'standalone',
-    )
-    standalone.load_schema()
-    registry = standalone.registry
-
-    same_site = sgalchemy.connect(
-        connection=type(fake_sg)(),
-        cache_root=tmp_path / 'same',
-    )
-
-    assert same_site.engine.registry is registry
+    assert other.calls == []
 
 
 def test_standalone_same_site_bind_during_connect_is_an_ordinary_refresh(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1900,10 +2047,7 @@ def test_standalone_same_site_bind_during_connect_is_an_ordinary_refresh(
     release = Event()
     original = fake_sg.schema_read
 
-    def blocking_schema_read() -> dict[str, Any]:
-        entered.set()
-        assert release.wait(timeout=10)
-        return original()
+    blocking_schema_read = block_call(original, entered, release)
 
     monkeypatch.setattr(fake_sg, 'schema_read', blocking_schema_read)
     registry = _registry.default_registry()
@@ -1931,6 +2075,32 @@ def test_standalone_same_site_bind_during_connect_is_an_ordinary_refresh(
     assert _scoping._default_session().engine is installed.engine
 
 
-def test_sync_suppress_failure_does_not_suppress_keyboard_interrupt() -> None:
-    with pytest.raises(KeyboardInterrupt), _scoping._SuppressFailure():
-        raise KeyboardInterrupt
+@pytest.mark.parametrize(
+    ('factory', 'message'),
+    [
+        (
+            _scoping.sessionmaker,
+            (
+                'sessionmaker() requires an Engine, not an AsyncEngine; use '
+                'async_sessionmaker(engine)'
+            ),
+        ),
+        (
+            _scoping.scoped_session,
+            (
+                'scoped_session() requires a Session factory, not an AsyncEngine; use '
+                'async_scoped_session(async_sessionmaker(engine))'
+            ),
+        ),
+    ],
+)
+def test_sync_factories_reject_an_async_engine(
+    factory: Callable[..., object],
+    message: str,
+    fake_async_sg: FakeAsyncShotgun,
+    tmp_path: Path,
+) -> None:
+    async_engine = isolated_async_engine(fake_async_sg, tmp_path)
+    with pytest.raises(TypeError) as excinfo:
+        factory(async_engine)
+    assert str(excinfo.value) == message

@@ -2,8 +2,6 @@ from collections.abc import Mapping
 from typing import get_type_hints
 
 import pytest
-from _fakes import _FakeShotgun
-from _support import fetch_schema, mapped_entity
 
 from sgalchemy._core import _expressions as ex
 from sgalchemy._core import _statement
@@ -18,6 +16,8 @@ from sgalchemy._core._statement import Select, select
 from sgalchemy._errors import CompilationError
 from sgalchemy.schema import _model
 from sgalchemy.schema._model import EntitySchema
+from tests._fakes import FakeShotgun
+from tests._support import fetch_schema, mapped_entity
 
 
 @mapped_entity('Shot')
@@ -46,7 +46,7 @@ def test_compile_annotations_preserve_exact_capabilities() -> None:
     assert hints['return'] == FindCall | SummarizeCall
 
 
-def test_compile_produces_expected_find_call(fake_sg: _FakeShotgun) -> None:
+def test_compile_produces_expected_find_call(fake_sg: FakeShotgun) -> None:
     schemas = _model.build_schema(fetch_schema(fake_sg))
     statement = select(ex.FieldExpr('Shot', ('code',), None)).limit(2)
 
@@ -61,7 +61,7 @@ def test_compile_produces_expected_find_call(fake_sg: _FakeShotgun) -> None:
     )
 
 
-def test_compile_translates_internal_joinedload_schema_drift(fake_sg: _FakeShotgun) -> None:
+def test_compile_translates_internal_joinedload_schema_drift(fake_sg: FakeShotgun) -> None:
     registry = Registry()
     schemas = _model.build_schema(fetch_schema(fake_sg))
     registry.bind(schemas, key='https://fake.example.com')
@@ -108,6 +108,41 @@ def test_group_by_bare_field_stamps_owner_and_preserves_groupings() -> None:
     assert grouping.entity_type == 'Shot'
 
 
+def test_group_by_rejects_values_that_are_not_fields_or_groupings() -> None:
+    with pytest.raises(TypeError) as excinfo:
+        select(_f('code')).group_by('code')  # pyright: ignore[reportArgumentType]
+    assert str(excinfo.value) == (
+        'group_by() takes fields or groupings from field.by_() and its shortcuts, not str'
+    )
+
+
+def test_options_rejects_bare_fields_and_other_values() -> None:
+    stmt = select(_f('code'))
+    with pytest.raises(TypeError) as excinfo:
+        stmt.options(_f('assets'))  # pyright: ignore[reportArgumentType]
+    assert str(excinfo.value) == (
+        'options() takes loader options, not a bare field; wrap the field in a loader such as '
+        'selectinload() or load_only()'
+    )
+    with pytest.raises(TypeError) as excinfo:
+        stmt.options('assets')  # pyright: ignore[reportArgumentType]
+    assert str(excinfo.value) == (
+        'options() takes loader options such as selectinload() or load_only(), not str'
+    )
+
+
+def test_order_by_accepts_a_bare_field_as_ascending() -> None:
+    code = _f('code')
+    ordering = select(code).order_by(code).orderings[0]
+    assert isinstance(ordering, ex.Ordering)
+    assert (ordering.path, ordering.direction, ordering.entity_type) == ('code', 'asc', 'Shot')
+    with pytest.raises(TypeError) as excinfo:
+        select(code).order_by('code')  # pyright: ignore[reportArgumentType]
+    assert str(excinfo.value) == (
+        'order_by() takes fields or orderings from field.asc() and field.desc(), not str'
+    )
+
+
 def test_select_entity_or_projected_columns() -> None:
     code = _f('code')
     summary = ex.func.count(code)
@@ -132,7 +167,7 @@ def test_select_uses_identity_equality_and_hash() -> None:
     assert hash(first) == object.__hash__(first)
 
 
-def test_where_order_by_and_options_accumulate_without_validation() -> None:
+def test_where_order_by_and_options_accumulate() -> None:
     code = _f('code')
     duration = _f('sg_cut_duration')
     ordering = code.desc()
@@ -152,3 +187,23 @@ def test_where_order_by_and_options_accumulate_without_validation() -> None:
     assert len(stmt.conditions) == 3
     assert stmt.orderings == (ordering,)
     assert stmt.loader_options == (first_option, second_option, third_option)
+
+
+def test_where_rejects_non_conditions_when_called() -> None:
+    stmt = select(_f('code'))
+    prefix = 'where() takes filter conditions (Filter, FilterGroup, or RawFilters), not'
+    bool_suffix = (
+        "; Python's in, and, and or were already evaluated, so use field.in_(), "
+        'and_(), or or_() instead'
+    )
+    separate_suffix = '; pass the conditions as separate arguments, such as where(*conditions)'
+    cases = [
+        (None, f'{prefix} NoneType'),
+        (True, f'{prefix} bool{bool_suffix}'),
+        ([_f('code') == 'A'], f'{prefix} list{separate_suffix}'),
+        ((_f('code') == 'A',), f'{prefix} tuple{separate_suffix}'),
+    ]
+    for value, message in cases:
+        with pytest.raises(TypeError) as excinfo:
+            stmt.where(value)  # pyright: ignore[reportArgumentType]
+        assert str(excinfo.value) == message

@@ -4,20 +4,22 @@ import importlib.metadata
 import sys
 import warnings
 from collections.abc import Iterator
+from datetime import UTC
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Never, cast
+from typing import Never, cast
 
 import pytest
-from _fakes import _FakeShotgun
-from _support import fetch_schema
-from cli_helpers import invoke_cli
 
-from sgalchemy import _cli
+from sgalchemy import Engine, _cli, create_engine
 from sgalchemy._errors import SgalchemyError
 from sgalchemy.schema import _cache
+from sgalchemy.schema._cachedir import cache_file
+from tests._fakes import FakeShotgun
+from tests._support import fetch_schema
+from tests.cli_helpers import invoke_cli
 
-VALID_COMMAND_ARGUMENTS = ['stubs', '-o', 'stubs', '--from-cache', 'schema.json']
+_VALID_COMMAND_ARGUMENTS = ['stubs', '-o', 'stubs', '--from-cache', 'schema.json']
 
 _MISSING_PROVIDER = (
     'error: no SG API provider is installed; '
@@ -43,10 +45,10 @@ _NONDEFAULT_FLAG_PROFILES = [
     ),
 ]
 _REFRESH = ['schema', 'refresh', '--site', 'https://example.com', '--script-name', 'script']
-_REFRESH_USAGE = 'usage: sgalchemy schema refresh [-h] --site URL --script-name NAME\n'
+_REFRESH_USAGE = 'usage: sgalchemy schema refresh [-h] --site URL [--script-name NAME]\n'
 
 
-def _cache_file(fake_sg: _FakeShotgun, tmp_path: Path) -> Path:
+def _cache_file(fake_sg: FakeShotgun, tmp_path: Path) -> Path:
     cache = fetch_schema(fake_sg)
     path = tmp_path / 'schema.json'
     _cache.store_cache(path, cache)
@@ -112,6 +114,19 @@ def _named_error(name: str, base: type[Exception] = Exception) -> type[Exception
     return type(name, (base,), {})
 
 
+def _record_engine(
+    monkeypatch: pytest.MonkeyPatch, fake_sg: FakeShotgun
+) -> list[tuple[str, dict[str, str]]]:
+    creations: list[tuple[str, dict[str, str]]] = []
+
+    def fake(site: str, **credentials: str) -> Engine:
+        creations.append((site, credentials))
+        return create_engine(connection=fake_sg, bind_default=False)
+
+    monkeypatch.setattr(_cli, 'create_engine', fake)
+    return creations
+
+
 def _starts_in_lowercase_style(text: str) -> bool:
     first = text.split(maxsplit=1)[0]
     is_acronym = first.upper() == first and any(character.isalpha() for character in first)
@@ -123,16 +138,23 @@ def _use_site(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv('SGALCHEMY_SCHEMA_CACHE', str(tmp_path / 'cache'))
 
 
-def test_check_reports_drift_on_stdout(fake_sg: _FakeShotgun, tmp_path: Path) -> None:
+def test_check_reports_drift_on_stdout(fake_sg: FakeShotgun, tmp_path: Path) -> None:
     cache_path = _cache_file(fake_sg, tmp_path)
     command = ['stubs', '--check', '-o', str(tmp_path / 'stubs'), '--from-cache', str(cache_path)]
 
-    assert invoke_cli(command) == (1, 'stub drift detected\n', '')
+    cache = _cache.load_cache(cache_path)
+    assert cache is not None
+    fetched = cache.fetched_at.astimezone(UTC).strftime('%Y-%m-%d %H:%M UTC')
+    assert invoke_cli(command) == (
+        1,
+        f'schema: {cache_path} (fetched {fetched})\nstub drift detected\n',
+        '',
+    )
 
 
 @pytest.mark.parametrize('flags', _NONDEFAULT_FLAG_PROFILES)
 def test_check_uses_generation_flag_profile(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
     flags: list[str],
 ) -> None:
@@ -146,57 +168,49 @@ def test_check_uses_generation_flag_profile(
 
 
 def test_connected_stubs_generate_and_check_with_one_schema_load_each(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    cache_path = _cache_file(fake_sg, tmp_path)
-    out = tmp_path / 'connected-stubs'
-    loads: list[bool] = []
-    creations: list[tuple[str, str, str]] = []
+    _use_site(monkeypatch, tmp_path)
+    creations = _record_engine(monkeypatch, fake_sg)
 
-    class FakeEngine:
-        site = 'https://connected.example.com'
+    def no_cache_read(_path: Path) -> Never:
+        raise AssertionError('connected stubs must use the loaded schema')
 
-        def load_schema(self, *, force: bool = False) -> dict[str, Any]:
-            loads.append(force)
-            return {}
-
-    def fake_create_engine(
-        site: str,
-        *,
-        script_name: str,
-        api_key: str,
-    ) -> FakeEngine:
-        creations.append((site, script_name, api_key))
-        return FakeEngine()
-
-    def fake_cache_file(site: str) -> Path:
-        assert site == FakeEngine.site
-        return cache_path
-
-    monkeypatch.setattr(_cli, 'create_engine', fake_create_engine)
-    monkeypatch.setattr(_cli, 'cache_file', fake_cache_file)
-    monkeypatch.setenv('SGALCHEMY_API_KEY', 'key')
-    command = [
-        'stubs',
-        '-o',
-        str(out),
-        '--site',
-        'https://connected.example.com',
-        '--script-name',
-        'script',
-    ]
-
-    assert _cli.main(command) == 0
-    assert creations == [('https://connected.example.com', 'script', 'key')]
-    assert loads == [False]
-    assert _cli.main([*command, '--check']) == 0
+    monkeypatch.setattr(_cli, 'load_cache', no_cache_read)
+    command = _connected_command('stubs', tmp_path)
+    assert invoke_cli(command)[0] == 0
+    assert invoke_cli([*command, '--check'])[0] == 0
     assert creations == [
-        ('https://connected.example.com', 'script', 'key'),
-        ('https://connected.example.com', 'script', 'key'),
+        ('https://example.com', {'script_name': 'script', 'api_key': 'key'}),
+        ('https://example.com', {'script_name': 'script', 'api_key': 'key'}),
     ]
-    assert loads == [False, False]
+    assert sum(name == 'schema_read' for name, _, _ in fake_sg.calls) == 1
+
+
+def test_connected_stubs_use_the_loaded_schema_when_the_cache_write_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fake_sg: FakeShotgun,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _use_site(monkeypatch, tmp_path)
+    (tmp_path / 'cache').write_text('blocked', encoding='utf-8')
+    _record_engine(monkeypatch, fake_sg)
+    status, stdout, stderr = invoke_cli(_connected_command('stubs', tmp_path))
+    assert status == 0
+    assert stdout.startswith('schema: fetched from https://fake.example.com\nwrote ')
+    assert (tmp_path / 'stubs' / 'sgalchemy' / 'entities' / '__init__.pyi').exists()
+    assert stderr.startswith(
+        f'warning: could not write the schema cache {cache_file("https://fake.example.com")}: '
+    )
+    assert stderr.endswith(
+        '; using the fetched schema without caching it. '
+        'Set SGALCHEMY_SCHEMA_CACHE to use a writable directory\n'
+    )
+    assert len(stderr.splitlines()) == 1
+    assert not caplog.records
 
 
 def test_every_visible_option_and_command_has_lowercase_help() -> None:
@@ -248,14 +262,18 @@ def test_incomplete_stubs_credentials_are_rejected(
         raise AssertionError
 
     monkeypatch.setattr(_cli, 'create_engine', fail_create_engine)
+    monkeypatch.delenv('SGALCHEMY_SESSION_TOKEN', raising=False)
 
     status, stdout, stderr = invoke_cli(['stubs', '-o', str(tmp_path / 'stubs'), *credentials])
 
     assert (status, stdout) == (2, '')
     assert stderr.startswith('usage: sgalchemy stubs [-h] ')
-    assert stderr.endswith(
-        'sgalchemy stubs: error: stubs requires --from-cache or both --site and --script-name\n'
+    message = (
+        'stubs requires --from-cache FILE or --site URL'
+        if credentials[0] == '--script-name'
+        else 'authenticate with --script-name NAME and an API key, or set SGALCHEMY_SESSION_TOKEN'
     )
+    assert stderr.endswith(f'sgalchemy stubs: error: {message}\n')
 
 
 def test_interrupted_api_key_prompt_exits_quietly(
@@ -278,22 +296,22 @@ def test_interrupted_api_key_prompt_exits_quietly(
     [
         pytest.param(
             ['--site', 'not-a-url', '--script-name', 'script'],
-            'url must be a complete http or https site URL',
+            '--site must be a complete https URL',
             id='incomplete',
         ),
         pytest.param(
             ['--site', 'http://example.com', '--script-name', 'script'],
-            'static credentials require an https site URL',
+            '--site must be a complete https URL',
             id='plaintext',
         ),
         pytest.param(
             ['--site', 'https://user@example.com', '--script-name', 'script'],
-            'url must not embed userinfo credentials',
+            '--site must be a complete https URL',
             id='userinfo',
         ),
         pytest.param(
             ['--site', 'https://example.com', '--script-name', ''],
-            'script_name must not be empty',
+            '--script-name must not be empty',
             id='empty-script-name',
         ),
     ],
@@ -306,22 +324,24 @@ def test_invalid_site_or_script_name_is_a_setup_error(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    _use_site(monkeypatch, tmp_path)
+    monkeypatch.delenv('SGALCHEMY_API_KEY', raising=False)
     prefix = (
         ['stubs', '-o', str(tmp_path / 'stubs')] if command == 'stubs' else ['schema', 'refresh']
     )
 
-    assert invoke_cli([*prefix, *credentials]) == (2, '', f'error: {message}\n')
+    assert invoke_cli([*prefix, *credentials], stdin=None) == (2, '', f'error: {message}\n')
 
 
+@pytest.mark.parametrize('stdin', ['', None], ids=['not-a-terminal', 'closed'])
 @pytest.mark.parametrize('command', ['stubs', 'refresh'])
 def test_missing_api_key_is_reported_by_the_command_parser(
     command: str,
+    stdin: str | None,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv('SGALCHEMY_API_KEY', raising=False)
-    status, stdout, stderr = invoke_cli(_connected_command(command, tmp_path))
+    status, stdout, stderr = invoke_cli(_connected_command(command, tmp_path), stdin=stdin)
     prog = 'sgalchemy stubs' if command == 'stubs' else 'sgalchemy schema refresh'
     assert (status, stdout) == (2, '')
     assert stderr.startswith(f'usage: {prog} [-h] ')
@@ -454,53 +474,37 @@ def test_schema_help_lists_its_commands() -> None:
     assert 'refresh' in {line.split()[0] for line in commands.splitlines() if line.split()}
 
 
+def test_schema_refresh_fails_when_the_cache_write_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fake_sg: FakeShotgun,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _use_site(monkeypatch, tmp_path)
+    (tmp_path / 'cache').write_text('blocked', encoding='utf-8')
+    _record_engine(monkeypatch, fake_sg)
+    status, stdout, stderr = invoke_cli(_REFRESH)
+    assert (status, stdout) == (1, '')
+    assert stderr.startswith(
+        f'error: could not write the schema cache {cache_file("https://fake.example.com")}: '
+    )
+    assert stderr.endswith('; set SGALCHEMY_SCHEMA_CACHE to a writable directory\n')
+    assert len(stderr.splitlines()) == 1
+    assert not caplog.records
+
+
 def test_schema_refresh_forces_refetch_and_prints_cache_path(
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
-    expected = tmp_path / 'refreshed.json'
-    calls: list[bool] = []
-
-    class FakeEngine:
-        site = 'https://refresh.example.com'
-
-        def load_schema(self, *, force: bool = False) -> dict[str, Any]:
-            calls.append(force)
-            return {}
-
-    def fake_create_engine(
-        site: str,
-        *,
-        script_name: str,
-        api_key: str,
-    ) -> FakeEngine:
-        assert (site, script_name, api_key) == (
-            'https://refresh.example.com',
-            'script',
-            'key',
-        )
-        return FakeEngine()
-
-    def fake_cache_file(_site: str) -> Path:
-        return expected
-
-    monkeypatch.setattr(_cli, 'create_engine', fake_create_engine)
-    monkeypatch.setattr(_cli, 'cache_file', fake_cache_file)
-    monkeypatch.setenv('SGALCHEMY_API_KEY', 'key')
-    code = _cli.main(
-        [
-            'schema',
-            'refresh',
-            '--site',
-            'https://refresh.example.com',
-            '--script-name',
-            'script',
-        ]
-    )
-    assert code == 0
-    assert calls == [True]
-    assert str(expected) in capsys.readouterr().out
+    _use_site(monkeypatch, tmp_path)
+    _record_engine(monkeypatch, fake_sg)
+    expected = cache_file('https://fake.example.com')
+    _cache.store_cache(expected, fetch_schema(fake_sg))
+    fake_sg.calls.clear()
+    assert invoke_cli(_REFRESH) == (0, f'refreshed schema cache: {expected}\n', '')
+    assert sum(name == 'schema_read' for name, _, _ in fake_sg.calls) == 1
 
 
 @pytest.mark.parametrize(
@@ -521,7 +525,7 @@ def test_schema_refresh_forces_refetch_and_prints_cache_path(
 def test_stub_write_failure_exits_one(
     error: Exception,
     detail: str,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -606,7 +610,7 @@ def test_connected_commands_read_secret_safely(
     assert bool(prompts) == (mode in {'prompt', 'empty', 'unsafe'})
 
 
-def test_stubs_generate_and_check_roundtrip(fake_sg: _FakeShotgun, tmp_path: Path) -> None:
+def test_stubs_generate_and_check_roundtrip(fake_sg: FakeShotgun, tmp_path: Path) -> None:
     cache_path = _cache_file(fake_sg, tmp_path)
     out = tmp_path / 'stubs'
     code = _cli.main(['stubs', '-o', str(out), '--from-cache', str(cache_path)])
@@ -621,8 +625,18 @@ def test_stubs_help_groups_options_by_role() -> None:
     assert (status, stderr) == (0, '')
     assert stdout.startswith('usage: sgalchemy stubs [-h] -o DIR [--check] [--from-cache FILE]')
     assert headings == ['options:', 'output:', 'schema source:', 'stub content:']
-    assert stdout.endswith(
-        'With --site, the API key comes from SGALCHEMY_API_KEY or a hidden terminal\nprompt.\n'
+    assert ' '.join(stdout.split()).endswith(
+        'With --script-name, the API key comes from SGALCHEMY_API_KEY or a hidden '
+        'terminal prompt. '
+        'Without it, the session token comes from SGALCHEMY_SESSION_TOKEN.'
+    )
+
+
+def test_stubs_without_a_source_is_a_usage_error() -> None:
+    status, stdout, stderr = invoke_cli(['stubs', '-o', 'stubs'])
+    assert (status, stdout) == (2, '')
+    assert stderr.endswith(
+        'sgalchemy stubs: error: stubs requires --from-cache FILE or --site URL\n'
     )
 
 
@@ -695,9 +709,102 @@ def test_unusable_api_key_entry_is_reported_by_the_refresh_parser(
     )
 
 
+@pytest.mark.parametrize('options', [['--site', 'https://example.com'], ['--script-name', 's']])
+def test_from_cache_cannot_be_combined_with_site_options(options: list[str]) -> None:
+    status, stdout, stderr = invoke_cli(
+        ['stubs', '-o', 'stubs', '--from-cache', 'schema.json', *options]
+    )
+    assert (status, stdout) == (2, '')
+    assert stderr.endswith(
+        'sgalchemy stubs: error: choose one schema source: --from-cache FILE, '
+        'or --site URL with credentials\n'
+    )
+
+
+@pytest.mark.parametrize('command', ['stubs', 'refresh'])
+def test_session_token_authenticates_without_script_name(
+    command: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fake_sg: FakeShotgun
+) -> None:
+    _use_site(monkeypatch, tmp_path)
+    monkeypatch.delenv('SGALCHEMY_API_KEY')
+    monkeypatch.setenv('SGALCHEMY_SESSION_TOKEN', 'tok')
+    creations = _record_engine(monkeypatch, fake_sg)
+    status, stdout, stderr = invoke_cli(_connected_command(command, tmp_path)[:-2])
+    assert (status, stderr) == (0, '')
+    assert stdout
+    assert creations == [('https://example.com', {'session_token': 'tok'})]
+
+
+@pytest.mark.parametrize('command', ['stubs', 'refresh'])
+def test_explicit_script_name_wins_over_an_ambient_token(
+    command: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fake_sg: FakeShotgun
+) -> None:
+    _use_site(monkeypatch, tmp_path)
+    monkeypatch.setenv('SGALCHEMY_SESSION_TOKEN', 'tok')
+    creations = _record_engine(monkeypatch, fake_sg)
+    assert invoke_cli(_connected_command(command, tmp_path))[0] == 0
+    assert creations == [('https://example.com', {'script_name': 'script', 'api_key': 'key'})]
+
+
+@pytest.mark.parametrize('token', [None, ''])
+@pytest.mark.parametrize('command', ['stubs', 'refresh'])
+def test_missing_credentials_is_a_usage_error(
+    command: str, token: str | None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv('SGALCHEMY_API_KEY', raising=False)
+    monkeypatch.delenv('SGALCHEMY_SESSION_TOKEN', raising=False)
+    if token is not None:
+        monkeypatch.setenv('SGALCHEMY_SESSION_TOKEN', token)
+    status, stdout, stderr = invoke_cli(_connected_command(command, tmp_path)[:-2], stdin=None)
+    assert (status, stdout) == (2, '')
+    assert stderr.endswith(
+        'error: authenticate with --script-name NAME and an API key, '
+        'or set SGALCHEMY_SESSION_TOKEN\n'
+    )
+
+
+@pytest.mark.parametrize('source', ['file', 'fetched', 'reused'])
+def test_stubs_reports_the_schema_source(
+    source: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fake_sg: FakeShotgun
+) -> None:
+    _use_site(monkeypatch, tmp_path)
+    _record_engine(monkeypatch, fake_sg)
+    cache = fetch_schema(fake_sg)
+    path = cache_file('https://fake.example.com')
+    fetched = cache.fetched_at.astimezone(UTC).strftime('%Y-%m-%d %H:%M UTC')
+    if source != 'fetched':
+        _cache.store_cache(path, cache)
+    command = _connected_command('stubs', tmp_path)
+    if source == 'file':
+        command = ['stubs', '-o', str(tmp_path / 'stubs'), '--from-cache', str(path)]
+        line = f'schema: {path} (fetched {fetched})\n'
+    elif source == 'fetched':
+        line = 'schema: fetched from https://fake.example.com\n'
+    else:
+        line = (
+            f'schema: cached copy fetched {fetched}; '
+            "run 'sgalchemy schema refresh' to fetch the current schema\n"
+        )
+    status, stdout, stderr = invoke_cli(command)
+    assert (status, stderr) == (0, '')
+    assert stdout.startswith(line + 'wrote ')
+    assert stdout.endswith(
+        "aliases skipped: Asset: field alias 'code' for sg_code collides; skipped\n"
+    )
+    if source == 'fetched':
+        stored = _cache.load_cache(path)
+        assert stored is not None
+        fetched = stored.fetched_at.astimezone(UTC).strftime('%Y-%m-%d %H:%M UTC')
+        line = (
+            f'schema: cached copy fetched {fetched}; '
+            "run 'sgalchemy schema refresh' to fetch the current schema\n"
+        )
+    assert invoke_cli([*command, '--check']) == (0, line + 'stubs are fresh\n', '')
+
+
 def test_version_ignores_other_valid_arguments(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(importlib.metadata, 'version', _fixed_version)
-    assert invoke_cli(['--version', *VALID_COMMAND_ARGUMENTS]) == (0, 'sgalchemy 9.8.7\n', '')
+    assert invoke_cli(['--version', *_VALID_COMMAND_ARGUMENTS]) == (0, 'sgalchemy 9.8.7\n', '')
 
 
 def test_version_prints_the_installed_version(monkeypatch: pytest.MonkeyPatch) -> None:

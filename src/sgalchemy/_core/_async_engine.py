@@ -6,6 +6,7 @@ import inspect
 import logging
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
+from os import PathLike
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Literal, Self, cast
@@ -14,6 +15,7 @@ from sgalchemy._core._async_backend import AsyncBackend, NativeAsyncBackend, Thr
 from sgalchemy._core._compiler import FindCall, SummarizeCall
 from sgalchemy._core._construction import (
     StaticCredentials,
+    has_mismatched_methods,
     require_static_credential_https,
     validate_site,
     validate_static_credentials,
@@ -25,8 +27,11 @@ from sgalchemy._core._engine_common import (
     add_note_once,
     looks_like_auth_fault,
     looks_like_schema_fault,
+    missing_provider_error,
     provider_call_arguments,
+    try_store_cache,
     validated_schema,
+    warn_cache_not_written,
 )
 from sgalchemy._core._registry import Registry, RegistryBinding, default_registry
 from sgalchemy._errors import SgalchemyError
@@ -41,7 +46,6 @@ from sgalchemy.schema._cache import (
     SchemaCache,
     load_cache,
     normalize_server_info,
-    store_cache,
 )
 from sgalchemy.schema._cachedir import cache_file
 from sgalchemy.schema._model import EntitySchema, build_schema
@@ -75,7 +79,7 @@ class _AsyncAcquisitionError(Exception):
     def __init__(self, original: Exception) -> None:
         """Retain the original exception for identity-preserving unwrapping."""
         super().__init__()
-        self._original = original
+        self.original = original
 
 
 class AsyncEngine:
@@ -159,8 +163,12 @@ class AsyncEngine:
         closed. Remains bound to this engine's event loop.
 
         Once started, resource reset continues if its awaiting caller is
-        cancelled. Ordinary cleanup failures propagate and leave unclosed
-        resources available for a later `dispose()` retry.
+        cancelled. Cleanup failures leave unclosed resources available for a
+        later `dispose()` retry.
+
+        Raises:
+            asyncio.CancelledError: If the awaiting caller is cancelled.
+            Exception: The original backend cleanup failure.
         """
         self._bind_loop()
         await self._backend.reset()
@@ -171,7 +179,13 @@ class AsyncEngine:
         exc_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        """Reset owned backend resources without suppressing exceptions."""
+        """Reset owned backend resources without suppressing exceptions.
+
+        Raises:
+            asyncio.CancelledError: If cancellation interrupts the wait for
+                disposal; an already-started reset continues.
+            Exception: The original backend cleanup failure.
+        """
         del exc_type, exc_value, traceback
         await self.dispose()
 
@@ -192,10 +206,16 @@ class AsyncEngine:
             method: Provider method name.
             args: Positional provider arguments.
             kwargs: Keyword provider arguments, excluding observation metadata.
-            progress: Fresh per-call observation, or None for ordinary calls.
+            progress: Fresh per-call observation, or `None` for ordinary calls.
 
         Returns:
             Provider result without wrapping.
+
+        Raises:
+            asyncio.CancelledError: If the caller is cancelled. Submitted
+                threaded work may continue after the waiter exits.
+            Exception: Client acquisition or provider failures, annotated where
+                applicable and propagated without wrapping.
         """
         self._bind_loop()
         if self._echo:
@@ -237,6 +257,11 @@ class AsyncEngine:
 
         Returns:
             Provider query result.
+
+        Raises:
+            asyncio.CancelledError: If the caller is cancelled; submitted
+                threaded work may continue.
+            Exception: Client acquisition or provider failures, unwrapped.
         """
         method, args, kwargs = provider_call_arguments(call)
         return await self.call(method, *args, **kwargs)
@@ -296,6 +321,9 @@ class AsyncEngine:
     async def load_schema(self, *, force: bool = False) -> Mapping[str, EntitySchema]:
         """Prepare schema and Registry state through an explicit awaited boundary.
 
+        An unwritable cache logs a warning on `sgalchemy.engine` and publishes
+        the fetched schema.
+
         Args:
             force: Ignore a fresh cache and fetch from the backend.
 
@@ -305,7 +333,8 @@ class AsyncEngine:
         Raises:
             SgalchemyError: If the provider returns malformed schema data or
                 the Registry is already bound to a different site.
-            Exception: Original provider or schema-cache exception, unwrapped.
+            Exception: Original provider exception or schema-cache
+                serialization error, unwrapped.
         """
         self._bind_loop()
         async with self._schema_lock:
@@ -326,7 +355,9 @@ class AsyncEngine:
                         server_info=normalize_server_info(raw_server_info),
                     )
                     candidate = validated_schema(cache)
-                    await asyncio.to_thread(store_cache, path, cache)
+                    store_error = await asyncio.to_thread(try_store_cache, path, cache)
+                    if store_error is not None:
+                        warn_cache_not_written(path, store_error)
                 else:
                     candidate = build_schema(cache)
                 self.registry.bind(candidate, key=self.site)
@@ -344,8 +375,11 @@ class AsyncEngine:
             The Registry's current complete binding after preparation.
 
         Raises:
-            SgalchemyError: If preparation fails to publish a binding or the
-                Registry is already bound to a different site.
+            SgalchemyError: If preparation fails to publish a binding, provider
+                schema is malformed, or the Registry is already bound to a
+                different site.
+            Exception: Original client acquisition, provider, or schema-cache
+                serialization failure, unwrapped.
         """
         await self.load_schema(force=force)
         binding = self.prepared_binding()
@@ -358,7 +392,7 @@ class AsyncEngine:
 
 def _classify_acquisition_fault(err: _AsyncAcquisitionError) -> Exception:
     """Annotate and return the original creator exception for public delivery."""
-    original = err._original  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    original = err.original
     if looks_like_auth_fault(original):
         add_note_once(original, AUTH_RECOVERY_NOTE)
     return original
@@ -444,14 +478,56 @@ def _create_threaded_backend(
 
     def create_sync() -> ClosableShotgunLike:
         with _AsyncAcquisitionBoundary():
-            provider = importlib.import_module('shotgun_api3')
+            try:
+                provider = importlib.import_module('shotgun_api3')
+            except ModuleNotFoundError as err:
+                if err.name != 'shotgun_api3':
+                    raise
+                raise missing_provider_error('sync_connection= or creator=') from err
             return cast('ClosableShotgunLike', provider.Shotgun(site, **kwargs))
 
     return ThreadedSyncBackend(site, creator=create_sync, max_workers=resolved)
 
 
+def _resolve_strategy(
+    strategy: object,
+    native_sources: tuple[str, ...],
+    threaded_sources: tuple[str, ...],
+) -> Literal['native', 'threaded']:
+    """Choose a strategy from the source keywords or explain a conflict."""
+    if strategy not in (None, 'native', 'threaded'):
+        raise ValueError("strategy must be 'native', 'threaded', or None")
+    if strategy == 'native':
+        if 'sync_connection' in threaded_sources or 'creator' in threaded_sources:
+            raise ValueError(
+                "strategy='native' does not accept sync_connection or creator; "
+                "omit strategy or pass strategy='threaded'"
+            )
+        if 'max_workers' in threaded_sources:
+            raise ValueError(
+                "strategy='native' does not accept max_workers; "
+                "omit strategy or pass strategy='threaded'"
+            )
+        return 'native'
+    if strategy == 'threaded':
+        if native_sources:
+            raise ValueError(
+                "strategy='threaded' does not accept connection or async_creator; "
+                "omit strategy or pass strategy='native'"
+            )
+        return 'threaded'
+    if native_sources and threaded_sources:
+        native = ', '.join(f'{source}=' for source in native_sources)
+        threaded = ', '.join(f'{source}=' for source in threaded_sources)
+        raise ValueError(
+            f"{native} selects strategy='native' but {threaded} selects "
+            "strategy='threaded'; pass keywords for one strategy"
+        )
+    return 'threaded' if threaded_sources else 'native'
+
+
 def _validate_factory_inputs(  # noqa: PLR0913 - Every option needs one validation site.
-    strategy: str,
+    strategy: Literal['native', 'threaded'],
     *,
     url: str | None,
     connection: AsyncShotgunLike | None,
@@ -461,19 +537,11 @@ def _validate_factory_inputs(  # noqa: PLR0913 - Every option needs one validati
     has_static: bool,
     max_workers: int | None,
 ) -> None:
-    """Validate strategy, source exclusivity, and sentinel options."""
-    if strategy not in ('native', 'threaded'):
-        raise ValueError("strategy must be 'native' or 'threaded'")
+    """Validate source exclusivity and worker bounds."""
     if strategy == 'native':
-        if sync_connection is not None or creator is not None:
-            raise ValueError('native strategy does not accept sync_connection or creator')
-        if max_workers is not None:
-            raise ValueError('native strategy does not accept max_workers')
         supplied = connection is not None
         chosen = sum(1 for choice in (supplied, async_creator is not None, has_static) if choice)
     else:
-        if connection is not None or async_creator is not None:
-            raise ValueError('threaded strategy does not accept connection or async_creator')
         if max_workers is not None and max_workers < 1:
             raise ValueError('max_workers must be at least 1')
         supplied = sync_connection is not None
@@ -497,11 +565,11 @@ def create_async_engine(  # noqa: PLR0913 - Mirror the synchronous factory surfa
     sync_connection: ShotgunLike | None = None,
     creator: Callable[[], ClosableShotgunLike] | None = None,
     async_creator: Callable[[], Awaitable[AsyncClosableShotgunLike]] | None = None,
-    strategy: Literal['native', 'threaded'] = 'native',
+    strategy: Literal['native', 'threaded'] | None = None,
     script_name: str | None = None,
     api_key: str | None = None,
     session_token: str | None = None,
-    cache_root: Path | None = None,
+    cache_root: str | PathLike[str] | None = None,
     policy: SchemaCachePolicy | None = None,
     echo: bool = False,
     registry: Registry | None = None,
@@ -528,12 +596,13 @@ def create_async_engine(  # noqa: PLR0913 - Mirror the synchronous factory surfa
             threaded worker.
         async_creator: Callable whose awaitable produces one fresh closable
             native async client.
-        strategy: Native async or bounded threaded execution.
+        strategy: `None` selects threaded for `sync_connection`, `creator`, or
+            `max_workers`, and native otherwise.
         script_name: Script credential paired with `api_key`.
         api_key: API key paired with `script_name`.
         session_token: JSON-RPC session token, exclusive with script
             credentials.
-        cache_root: Schema cache directory override.
+        cache_root: Schema cache directory override, as a path or string.
         policy: Cache freshness policy, or `None` for the default TTL policy.
         echo: Log provider calls and arguments on `sgalchemy.engine`.
         registry: Explicit Registry permanently paired with the engine.
@@ -547,12 +616,34 @@ def create_async_engine(  # noqa: PLR0913 - Mirror the synchronous factory surfa
         Unprepared async engine that binds to its first-use event loop.
 
     Raises:
+        TypeError: If a supplied connection declares the wrong provider call
+            kind.
         ValueError: If the URL, strategy, sources, credentials, or options are
             inconsistent.
     """
     has_static = script_name is not None or api_key is not None or session_token is not None
-    _validate_factory_inputs(
+    selected_strategy = _resolve_strategy(
         strategy,
+        tuple(
+            name
+            for name, supplied in (
+                ('connection', connection is not None),
+                ('async_creator', async_creator is not None),
+            )
+            if supplied
+        ),
+        tuple(
+            name
+            for name, supplied in (
+                ('sync_connection', sync_connection is not None),
+                ('creator', creator is not None),
+                ('max_workers', max_workers is not None),
+            )
+            if supplied
+        ),
+    )
+    _validate_factory_inputs(
+        selected_strategy,
         url=url,
         connection=connection,
         sync_connection=sync_connection,
@@ -573,9 +664,19 @@ def create_async_engine(  # noqa: PLR0913 - Mirror the synchronous factory surfa
     )
     if credentials is not None:
         require_static_credential_https(cast('str', site))
+    if connection is not None and has_mismatched_methods(connection, asynchronous=True):
+        raise TypeError(
+            'connection= received a sync client; pass it to '
+            'create_async_engine(sync_connection=...) instead'
+        )
+    if sync_connection is not None and has_mismatched_methods(sync_connection, asynchronous=False):
+        raise TypeError(
+            'sync_connection= received an async client; pass it to '
+            'create_async_engine(connection=...) instead'
+        )
     backend = (
         _create_native_backend(site, connection, credentials, async_creator)
-        if strategy == 'native'
+        if selected_strategy == 'native'
         else _create_threaded_backend(
             site,
             sync_connection,
@@ -588,7 +689,7 @@ def create_async_engine(  # noqa: PLR0913 - Mirror the synchronous factory surfa
         registry = default_registry() if bind_default else Registry()
     return AsyncEngine(
         backend,
-        cache_root=cache_root,
+        cache_root=Path(cache_root) if cache_root is not None else None,
         policy=policy or TTLPolicy(),
         echo=echo,
         registry=registry,

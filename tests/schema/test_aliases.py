@@ -1,7 +1,6 @@
-from _fakes import _FakeShotgun
-from _support import fetch_schema
-
 from sgalchemy.schema import _aliases, _model
+from tests._fakes import FakeShotgun
+from tests._support import fetch_schema
 
 
 def _entity(type_name: str, display_name: str, *field_codes: str) -> _model.EntitySchema:
@@ -24,11 +23,11 @@ def _entity(type_name: str, display_name: str, *field_codes: str) -> _model.Enti
     )
 
 
-def _schemas(fake_sg: _FakeShotgun) -> dict[str, _model.EntitySchema]:
+def _schemas(fake_sg: FakeShotgun) -> dict[str, _model.EntitySchema]:
     return _model.build_schema(fetch_schema(fake_sg))
 
 
-def test_entity_alias_from_display_name(fake_sg: _FakeShotgun) -> None:
+def test_entity_alias_from_display_name(fake_sg: FakeShotgun) -> None:
     aliases, reports = _aliases.entity_aliases(_schemas(fake_sg))
 
     assert aliases['Vendor'] == 'CustomEntity03'
@@ -77,7 +76,7 @@ def test_field_alias_collision_with_prefixed_canonical_field_is_reported() -> No
     assert 'sg_sg_name' in reports[0]
 
 
-def test_field_alias_strip_and_collision(fake_sg: _FakeShotgun) -> None:
+def test_field_alias_strip_and_collision(fake_sg: FakeShotgun) -> None:
     schemas = _schemas(fake_sg)
 
     shot_aliases, shot_reports = _aliases.field_aliases(schemas['Shot'])

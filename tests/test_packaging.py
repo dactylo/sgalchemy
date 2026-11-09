@@ -5,9 +5,9 @@ import tomllib
 import zipfile
 from pathlib import Path
 
-from cli_helpers import process_transcript, run_cli, run_setup
+from tests.cli_helpers import process_transcript, run_cli, run_setup
 
-ROOT = Path(__file__).resolve().parents[1]
+_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _build(project: Path, target: str) -> Path:
@@ -22,10 +22,10 @@ def _build(project: Path, target: str) -> Path:
 def _copy_project(destination: Path) -> None:
     destination.mkdir()
     for name in ('pyproject.toml', 'README.md', 'LICENSE'):
-        source = ROOT / name
+        source = _ROOT / name
         if source.is_file():
             shutil.copy2(source, destination / name)
-    source = ROOT / 'src'
+    source = _ROOT / 'src'
     shutil.copytree(
         source, destination / 'src', ignore=shutil.ignore_patterns('__pycache__', '*.pyc')
     )

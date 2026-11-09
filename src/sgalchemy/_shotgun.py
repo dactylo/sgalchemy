@@ -1,6 +1,6 @@
 """Define structural protocols for the consumed provider API."""
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from types import MappingProxyType
 from typing import Any, Literal, Protocol, TypeAlias, runtime_checkable
 
@@ -41,14 +41,14 @@ class AsyncShotgunLike(Protocol):
     Implementations supply awaitable methods with the documented provider
     result shapes. Supplying this protocol to an engine does not transfer
     client ownership or require a close method.
-
-    Attributes:
-        base_url: Complete site URL used to identify the supplied connection.
     """
 
-    base_url: str
+    @property
+    def base_url(self) -> str:
+        """Return the complete site URL that identifies the supplied connection."""
+        ...
 
-    async def batch(self, requests: list[WireRecord]) -> list[BatchItem]:
+    async def batch(self, requests: list[WireRecord]) -> Sequence[object]:
         """Execute create/update/delete requests atomically.
 
         Args:
@@ -65,14 +65,14 @@ class AsyncShotgunLike(Protocol):
         entity_type: str,
         filters: list[Any],
         fields: list[str] | None = None,
-        order: list[dict[str, str]] | None = None,
+        order: list[Any] | None = None,
         filter_operator: str | None = None,
         limit: int = 0,
         retired_only: bool = False,
         page: int = 0,
         include_archived_projects: bool = True,
         additional_filter_presets: list[dict[str, Any]] | None = None,
-    ) -> WireRecords:
+    ) -> Sequence[Mapping[str, Any]]:
         """Return entity records matching the filters.
 
         Args:
@@ -97,8 +97,8 @@ class AsyncShotgunLike(Protocol):
         entity_type: str,
         filters: list[Any],
         fields: list[str] | None = None,
-    ) -> WireRecord | None:
-        """Return the first matching record, or None.
+    ) -> Mapping[str, Any] | None:
+        """Return the first matching record, or `None`.
 
         Args:
             entity_type: Entity type name to query.
@@ -106,7 +106,7 @@ class AsyncShotgunLike(Protocol):
             fields: Field codes to return (server defaults to `id`).
 
         Returns:
-            The first matching record dict, or None when nothing matches.
+            The first matching record dict, or `None` when nothing matches.
         """
         ...
 
@@ -122,7 +122,7 @@ class AsyncShotgunLike(Protocol):
         """
         ...
 
-    async def schema_entity_read(self) -> dict[str, dict[str, Any]]:
+    async def schema_entity_read(self) -> dict[str, Any]:
         """Return entity-type metadata (display names, visibility).
 
         Returns:
@@ -130,7 +130,7 @@ class AsyncShotgunLike(Protocol):
         """
         ...
 
-    async def schema_read(self) -> dict[str, dict[str, Any]]:
+    async def schema_read(self) -> dict[str, Any]:
         """Return the field schema for every entity type.
 
         Returns:
@@ -144,9 +144,9 @@ class AsyncShotgunLike(Protocol):
         filters: list[Any],
         summary_fields: list[dict[str, str]],
         filter_operator: str | None = None,
-        grouping: list[dict[str, str]] | None = None,
+        grouping: list[Any] | None = None,
         include_archived_projects: bool = True,
-    ) -> WireRecord:
+    ) -> Mapping[str, Any]:
         """Return aggregate values and optional grouping rows.
 
         Args:
@@ -214,14 +214,14 @@ class ShotgunLike(Protocol):
     Implementations supply synchronous methods with the documented provider
     result shapes. Supplying this protocol to an engine does not transfer
     client ownership or require a close method.
-
-    Attributes:
-        base_url: Complete site URL used to identify the supplied connection.
     """
 
-    base_url: str
+    @property
+    def base_url(self) -> str:
+        """Return the complete site URL that identifies the supplied connection."""
+        ...
 
-    def batch(self, requests: list[WireRecord]) -> list[BatchItem]:
+    def batch(self, requests: list[WireRecord]) -> Sequence[object]:
         """Execute create/update/delete requests atomically.
 
         Args:
@@ -238,14 +238,14 @@ class ShotgunLike(Protocol):
         entity_type: str,
         filters: list[Any],
         fields: list[str] | None = None,
-        order: list[dict[str, str]] | None = None,
+        order: list[Any] | None = None,
         filter_operator: str | None = None,
         limit: int = 0,
         retired_only: bool = False,
         page: int = 0,
         include_archived_projects: bool = True,
         additional_filter_presets: list[dict[str, Any]] | None = None,
-    ) -> WireRecords:
+    ) -> Sequence[Mapping[str, Any]]:
         """Return entity records matching the filters.
 
         Args:
@@ -270,8 +270,8 @@ class ShotgunLike(Protocol):
         entity_type: str,
         filters: list[Any],
         fields: list[str] | None = None,
-    ) -> WireRecord | None:
-        """Return the first matching record, or None.
+    ) -> Mapping[str, Any] | None:
+        """Return the first matching record, or `None`.
 
         Args:
             entity_type: Entity type name to query.
@@ -279,7 +279,7 @@ class ShotgunLike(Protocol):
             fields: Field codes to return (server defaults to `id`).
 
         Returns:
-            The first matching record dict, or None when nothing matches.
+            The first matching record dict, or `None` when nothing matches.
         """
         ...
 
@@ -295,7 +295,7 @@ class ShotgunLike(Protocol):
         """
         ...
 
-    def schema_entity_read(self) -> dict[str, dict[str, Any]]:
+    def schema_entity_read(self) -> dict[str, Any]:
         """Return entity-type metadata (display names, visibility).
 
         Returns:
@@ -303,7 +303,7 @@ class ShotgunLike(Protocol):
         """
         ...
 
-    def schema_read(self) -> dict[str, dict[str, Any]]:
+    def schema_read(self) -> dict[str, Any]:
         """Return the field schema for every entity type.
 
         Returns:
@@ -317,9 +317,9 @@ class ShotgunLike(Protocol):
         filters: list[Any],
         summary_fields: list[dict[str, str]],
         filter_operator: str | None = None,
-        grouping: list[dict[str, str]] | None = None,
+        grouping: list[Any] | None = None,
         include_archived_projects: bool = True,
-    ) -> WireRecord:
+    ) -> Mapping[str, Any]:
         """Return aggregate values and optional grouping rows.
 
         Args:

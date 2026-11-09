@@ -175,13 +175,13 @@ def _parse_cache_payload(payload: object) -> SchemaCache:
 
 
 def load_cache(path: Path) -> SchemaCache | None:
-    """Load a cached schema; missing or corrupt files yield None, never an error.
+    """Load a cached schema; missing or corrupt files yield `None`, never an error.
 
     Args:
         path: Cache file to read.
 
     Returns:
-        Parsed cache, or None when the file is missing or corrupt.
+        Parsed cache, or `None` when the file is missing or corrupt.
     """
     try:
         payload = cast('object', json.loads(path.read_text(encoding='utf-8')))

@@ -1,13 +1,10 @@
 import asyncio
-import os
 from importlib import import_module
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
-from _fakes import _FakeShotgun
-from _support import PROVIDER_DISTRIBUTIONS, fetch_schema
 
 from sgalchemy._core._async_engine import create_async_engine
 from sgalchemy._core._engine import create_engine
@@ -21,6 +18,8 @@ from sgalchemy._shotgun import (
     ClosableShotgunLike,
 )
 from sgalchemy.testing import mockgun_engine
+from tests._fakes import FakeShotgun
+from tests._support import PROVIDER_DISTRIBUTIONS, fetch_schema
 
 
 def _installed(distribution: str) -> bool:
@@ -70,14 +69,14 @@ def test_selected_provider_construction_matrix(tmp_path: Path) -> None:
         threaded = create_async_engine(
             site, strategy='threaded', creator=make_client, cache_root=tmp_path
         )
-        assert await cast('Any', threaded)._backend.supports('find')
+        assert await threaded._backend.supports('find')
         await threaded.dispose()
 
     asyncio.run(threaded_scenario())
 
     async def native_scenario() -> None:
         native = create_async_engine(site, session_token=value, cache_root=tmp_path)
-        supports = cast('Any', native)._supports
+        supports = native._supports
         if installed == ['api']:
             assert await supports('find')
 
@@ -85,7 +84,7 @@ def test_selected_provider_construction_matrix(tmp_path: Path) -> None:
                 return provider.AsyncShotgun(site, session_token=value)
 
             with_creator = create_async_engine(site, async_creator=make_async, cache_root=tmp_path)
-            assert await cast('Any', with_creator)._supports('find')
+            assert await with_creator._supports('find')
             await with_creator.dispose()
             await native.dispose()
         else:
@@ -97,16 +96,10 @@ def test_selected_provider_construction_matrix(tmp_path: Path) -> None:
 
 @pytest.mark.provider_contract
 def test_selected_provider_sync_and_threaded_contract(
-    fake_sg: _FakeShotgun, tmp_path: Path
+    fake_sg: FakeShotgun, tmp_path: Path
 ) -> None:
-    required = os.environ.get('SGALCHEMY_REQUIRE_PROVIDER')
-    if required is not None and required not in PROVIDER_DISTRIBUTIONS:
-        pytest.fail(f'unknown SGALCHEMY_REQUIRE_PROVIDER value: {required!r}')
+    # Required-provider runs are validated at collection in tests/conftest.py.
     installed = [name for name, dist in PROVIDER_DISTRIBUTIONS.items() if _installed(dist)]
-    if required is not None and required not in installed:
-        pytest.fail(
-            f'required provider distribution is unavailable: {PROVIDER_DISTRIBUTIONS[required]}'
-        )
     if len(installed) > 1:
         pytest.fail('both provider distributions are installed; select exactly one')
     if not installed:
@@ -115,7 +108,7 @@ def test_selected_provider_sync_and_threaded_contract(
     sync_engine = mockgun_engine(fetch_schema(fake_sg), cache_root=tmp_path / 'sync')
     sync_engine.load_schema()
     sync_session = Session(sync_engine)
-    sync_shot_cls = cast('Any', sync_engine.entities.Shot)
+    sync_shot_cls = sync_engine.entities.Shot
     sync_obj = sync_shot_cls.new(code='sync-provider')
     sync_session.add(sync_obj)
     sync_session.commit()
@@ -142,7 +135,7 @@ def test_selected_provider_sync_and_threaded_contract(
         )
         await async_engine.load_schema()
         async_session = AsyncSession(async_engine)
-        async_shot_cls = cast('Any', async_engine.entities.Shot)
+        async_shot_cls = async_engine.entities.Shot
         async_obj = async_shot_cls.new(code='threaded-provider')
         async_session.add(async_obj)
         await async_session.commit()

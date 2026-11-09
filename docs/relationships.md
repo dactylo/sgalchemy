@@ -1,26 +1,11 @@
 # Queries and relationships
 
-This page shows how to query entities and load related records without hidden network calls. If you
-have not loaded a schema and run a first query yet, start with the
+This page shows how to query entities and load related records with explicit control over network
+calls. If you have not loaded a schema and run a first query yet, start with the
 [README quick start](../README.md#quick-start).
 
-## The loading rule
-
-Reading a field or relationship that a query did not load raises an error instead of calling SG.
-Every provider call therefore happens at a query or an explicit load that you can see in your code,
-never inside an ordinary attribute read in a loop.
-
-- **Fields:** a query loads every API-readable field of the selected type unless `load_only()` or
-  `defer()` narrows it. Reading a field that was left out raises `UnfetchedFieldError`, whose
-  message names the option that would load it.
-- **Relationships:** a relationship field loads as linked entity objects. Each link carries the
-  target's type and ID and the fields the provider sends with the link, such as `name`. Reading any
-  other field of the target raises `UnfetchedFieldError` until a relationship loader reads the
-  target records.
-
-`UnfetchedFieldError` inherits `AttributeError`, because an unloaded field is an expected, harmless
-absence. Other field errors, such as `RefreshRequiredError`, deliberately do not; see
-[field trust](sessions.md#field-trust).
+Choose [entity objects](#select-entities), [rows or summaries](#select-fields-and-summaries), then
+[choose a relationship loader](#choose-a-relationship-loader) for the related fields you need.
 
 ## Select entities
 
@@ -40,9 +25,89 @@ statement = (
 shots = session.scalars(statement)
 ```
 
+You can also write `Shot.sg_status_list.in_(['ip', 'rev'])`; both forms build the same filter.
+
 `session.scalars()` returns a list of entity objects. It does not send pending writes; call
 `commit()` for those. Use `session.execute()` for statements that select individual fields or
 summaries instead of entities.
+
+## The loading rule
+
+By default, reading a field or relationship that a query did not load raises an error instead of
+calling SG. Queries and explicit loads control provider I/O. Synchronous code can opt into
+[`lazyload()`](#lazy-loading), which loads a relationship on its first attribute read.
+
+- **Fields:** a query loads every API-readable field of the selected type unless `load_only()` or
+  `defer()` narrows it. Reading a field that was left out raises `UnfetchedFieldError`, whose
+  message says how to load it.
+- **Relationships:** a relationship field loads as linked entity objects. Each link carries the
+  target's type and ID and the fields the provider sends with the link, such as `name`. Reading any
+  other field of the target raises `UnfetchedFieldError` until a relationship loader reads the
+  target records.
+
+`UnfetchedFieldError` inherits `AttributeError`, because an unloaded field is an expected, harmless
+absence. Other field errors, such as `RefreshRequiredError`, deliberately do not; see
+[field trust](sessions.md#field-trust).
+
+## Select fields and summaries
+
+Select fields instead of an entity class when you want a table of values rather than objects.
+`session.execute()` returns a `Result`, which is a list of `Row` objects. A row is a read-only
+mapping keyed by field path, and a plain field name also works as an attribute:
+
+```python
+from sgalchemy import or_, select
+
+statement = (
+    select(Shot.code, Shot.sg_status_list, Shot.sg_sequence.code)
+    .where(or_(Shot.sg_status_list == 'ip', Shot.sg_status_list == 'rev'))
+    .order_by(Shot.code.asc())
+)
+for row in session.execute(statement):
+    print(row.code, row.sg_status_list, row['sg_sequence.Sequence.code'])
+```
+
+A field reached through a link is keyed by its wire path, `link.TargetType.field`, so read it with
+`row[...]`.
+
+Wrap a field in `func` to summarize instead, and add `group_by()` to get one summary per group.
+`session.execute()` then returns the provider's summary payload unchanged. See
+[Query reference](#query-reference) for the supported summary types:
+
+```python
+from sgalchemy import func, select
+
+statement = select(func.count(Shot.id)).group_by(Shot.sg_status_list)
+payload = session.execute(statement)
+payload['summaries']  # {'id': 3}
+payload['groups'][0]  # {'group_name': 'ip', 'group_value': 'ip', 'summaries': {'id': 2}}
+```
+
+## Filter, order, and page results
+
+`where()` requires all of its conditions to match. Nest `and_()` and `or_()` for other
+combinations, and use `raw()` to pass a filter list in SG syntax unchanged, such as
+`raw([['sg_status_list', 'is_not', 'omt']])`. Entity and field statements also accept `limit()` and
+`page()`, which selects a one-based page of results; summary statements reject ordering, limits,
+and pages.
+
+## Query reference
+
+`func` accepts the following server summary types:
+
+- `count`
+- `record_count`
+- `sum`
+- `avg`
+- `min`
+- `max`
+- `earliest`
+- `latest`
+- `percentage`
+- `status_percentage`
+- `status_list`
+- `checked`
+- `unchecked`
 
 ## Choose a relationship loader
 

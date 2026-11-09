@@ -7,14 +7,15 @@ import re
 import sys
 import warnings
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 
 from sgalchemy import _stubgen
-from sgalchemy._core._engine import Engine, create_engine
+from sgalchemy._core._construction import require_static_credential_https, validate_site
+from sgalchemy._core._engine import Engine, SchemaLoad, create_engine, load_schema_with_source
 from sgalchemy._downstream import write_stdout
 from sgalchemy._errors import SgalchemyError
 from sgalchemy.schema._cache import SchemaCache, load_cache
-from sgalchemy.schema._cachedir import cache_file
 
 _COMMAND_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
     (
@@ -43,7 +44,7 @@ class _CommandError(Exception):
     def __init__(self, message: str, status: int) -> None:
         """Record the message and the exit status it maps to."""
         super().__init__(message)
-        self._status = status
+        self.status = status
 
 
 class _RootParser(argparse.ArgumentParser):
@@ -82,9 +83,13 @@ def _build_parser() -> argparse.ArgumentParser:
     stubs = commands.add_parser(
         'stubs',
         help=_COMMAND_HELP['stubs'],
-        description='Generate or check type stubs for the entity classes in a site schema.',
+        description=(
+            'Generate or check type stubs for the entity classes in a site schema. '
+            'Read the schema from --from-cache FILE, or from --site URL with credentials.'
+        ),
         epilog=(
-            'With --site, the API key comes from SGALCHEMY_API_KEY or a hidden terminal prompt.'
+            'With --script-name, the API key comes from SGALCHEMY_API_KEY or a hidden '
+            'terminal prompt. Without it, the session token comes from SGALCHEMY_SESSION_TOKEN.'
         ),
     )
     stubs.set_defaults(command_parser=stubs)
@@ -110,7 +115,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help='read the schema from a saved cache file',
     )
     source.add_argument('--site', metavar='URL', help='site URL to read the schema from')
-    source.add_argument('--script-name', metavar='NAME', help='script name to authenticate with')
+    source.add_argument(
+        '--script-name', metavar='NAME', help='script name to authenticate with an API key'
+    )
     content = stubs.add_argument_group('stub content')
     content.add_argument(
         '--no-entity-aliases',
@@ -142,14 +149,17 @@ def _build_parser() -> argparse.ArgumentParser:
         'refresh',
         help='fetch the schema now and rewrite its cache file',
         description='Fetch the site schema now and rewrite its cache file.',
-        epilog='The API key comes from SGALCHEMY_API_KEY or a hidden terminal prompt.',
+        epilog=(
+            'With --script-name, the API key comes from SGALCHEMY_API_KEY or a hidden '
+            'terminal prompt. Without it, the session token comes from SGALCHEMY_SESSION_TOKEN.'
+        ),
     )
     refresh.set_defaults(command_parser=refresh)
     refresh.add_argument(
         '--site', required=True, metavar='URL', help='site URL whose schema to fetch'
     )
     refresh.add_argument(
-        '--script-name', required=True, metavar='NAME', help='script name to authenticate with'
+        '--script-name', metavar='NAME', help='script name to authenticate with an API key'
     )
     return parser
 
@@ -159,6 +169,11 @@ def _describe_failure(error: Exception) -> str:
     return str(error) or type(error).__name__
 
 
+def _format_fetched(at: datetime) -> str:
+    """Format a schema snapshot timestamp in UTC at minute precision."""
+    return at.astimezone(UTC).strftime('%Y-%m-%d %H:%M UTC')
+
+
 def _is_provider_failure(error: Exception) -> bool:
     """Report whether an exception is a provider, network, or schema-cache failure."""
     return isinstance(error, (OSError, SgalchemyError)) or any(
@@ -166,10 +181,10 @@ def _is_provider_failure(error: Exception) -> bool:
     )
 
 
-def _load_site_schema(engine: Engine, *, force: bool) -> None:
+def _load_site_schema(engine: Engine, *, force: bool) -> SchemaLoad:
     """Load the site schema, mapping a missing provider and provider failures."""
     try:
-        engine.load_schema(force=force)
+        return load_schema_with_source(engine, force=force)
     except ModuleNotFoundError as error:
         if error.name != _PROVIDER_MODULE:
             raise
@@ -187,7 +202,7 @@ def _read_api_key(parser: argparse.ArgumentParser) -> str:
     key = os.environ.get('SGALCHEMY_API_KEY')
     if key:
         return key
-    if not sys.stdin.isatty():
+    if sys.stdin is None or not sys.stdin.isatty():
         parser.error('set SGALCHEMY_API_KEY or run interactively to enter an API key')
     try:
         with warnings.catch_warnings():
@@ -221,46 +236,75 @@ def _report_error(message: str) -> None:
     print(f'error: {visible}', file=sys.stderr)
 
 
-def _site_engine(site: str, script_name: str, parser: argparse.ArgumentParser) -> Engine:
-    """Create an engine for one site, reporting an invalid site URL or script name."""
-    api_key = _read_api_key(parser)
+def _report_warning(message: str) -> None:
+    """Print one terminal-safe warning line to standard error."""
+    visible = _CONTROL_CHARACTERS.sub(lambda match: f'\\x{ord(match.group()):02x}', message)
+    print(f'warning: {visible}', file=sys.stderr)
+
+
+def _site_engine(site: str, script_name: str | None, parser: argparse.ArgumentParser) -> Engine:
+    """Validate site options before selecting script or session-token credentials."""
     try:
-        return create_engine(site, script_name=script_name, api_key=api_key)
+        site = validate_site(site)
+        require_static_credential_https(site)
+    except ValueError as error:
+        raise _CommandError('--site must be a complete https URL', 2) from error
+    if script_name is not None and not script_name.strip():
+        raise _CommandError('--script-name must not be empty', 2)
+    try:
+        if script_name is not None:
+            return create_engine(site, script_name=script_name, api_key=_read_api_key(parser))
+        token = os.environ.get('SGALCHEMY_SESSION_TOKEN')
+        if not token:
+            parser.error(
+                'authenticate with --script-name NAME and an API key, '
+                'or set SGALCHEMY_SESSION_TOKEN'
+            )
+        return create_engine(site, session_token=token)
     except ValueError as error:
         raise _CommandError(str(error), 2) from error
-
-
-def _connected_engine(
-    args: argparse.Namespace,
-    parser: argparse.ArgumentParser,
-) -> Engine:
-    """Create an engine from validated CLI credentials."""
-    if args.site is None or args.script_name is None:
-        parser.error('stubs requires --from-cache or both --site and --script-name')
-    return _site_engine(args.site, args.script_name, parser)
 
 
 def _load_schema_cache(
     args: argparse.Namespace,
     parser: argparse.ArgumentParser,
-) -> SchemaCache:
-    """Load the explicit or connection-populated schema cache."""
-    path = args.from_cache
-    if path is None:
-        engine = _connected_engine(args, parser)
-        _load_site_schema(engine, force=False)
-        path = cache_file(engine.site)
-    cache = load_cache(path)
-    if cache is None:
-        parser.error(f'could not load schema cache: {path}')
-    return cache
+) -> tuple[SchemaCache, str]:
+    """Load the chosen schema snapshot and describe its source."""
+    if args.from_cache is not None:
+        cache = load_cache(args.from_cache)
+        if cache is None:
+            parser.error(f'could not load schema cache: {args.from_cache}')
+        return cache, f'schema: {args.from_cache} (fetched {_format_fetched(cache.fetched_at)})'
+    engine = _site_engine(args.site, args.script_name, parser)
+    load = _load_site_schema(engine, force=False)
+    if load.store_error is not None:
+        _report_warning(
+            f'could not write the schema cache {load.path}: '
+            f'{_describe_failure(load.store_error)}; using the fetched schema without caching it. '
+            'Set SGALCHEMY_SCHEMA_CACHE to use a writable directory'
+        )
+    if load.fetched:
+        source = f'schema: fetched from {engine.site}'
+    else:
+        source = (
+            f'schema: cached copy fetched {_format_fetched(load.cache.fetched_at)}; '
+            "run 'sgalchemy schema refresh' to fetch the current schema"
+        )
+    return load.cache, source
 
 
 def _refresh_schema(args: argparse.Namespace, parser: argparse.ArgumentParser) -> tuple[int, str]:
     """Force a schema refetch and return its cache path."""
     engine = _site_engine(args.site, args.script_name, parser)
-    _load_site_schema(engine, force=True)
-    return 0, f'refreshed schema cache: {cache_file(engine.site)}\n'
+    load = _load_site_schema(engine, force=True)
+    if load.store_error is not None:
+        raise _CommandError(
+            f'could not write the schema cache {load.path}: '
+            f'{_describe_failure(load.store_error)}; '
+            'set SGALCHEMY_SCHEMA_CACHE to a writable directory',
+            1,
+        )
+    return 0, f'refreshed schema cache: {load.path}\n'
 
 
 def _run_stubs(
@@ -268,7 +312,11 @@ def _run_stubs(
     parser: argparse.ArgumentParser,
 ) -> tuple[int, str]:
     """Generate or check stubs against the selected schema cache."""
-    cache = _load_schema_cache(args, parser)
+    if args.from_cache is not None and (args.site is not None or args.script_name is not None):
+        parser.error('choose one schema source: --from-cache FILE, or --site URL with credentials')
+    if args.from_cache is None and args.site is None:
+        parser.error('stubs requires --from-cache FILE or --site URL')
+    cache, source = _load_schema_cache(args, parser)
     if args.check:
         fresh = _stubgen.check_stubs(
             cache,
@@ -277,7 +325,8 @@ def _run_stubs(
             field_aliases=args.field_aliases,
             permissive=args.permissive,
         )
-        return (0, 'stubs are fresh\n') if fresh else (1, 'stub drift detected\n')
+        message = 'stubs are fresh' if fresh else 'stub drift detected'
+        return (0 if fresh else 1), f'{source}\n{message}\n'
 
     try:
         report = _stubgen.generate_stubs(
@@ -289,7 +338,7 @@ def _run_stubs(
         )
     except (OSError, SgalchemyError) as error:
         raise _CommandError(f'could not write stubs: {_describe_failure(error)}', 1) from error
-    lines = [f'wrote {path}' for path in report.written]
+    lines = [source, *(f'wrote {path}' for path in report.written)]
     if report.skipped_aliases:
         lines.append(f'aliases skipped: {", ".join(report.skipped_aliases)}')
     else:
@@ -310,7 +359,7 @@ def _run(arguments: list[str]) -> tuple[int, str]:
         result = handler(args, args.command_parser)
     except _CommandError as failure:
         _report_error(str(failure))
-        return failure._status, ''  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        return failure.status, ''
     return result
 
 
@@ -326,10 +375,16 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     Returns:
         The process exit status.
+
+    Raises:
+        SystemExit: With status 2 for invalid arguments or missing input, or
+            status 0 after printing `--help`.
+        OSError: If writing or flushing command output fails for a reason other
+            than downstream closure.
     """
     if sys.stdout is None:
-        # Started with standard output closed: nothing can be delivered, and the
-        # no text stream is available to write to.
+        # Started with standard output closed: nothing can be delivered, and
+        # no text stream exists to write to.
         _report_error('standard output is unavailable')
         return 2
     output = ''

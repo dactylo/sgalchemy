@@ -13,11 +13,11 @@ from unittest import mock
 from sgalchemy._cli import main
 
 # Hang guard, not a performance assertion. Allow for scheduling on shared CI hosts.
-CHILD_TIMEOUT_SECONDS = 300
+_CHILD_TIMEOUT_SECONDS = 300
 _COLLECT_AFTER_KILL_SECONDS = 10
 _CONTROL_CHARACTERS = re.compile(r'[\x00-\x08\x0b-\x1f\x7f-\x9f]')
 _ENV = {**os.environ, 'PYTHON_COLORS': '0'}
-PROCESS_GROUP_FLAGS = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == 'win32' else 0
+_PROCESS_GROUP_FLAGS = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == 'win32' else 0
 _TRANSCRIPT_FIELD_CHARACTERS = 2048
 _TRANSCRIPT_HEAD_BYTES = 2048
 _TRANSCRIPT_TAIL_BYTES = 6144
@@ -111,7 +111,7 @@ def _transcript_stream(label: str, data: str | bytes | None) -> list[str]:
 def invoke_cli(
     argv: Sequence[str],
     *,
-    stdin: str = '',
+    stdin: str | None = '',
     cwd: Path | str | None = None,
 ) -> tuple[int, str, str]:
     stdout_buffer = io.BytesIO()
@@ -120,7 +120,11 @@ def invoke_cli(
     stderr = io.TextIOWrapper(
         stderr_buffer, encoding='utf-8', errors='backslashreplace', newline=''
     )
-    stdin_stream = io.TextIOWrapper(io.BytesIO(stdin.encode('utf-8')), encoding='utf-8')
+    stdin_stream = (
+        None
+        if stdin is None
+        else io.TextIOWrapper(io.BytesIO(stdin.encode('utf-8')), encoding='utf-8')
+    )
     with contextlib.ExitStack() as stack:
         stack.enter_context(mock.patch.dict(os.environ, {'COLUMNS': '80', 'PYTHON_COLORS': '0'}))
         stack.enter_context(contextlib.redirect_stdout(stdout))
@@ -176,11 +180,11 @@ def _kill_and_describe(
     return process_transcript(killed, cwd=cwd, note=reason)
 
 
-def finish_process(
+def _finish_process(
     process: subprocess.Popen[_Output],
     *,
     stdin: _Output | None = None,
-    timeout: float = CHILD_TIMEOUT_SECONDS,
+    timeout: float = _CHILD_TIMEOUT_SECONDS,
     cwd: Path | str | None = None,
 ) -> subprocess.CompletedProcess[_Output]:
     try:
@@ -210,9 +214,9 @@ def run_cli(
         env=dict(_ENV if env is None else env),
         cwd=cwd,
         start_new_session=True,
-        creationflags=PROCESS_GROUP_FLAGS,
+        creationflags=_PROCESS_GROUP_FLAGS,
     )
-    result = finish_process(process, stdin=stdin, timeout=CHILD_TIMEOUT_SECONDS, cwd=cwd)
+    result = _finish_process(process, stdin=stdin, timeout=_CHILD_TIMEOUT_SECONDS, cwd=cwd)
     if expect is not None and result.returncode != expect:
         raise AssertionError(f'expected status {expect}\n{process_transcript(result, cwd=cwd)}')
     return result
@@ -234,9 +238,9 @@ def run_setup(
         env=None if env is None else dict(env),
         cwd=cwd,
         start_new_session=True,
-        creationflags=PROCESS_GROUP_FLAGS,
+        creationflags=_PROCESS_GROUP_FLAGS,
     )
-    result = finish_process(process, stdin=stdin, timeout=CHILD_TIMEOUT_SECONDS, cwd=cwd)
+    result = _finish_process(process, stdin=stdin, timeout=_CHILD_TIMEOUT_SECONDS, cwd=cwd)
     if check and result.returncode != 0:
         raise AssertionError(f'setup command failed\n{process_transcript(result, cwd=cwd)}')
     return result
@@ -247,7 +251,7 @@ def run_with_closed_output(
     *,
     closed: Literal['stdout', 'stderr'] = 'stdout',
     stdin: bytes | None = None,
-    timeout: float = CHILD_TIMEOUT_SECONDS,
+    timeout: float = _CHILD_TIMEOUT_SECONDS,
     env: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     read_fd, write_fd = os.pipe()
@@ -260,8 +264,8 @@ def run_with_closed_output(
             stderr=write_fd if closed == 'stderr' else subprocess.PIPE,
             env=dict(_ENV if env is None else env),
             start_new_session=True,
-            creationflags=PROCESS_GROUP_FLAGS,
+            creationflags=_PROCESS_GROUP_FLAGS,
         )
     finally:
         os.close(write_fd)
-    return finish_process(process, stdin=stdin, timeout=timeout)
+    return _finish_process(process, stdin=stdin, timeout=timeout)

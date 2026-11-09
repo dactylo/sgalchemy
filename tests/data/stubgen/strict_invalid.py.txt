@@ -10,6 +10,7 @@ def check_invalid(shot: Shot) -> None:
     shot.id = 42  # error: reportAttributeAccessIssue
     shot.sg_uploaded_movie = 'clip.mov'  # error: reportAttributeAccessIssue
     shot.filmstrip_image = None  # error: reportAttributeAccessIssue
+    shot.created_at = None  # error: reportAttributeAccessIssue
     image = shot.image
     if image is not None:
         print(image.upper())  # error: reportAttributeAccessIssue

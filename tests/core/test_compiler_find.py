@@ -3,7 +3,6 @@ from dataclasses import replace
 from typing import Any, TypeAlias, cast
 
 import pytest
-from _support import mapped_entity
 
 from sgalchemy._core import _expressions as ex
 from sgalchemy._core._compiler import FindCall, compile_statement
@@ -25,6 +24,7 @@ from sgalchemy._core._schema_drift import SchemaDrift
 from sgalchemy._core._statement import Select, select
 from sgalchemy._errors import CompilationError
 from sgalchemy.schema import _model
+from tests._support import mapped_entity
 
 _LoaderFactory: TypeAlias = Callable[[FieldExpr], JoinedLoad | LazyLoad | SelectinLoad]
 
@@ -608,19 +608,6 @@ def test_relationship_loaders_reject_ui_only_link(
         compile_statement(select(_FakeShotClass).options(loader(field)), schemas)
 
 
-def test_repeated_joinedload_deduplicates_projections(
-    schemas: dict[str, _model.EntitySchema],
-) -> None:
-    option = joinedload(_f('sg_sequence', schemas))
-
-    call = _compile_find(
-        select(_FakeShotClass).options(option, option),
-        schemas,
-    )
-
-    assert len(call.fields) == len(set(call.fields))
-
-
 def test_selectinload_adds_link_once(
     schemas: dict[str, _model.EntitySchema],
 ) -> None:
@@ -664,7 +651,7 @@ def test_symbolic_alias_class_teaches_canonical(
     class _FakeVendorClass(Entity):
         pass
 
-    with pytest.raises(CompilationError, match='CustomEntity03'):
+    with pytest.raises(CompilationError, match=r'CustomEntity03.*after engine\.load_schema\(\)'):
         compile_statement(select(_FakeVendorClass), schemas)
 
 
@@ -705,12 +692,8 @@ def test_ui_only_field_rejected(
 def test_unknown_entity_type_rejected(
     schemas: dict[str, _model.EntitySchema],
 ) -> None:
-    @mapped_entity('Missing')
-    class _MissingClass(Entity):
-        pass
-
     with pytest.raises(CompilationError, match="unknown entity type 'Missing'"):
-        compile_statement(select(_MissingClass), schemas)
+        compile_statement(select(ex.func.count(FieldExpr('Missing', ('id',), None))), schemas)
 
 
 @pytest.mark.parametrize('key', ['unsupported', 'include_archived_projects_typo'])

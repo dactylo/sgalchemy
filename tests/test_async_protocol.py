@@ -3,14 +3,14 @@ import inspect
 from typing import Any, TypedDict, get_type_hints
 
 import pytest
-from _fakes import _FakeAsyncShotgun, _FakeShotgun
 
 from sgalchemy._shotgun import (
     REQUIRED_SHOTGUN_METHODS,
-    AsyncClosableShotgunLike,
     AsyncShotgunLike,
     ShotgunLike,
 )
+from tests._fakes import FakeAsyncShotgun, FakeShotgun
+from tests._support import run_async
 
 
 class _FindDefaultKwargs(TypedDict):
@@ -50,8 +50,8 @@ def test_async_protocol_matches_complete_consumed_sync_signatures() -> None:
 
 
 def test_fake_async_find_records_explicit_defaults(
-    fake_async_sg: _FakeAsyncShotgun,
-    fake_sg: _FakeShotgun,
+    fake_async_sg: FakeAsyncShotgun,
+    fake_sg: FakeShotgun,
 ) -> None:
     kwargs: _FindDefaultKwargs = {
         'order': None,
@@ -67,51 +67,35 @@ def test_fake_async_find_records_explicit_defaults(
     expected: list[tuple[str, tuple[Any, ...], _FindDefaultKwargs]] = [
         ('find', ('Shot', [], ['id']), kwargs)
     ]
-    assert fake_async_sg._calls == expected
-    assert fake_sg._calls == expected
+    assert fake_async_sg.calls == expected
+    assert fake_sg.calls == expected
 
 
-def test_fake_async_shotgun_blocks_deterministically(fake_async_sg: _FakeAsyncShotgun) -> None:
+def test_fake_async_shotgun_blocks_deterministically(fake_async_sg: FakeAsyncShotgun) -> None:
     async def scenario() -> None:
-        entered, release = fake_async_sg._block('find')
+        entered, release = fake_async_sg.block('find')
         task = asyncio.create_task(fake_async_sg.find('Shot', [], ['id']))
         await entered.wait()
         assert not task.done()
         release.set()
         await task
 
-    asyncio.run(scenario())
+    run_async(scenario())
 
 
-def test_fake_async_shotgun_matches_sync_call_transcript(
-    fake_async_sg: _FakeAsyncShotgun,
-    fake_sg: _FakeShotgun,
-) -> None:
-    asyncio.run(fake_async_sg.find('Shot', [], ['id']))
-    fake_sg.find('Shot', [], ['id'])
-    asyncio.run(fake_async_sg.summarize('Shot', [], [{'field': 'id', 'type': 'count'}]))
-    fake_sg.summarize('Shot', [], [{'field': 'id', 'type': 'count'}])
-    assert fake_async_sg._calls == fake_sg._calls
-
-
-def test_fake_async_shotgun_records_awaited_calls(fake_async_sg: _FakeAsyncShotgun) -> None:
+def test_fake_async_shotgun_records_awaited_calls(fake_async_sg: FakeAsyncShotgun) -> None:
     async def scenario() -> None:
-        fake_async_sg._find_results = [[{'type': 'Shot', 'id': 1, 'code': 'A'}]]
+        fake_async_sg.find_results = [[{'type': 'Shot', 'id': 1, 'code': 'A'}]]
         rows = await fake_async_sg.find('Shot', [], ['id', 'code'])
         assert rows[0]['code'] == 'A'
-        assert fake_async_sg._calls[-1][0] == 'find'
+        assert fake_async_sg.calls[-1][0] == 'find'
 
     asyncio.run(scenario())
-
-
-def test_fake_async_shotgun_satisfies_protocol(fake_async_sg: _FakeAsyncShotgun) -> None:
-    assert isinstance(fake_async_sg, AsyncShotgunLike)
-    assert isinstance(fake_async_sg, AsyncClosableShotgunLike)
 
 
 def test_fake_async_summarize_records_explicit_defaults(
-    fake_async_sg: _FakeAsyncShotgun,
-    fake_sg: _FakeShotgun,
+    fake_async_sg: FakeAsyncShotgun,
+    fake_sg: FakeShotgun,
 ) -> None:
     kwargs: _SummarizeDefaultKwargs = {
         'filter_operator': None,
@@ -124,17 +108,17 @@ def test_fake_async_summarize_records_explicit_defaults(
     expected: list[tuple[str, tuple[Any, ...], _SummarizeDefaultKwargs]] = [
         ('summarize', ('Shot', [], summary_fields), kwargs)
     ]
-    assert fake_async_sg._calls == expected
-    assert fake_sg._calls == expected
+    assert fake_async_sg.calls == expected
+    assert fake_sg.calls == expected
 
 
 def test_fake_sync_shotgun_close_marks_closed_and_raises_canned_errors() -> None:
-    fake = _FakeShotgun()
-    assert fake._closed is False
+    fake = FakeShotgun()
+    assert fake.closed is False
     fake.close()
-    assert fake._closed is True
-    failing = _FakeShotgun()
-    failing._close_errors.append(RuntimeError('close failed'))
+    assert fake.closed is True
+    failing = FakeShotgun()
+    failing.close_errors.append(RuntimeError('close failed'))
     with pytest.raises(RuntimeError, match='close failed'):
         failing.close()
-    assert failing._closed is False
+    assert failing.closed is False

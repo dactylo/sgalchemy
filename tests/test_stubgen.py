@@ -8,13 +8,13 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
-from _fakes import _FakeShotgun
-from _support import fetch_schema
 
 from sgalchemy import _stubgen, _stubgen_registry
 from sgalchemy._core._registry import Registry
 from sgalchemy._errors import SgalchemyError
 from sgalchemy.schema import _cache, _model
+from tests._fakes import FakeShotgun
+from tests._support import fetch_schema
 
 _NONDEFAULT_PROFILES = [
     pytest.param(False, True, False, id='no-entity-aliases'),
@@ -45,11 +45,13 @@ def _consumer_cache() -> _cache.SchemaCache:
         ('image', 'image', []),
         ('filmstrip_image', 'image', []),
         ('sg_uploaded_movie', 'image', []),
+        ('created_at', 'date_time', []),
     ):
         fields[code] = {
             'data_type': {'value': data_type},
             'properties': {'valid_types': {'value': targets}},
         }
+    fields['created_at']['editable'] = {'value': False}
     return _cache.SchemaCache(
         fields={'Shot': fields, 'Sequence': {'code': fields['code']}},
         entities={'Shot': {'name': {'value': 'Take'}}, 'Sequence': {}},
@@ -108,7 +110,7 @@ def _signature(node: ast.FunctionDef) -> tuple[object, ...]:
 
 
 def test_check_stubs_detects_crlf_only_drift(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
     cache = fetch_schema(fake_sg)
@@ -119,14 +121,14 @@ def test_check_stubs_detects_crlf_only_drift(
     assert _stubgen.check_stubs(cache, tmp_path) is False
 
 
-def test_check_stubs_detects_display_name_drift(fake_sg: _FakeShotgun, tmp_path: Path) -> None:
+def test_check_stubs_detects_display_name_drift(fake_sg: FakeShotgun, tmp_path: Path) -> None:
     cache = fetch_schema(fake_sg)
     _stubgen.generate_stubs(cache, tmp_path)
     cache.entities['CustomEntity03']['name']['value'] = 'Supplier'  # alias source changed
     assert not _stubgen.check_stubs(cache, tmp_path)
 
 
-def test_check_stubs_detects_drift(fake_sg: _FakeShotgun, tmp_path: Path) -> None:
+def test_check_stubs_detects_drift(fake_sg: FakeShotgun, tmp_path: Path) -> None:
     cache = fetch_schema(fake_sg)
     _stubgen.generate_stubs(cache, tmp_path)
     assert _stubgen.check_stubs(cache, tmp_path)
@@ -143,7 +145,7 @@ def test_check_stubs_detects_drift(fake_sg: _FakeShotgun, tmp_path: Path) -> Non
 
 
 def test_check_stubs_rejects_and_regeneration_removes_obsolete_file(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
     cache = fetch_schema(fake_sg)
@@ -157,7 +159,7 @@ def test_check_stubs_rejects_and_regeneration_removes_obsolete_file(
 
 
 def test_check_stubs_rejects_invalid_utf8(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
     cache = fetch_schema(fake_sg)
@@ -169,7 +171,7 @@ def test_check_stubs_rejects_invalid_utf8(
 
 
 def test_check_stubs_rejects_same_hash_body_mutation(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
     cache = fetch_schema(fake_sg)
@@ -184,7 +186,7 @@ def test_check_stubs_rejects_same_hash_body_mutation(
     assert _stubgen.check_stubs(cache, tmp_path) is False
 
 
-def test_flags_control_aliases_and_permissive(fake_sg: _FakeShotgun, tmp_path: Path) -> None:
+def test_flags_control_aliases_and_permissive(fake_sg: FakeShotgun, tmp_path: Path) -> None:
     cache = fetch_schema(fake_sg)
     _stubgen.generate_stubs(
         cache, tmp_path, entity_aliases=False, field_aliases=False, permissive=True
@@ -196,9 +198,9 @@ def test_flags_control_aliases_and_permissive(fake_sg: _FakeShotgun, tmp_path: P
     assert '__getattr__' in shot
 
 
-def test_generate_emits_descriptor_annotations(fake_sg: _FakeShotgun, tmp_path: Path) -> None:
+def test_generate_emits_descriptor_annotations(fake_sg: FakeShotgun, tmp_path: Path) -> None:
     cache = fetch_schema(fake_sg)
-    report = _stubgen.generate_stubs(cache, tmp_path)
+    _stubgen.generate_stubs(cache, tmp_path)
     for stub in (tmp_path / 'sgalchemy' / 'entities').glob('*.pyi'):
         ast.parse(stub.read_text())  # every generated stub is valid Python syntax
     init = (tmp_path / 'sgalchemy' / 'entities' / '__init__.pyi').read_text()
@@ -206,10 +208,11 @@ def test_generate_emits_descriptor_annotations(fake_sg: _FakeShotgun, tmp_path: 
     types_stub = (tmp_path / 'sgalchemy' / 'entities' / '_types.pyi').read_text()
     assert "_ReadT_co = TypeVar('_ReadT_co', covariant=True)" in types_stub
     assert "_WriteT_contra = TypeVar('_WriteT_contra', contravariant=True)" in types_stub
-    assert 'class _SGField(Generic[_ReadT_co, _WriteT_contra]):' in types_stub
+    assert 'class SGField(Generic[_ReadT_co, _WriteT_contra]):' in types_stub
+    assert 'from sgalchemy.entities._types import SGField as _SGField' in shot
     assert 'def __set__(self, obj: Entity, value: _WriteT_contra) -> None: ...' in types_stub
     assert 'fetched-at:' not in init
-    assert f'schema-hash: {report._hash}' in init
+    assert f'schema-hash: {_stubgen._schema_hash(cache)}' in init
     assert 'code: _SGField[str | None, str | None]' in shot
     assert (
         'image: _SGField[str | os.PathLike[str] | os.PathLike[bytes] | None, '
@@ -237,27 +240,20 @@ def test_generate_emits_descriptor_annotations(fake_sg: _FakeShotgun, tmp_path: 
     ]
 
 
-def test_generate_permissive_stub_imports_any(fake_sg: _FakeShotgun, tmp_path: Path) -> None:
-    cache = fetch_schema(fake_sg)
-    _stubgen.generate_stubs(cache, tmp_path, permissive=True)
-
-    shot = (tmp_path / 'sgalchemy' / 'entities' / '_shot.pyi').read_text()
-    assert 'from typing import Any' in shot.splitlines()
-
-
 def test_generate_rejects_colliding_entity_paths(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
     cache = fetch_schema(fake_sg)
     valid_out = tmp_path / 'valid'
     report = _stubgen.generate_stubs(cache, valid_out)
+    original_digest = _stubgen._schema_hash(cache)
     cache.fields['SHOT'] = cache.fields['Shot']
     cache.entities['SHOT'] = {'name': {'value': 'Uppercase shot'}}
     collision_digest = _stubgen._schema_hash(cache)
     for path in report.written:
         text = path.read_text(encoding='utf-8')
-        path.write_text(text.replace(report._hash, collision_digest), encoding='utf-8')
+        path.write_text(text.replace(original_digest, collision_digest), encoding='utf-8')
 
     assert not _stubgen.check_stubs(cache, valid_out)
 
@@ -272,7 +268,7 @@ def test_generate_rejects_colliding_entity_paths(
     assert not collision_out.exists()
 
 
-def test_generate_skips_unusable_field_aliases(fake_sg: _FakeShotgun, tmp_path: Path) -> None:
+def test_generate_skips_unusable_field_aliases(fake_sg: FakeShotgun, tmp_path: Path) -> None:
     cache = fetch_schema(fake_sg)
     for code in ('sg_class', 'sg_new', 'sg_valid'):
         cache.fields['Shot'][code] = {
@@ -303,7 +299,7 @@ def test_generate_skips_unusable_field_aliases(fake_sg: _FakeShotgun, tmp_path: 
 
 
 def test_generate_then_check_writes_exact_utf8_bytes_under_windows_newlines(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -325,6 +321,62 @@ def test_generate_then_check_writes_exact_utf8_bytes_under_windows_newlines(
 
     assert _stubgen.check_stubs(cache, tmp_path)
     assert all(b'\r\n' not in path.read_bytes() for path in report.written)
+
+
+def test_generated_entities_stub_declares_all(tmp_path: Path) -> None:
+    cache = _cache.SchemaCache(
+        fields={'Shot': {}},
+        entities={'Shot': {'name': {'value': 'Take'}}},
+        fetched_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    _stubgen.generate_stubs(cache, tmp_path)
+
+    init = (tmp_path / 'sgalchemy' / 'entities' / '__init__.pyi').read_text()
+    module = ast.parse(init)
+    exports = [
+        node.value
+        for node in module.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == '__all__' for target in node.targets)
+    ]
+    assert len(exports) == 1
+    assert ast.literal_eval(exports[0]) == ['Shot', 'Take']
+
+
+def test_generated_stub_allows_entity_named_sgfield(tmp_path: Path) -> None:
+    cache = _cache.SchemaCache(
+        fields={'SGField': {'code': {'data_type': {'value': 'text'}, 'properties': {}}}},
+        entities={'SGField': {}},
+        fetched_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    stub_path = tmp_path / 'typings'
+    _stubgen.generate_stubs(cache, stub_path)
+    consumer = tmp_path / 'consumer.py'
+    consumer.write_text(
+        'from sgalchemy.entities import SGField\n'
+        '\n'
+        'def read_code(entity: SGField) -> str | None:\n'
+        '    return entity.code\n'
+    )
+    config = tmp_path / 'pyrightconfig.json'
+    config.write_text(
+        json.dumps(
+            {
+                'include': [consumer.name],
+                'extraPaths': [str(Path(__file__).resolve().parents[1] / 'src')],
+                'stubPath': str(stub_path),
+                'pythonVersion': '3.11',
+                'typeCheckingMode': 'strict',
+            }
+        )
+    )
+
+    result = _run_pyright(config)
+    assert not result.stderr, result.stderr
+    payload = cast('dict[str, Any]', json.loads(result.stdout))
+    assert payload['summary']['filesAnalyzed'] == 1, result.stdout
+    assert result.returncode == 0, result.stdout
+    assert payload['generalDiagnostics'] == [], result.stdout
 
 
 def test_registry_companion_mode_switch_preserves_unowned_core_files(tmp_path: Path) -> None:
@@ -403,30 +455,47 @@ def test_registry_companion_tracks_runtime_signatures(*, permissive: bool) -> No
     }
     assert stub_functions == runtime_functions
 
+    runtime_names = {
+        node.target.id: _annotation(node.annotation)
+        for node in runtime.body
+        if isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+        and not node.target.id.startswith('_')
+    }
+    stub_names = {
+        node.target.id: _annotation(node.annotation)
+        for node in stub.body
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+    }
+    assert stub_names == runtime_names
 
-@pytest.mark.parametrize(
-    ('fixture', 'permissive'),
-    [
-        ('strict_valid', False),
-        ('strict_valid', True),
-        ('strict_invalid', False),
-        ('strict_invalid', True),
-        ('permissive', True),
-    ],
-)
-def test_generated_consumers(tmp_path: Path, fixture: str, *, permissive: bool) -> None:
+
+@pytest.mark.parametrize('permissive', [False, True])
+def test_generated_consumers(tmp_path: Path, *, permissive: bool) -> None:
     stub_path = tmp_path / 'typings'
     _stubgen.generate_stubs(_consumer_cache(), stub_path, permissive=permissive)
-    source = (Path(__file__).parent / 'data' / 'stubgen' / f'{fixture}.py.txt').read_text()
-    if permissive and fixture == 'strict_invalid':
-        source = '\n'.join(line for line in source.splitlines() if 'unknown_field' not in line)
-    consumer = tmp_path / 'consumer.py'
-    consumer.write_text(source)
+    fixtures = ['strict_valid', 'strict_invalid']
+    if permissive:
+        fixtures.append('permissive')
+    expected: dict[tuple[Path, int], str] = {}
+    consumers: list[Path] = []
+    for fixture in fixtures:
+        source = (Path(__file__).parent / 'data' / 'stubgen' / f'{fixture}.py.txt').read_text()
+        if permissive and fixture == 'strict_invalid':
+            source = '\n'.join(line for line in source.splitlines() if 'unknown_field' not in line)
+        consumer = tmp_path / f'{fixture}.py'
+        consumer.write_text(source)
+        consumers.append(consumer)
+        expected.update(
+            ((consumer, line), text.split('# error: ')[1].strip())
+            for line, text in enumerate(source.splitlines())
+            if '# error: ' in text
+        )
     config = tmp_path / 'pyrightconfig.json'
     config.write_text(
         json.dumps(
             {
-                'include': [consumer.name],
+                'include': [consumer.name for consumer in consumers],
                 'extraPaths': [str(Path(__file__).resolve().parents[1] / 'src')],
                 'stubPath': str(stub_path),
                 'pythonVersion': '3.11',
@@ -437,31 +506,22 @@ def test_generated_consumers(tmp_path: Path, fixture: str, *, permissive: bool) 
     result = _run_pyright(config)
     assert not result.stderr, result.stderr
     payload = cast('dict[str, Any]', json.loads(result.stdout))
-    assert payload['summary']['filesAnalyzed'] == 1, result.stdout
+    assert payload['summary']['filesAnalyzed'] == len(consumers), result.stdout
     diagnostics = cast('list[dict[str, Any]]', payload['generalDiagnostics'])
-    expected = {
-        line: text.split('# error: ')[1].strip()
-        for line, text in enumerate(source.splitlines())
-        if '# error: ' in text
-    }
-    if not expected:
-        assert result.returncode == 0, result.stdout
-        assert diagnostics == [], result.stdout
-        return
+    assert expected
     assert result.returncode == 1, result.stdout
-    actual: dict[int, set[str]] = {}
+    actual: dict[tuple[Path, int], set[str]] = {}
     for diagnostic in diagnostics:
-        assert Path(diagnostic['file']) == consumer, result.stdout
-        line = diagnostic['range']['start']['line']
-        assert line in expected, result.stdout
+        key = (Path(diagnostic['file']), diagnostic['range']['start']['line'])
+        assert key in expected, result.stdout
         rule = diagnostic['rule']
-        assert rule == expected[line] or rule in {
+        assert rule == expected[key] or rule in {
             'reportUnknownMemberType',
             'reportUnknownArgumentType',
             'reportUnknownVariableType',
         }, result.stdout
-        actual.setdefault(line, set()).add(rule)
-    assert all(rule in actual.get(line, set()) for line, rule in expected.items()), result.stdout
+        actual.setdefault(key, set()).add(rule)
+    assert all(rule in actual.get(key, set()) for key, rule in expected.items()), result.stdout
 
 
 @pytest.mark.parametrize(
@@ -469,7 +529,7 @@ def test_generated_consumers(tmp_path: Path, fixture: str, *, permissive: bool) 
     _NONDEFAULT_PROFILES,
 )
 def test_check_stubs_requires_exact_generation_profile(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
     *,
     entity_aliases: bool,
@@ -535,7 +595,7 @@ def test_strict_stub_marks_server_owned_fields_unwritable(tmp_path: Path) -> Non
 
 
 def test_stub_generation_ignores_fetch_time(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
     cache_a = fetch_schema(fake_sg)

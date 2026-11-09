@@ -3,8 +3,8 @@
 sgalchemy is a SQLAlchemy-style ORM for Autodesk Flow Production Tracking. It gives pipeline code
 typed entity classes reflected from your site's schema, `select()` queries with relationship
 loaders, and a `Session` that keeps one object per record and sends your changes only when you call
-`commit()`. You decide when the network is used: reading an attribute never makes a hidden provider
-call.
+`commit()`. Provider calls are explicit by default. Synchronous code can opt into relationship
+loading on attribute access with `lazyload()`.
 
 This documentation uses SG for Flow Production Tracking, formerly named Shotgun and ShotGrid.
 
@@ -12,7 +12,7 @@ This documentation uses SG for Flow Production Tracking, formerly named Shotgun 
 
 Calling the provider API directly means working with dictionaries: you choose field lists for each
 `find()`, track which records changed, and assemble `batch()` requests yourself. sgalchemy handles
-that bookkeeping while keeping every provider call explicit.
+that bookkeeping and gives you control over when queries and writes run.
 
 The SQLAlchemy concepts are familiar, but SG is not a relational database, and sgalchemy follows
 the provider where the two differ:
@@ -83,9 +83,7 @@ The script prints the number of matching shots, then the new shot with its serve
 
 `load_schema()` fetches the site schema, or reads a fresh cached copy, before you import entity
 classes. The query does not send the pending create; `session.commit()` does. Leaving the `with`
-block closes the session and discards any work you did not commit. If a commit fails after a
-provider call, [check what was applied](docs/sessions.md#recover-from-a-failed-commit) before you
-retry.
+block closes the session and discards any work you did not commit.
 
 To give your type checker the reflected fields of `Shot`, generate site-specific stubs; see
 [typed stubs](docs/tooling.md#generate-typed-stubs).

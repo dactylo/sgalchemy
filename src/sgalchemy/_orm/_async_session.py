@@ -1,12 +1,10 @@
 """Manage asynchronous reads and task-owned entity identity."""
 
-# pyright: reportPrivateUsage=false
-
 import asyncio
 import logging
 import os
 from collections.abc import AsyncGenerator, Iterable, Mapping
-from contextlib import AbstractContextManager, asynccontextmanager
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from types import TracebackType
 from typing import Any, Self, TypeVar, cast, overload
@@ -18,6 +16,7 @@ from sgalchemy._core._compiler import (
     compile_statement,
     validate_relationship_field,
 )
+from sgalchemy._core._engine import Engine
 from sgalchemy._core._engine_common import (
     AUTH_RECOVERY_NOTE,
     AUTH_UPLOAD_NOTE,
@@ -32,6 +31,7 @@ from sgalchemy._core._registry import (
     Entity,
     RegistryBinding,
     entity_state,
+    reject_outdated,
 )
 from sgalchemy._core._result import Result
 from sgalchemy._core._schema_drift import SchemaDrift
@@ -40,14 +40,14 @@ from sgalchemy._errors import CommitError, CompilationError, SchemaUnavailableEr
 from sgalchemy._orm._async_loaders import execute_selectins, load_relationship
 from sgalchemy._orm._session_common import (
     annotate_read_error,
+    commit_error_with_batch_status,
     projection_result,
     refresh_call,
+    route_batch_failure,
     validate_query_payload,
 )
 from sgalchemy._orm._state import SessionState, validate_point_records
 from sgalchemy._orm._uow import (
-    SOLE_BATCH_STAGED_NOTE,
-    BatchReconciliationError,
     CommitOutcome,
     CommitPlan,
     CommitStep,
@@ -55,30 +55,39 @@ from sgalchemy._orm._uow import (
     ConfirmedFieldReadGroup,
     RecoveryAdapter,
     UnitOfWork,
+    accepted_batch_pending,
+    accepted_batch_reported,
+    add_accepted_batch_notes,
     apply_batch_indeterminate,
     apply_batch_results,
     apply_confirmed_field_readback,
     apply_revive_result,
     apply_upload_indeterminate,
     apply_upload_result,
-    batch_failure_note,
+    batch_accepted,
+    build_commit_error,
     commit_steps,
     confirmed_field_read_call,
     confirmed_field_read_codes,
     count_unsubmitted_work,
     discard_local_state,
+    finish_accepted_batch_for_cleanup,
     group_upload_field_reads,
     mark_indeterminate_entities,
     new_session_unit_of_work,
     plan_commit,
     preflight_uploads,
+    prepare_local_cleanup,
+    release_accepted_batch,
     retire_interrupted_step,
+    retry_accepted_batch,
     schema_drift_error,
     serialize_chunk,
     stage_add,
     stage_delete,
     stage_revive,
     staged_intent_snapshot,
+    unfinished_cleanup_note,
     validate_batch_size,
 )
 from sgalchemy._shotgun import QueryResult, WireRecord, WireRecords
@@ -109,9 +118,27 @@ class AsyncSession:
 
     Only the methods listed in the session guide are supported. Other
     non-underscore methods, such as `attach_for_staging`, `hydrate_record`,
-    `hydration_scope`, `register_identity`, and `unit_of_work`, are
-    package-internal orchestration hooks and may change without notice.
+    `register_identity`, and `unit_of_work`, are package-internal orchestration
+    hooks and may change without notice.
+
+    If an operation raises `SgalchemyError` saying SG saved a batch but
+    sgalchemy could not finish updating the session's objects, call
+    `rollback()` or `close()`, then query the affected records again.
     """
+
+    def _assert_not_quarantined(self) -> None:
+        """Reject use after an indeterminate cancellation or its closing discard."""
+        if self.discarded_after_cancel:
+            raise SgalchemyError(
+                'this AsyncSession was closed after an indeterminate write; '
+                'create a new AsyncSession'
+            )
+        if self.quarantined_write is not None:
+            raise SgalchemyError(
+                f'AsyncSession has an indeterminate {self.quarantined_write}; '
+                'reconcile the server outcome, close this session, and create '
+                'a new AsyncSession'
+            )
 
     def _assert_task_access(self) -> asyncio.Task[object]:
         """Reject work from another task while this session is active."""
@@ -129,18 +156,10 @@ class AsyncSession:
         return task
 
     def _assert_usable(self) -> None:
-        """Reject use after an indeterminate cancellation or its closing discard."""
-        if self._discarded_after_cancel:
-            raise SgalchemyError(
-                'this AsyncSession was closed after an indeterminate write; '
-                'create a new AsyncSession'
-            )
-        if self._quarantined_write is not None:
-            raise SgalchemyError(
-                f'AsyncSession has an indeterminate {self._quarantined_write}; '
-                'reconcile the server outcome, close this session, and create '
-                'a new AsyncSession'
-            )
+        """Reject quarantine and finish pending accepted bookkeeping."""
+        self._assert_not_quarantined()
+        if accepted_batch_pending(self.raw_unit_of_work):
+            retry_accepted_batch(_automatic_recovery_adapter(self))
 
     def _assert_session_access(self) -> None:
         """Reject unusable-session access or another active task."""
@@ -152,61 +171,37 @@ class AsyncSession:
 
         Args:
             engine: Async engine bound to the session.
+
+        Raises:
+            TypeError: If `engine` is an Engine.
         """
-        self._active_step: CommitStep | None = None
-        self._automatic_cleanup_details: tuple[str, bool] = ('', False)
-        self._automatic_cleanup_done = False
-        self._automatic_cleanup_pending = False
-        self._cleanup_anchors: list[Entity] = []
-        self._depth = 0
-        self._discarded_after_cancel = False
+        if isinstance(engine, Engine):
+            raise TypeError(
+                'AsyncSession() requires an AsyncEngine, not an Engine; use Session(engine)'
+            )
+        self.active_step: CommitStep | None = None
+        self.automatic_cleanup_details: tuple[str, bool] = ('', False)
+        self.automatic_cleanup_done = False
+        self.automatic_cleanup_pending = False
+        self.cleanup_anchors: list[Entity] = []
+        self.depth = 0
+        self.discarded_after_cancel = False
         self._engine = engine
         self._owner: asyncio.Task[object] | None = None
-        self._quarantined_write: str | None = None
-        self._state = SessionState(
+        self.quarantined_write: str | None = None
+        self.state = SessionState(
             self,
             engine.registry,
             engine.prepared_binding,
             engine.mark_schema_stale,
             self._assert_session_access,
         )
-        self._unit_of_work = new_session_unit_of_work()
+        self.raw_unit_of_work = new_session_unit_of_work()
 
     async def __aenter__(self) -> Self:
         """Return this session for async context-manager use."""
         self._assert_session_access()
         return self
-
-    def _identity_values(self) -> list[Entity]:
-        """Return a snapshot of identity-mapped objects."""
-        self._assert_session_access()
-        return self._state.identity_values()
-
-    @asynccontextmanager
-    async def _operation_guard(
-        self,
-        *,
-        allow_quarantined: bool = False,
-    ) -> AsyncGenerator[None]:
-        """Reject overlapping use while permitting same-task helper nesting."""
-        task = self._assert_task_access()
-        if not allow_quarantined:
-            self._assert_usable()
-        self._owner = task
-        self._depth += 1
-        try:
-            yield
-        finally:
-            self._depth -= 1
-            if self._depth == 0:
-                self._owner = None
-                if self._automatic_cleanup_pending:
-                    task_name, cancelled = self._automatic_cleanup_details
-                    automatic_cleanup(
-                        self,
-                        task_name=task_name,
-                        cancelled=cancelled,
-                    )
 
     def _quarantine_submitted_step(
         self,
@@ -215,82 +210,27 @@ class AsyncSession:
     ) -> None:
         """Remove one submitted step from retry and quarantine its exact entities."""
         for obj in retire_interrupted_step(self, step):
-            if all(candidate is not obj for candidate in self._cleanup_anchors):
-                self._cleanup_anchors.append(obj)
+            if all(candidate is not obj for candidate in self.cleanup_anchors):
+                self.cleanup_anchors.append(obj)
         outcome.mark_indeterminate(step.items)
         mark_indeterminate_entities(step.entities)
 
-    def _record_commit_interruption(
-        self,
-        err: BaseException,
-        step: CommitStep | None,
-        outcome: CommitOutcome,
-        progress: CallProgress | None,
-    ) -> None:
-        """Quarantine an invoked call or dispatched work that can outlive its waiter."""
-        if progress is None or not (progress.invoked.is_set() or progress.dispatched.is_set()):
-            return
-        confirmed_batch = (
-            step is not None
-            and step.kind == 'batch'
-            and outcome.contains_committed(step.operations)
-        )
-        if step is None or confirmed_batch:
-            return
-        self._quarantine_submitted_step(step, outcome)
-        self._quarantined_write = step.description
-        add_note_once(
-            err,
-            f'sgalchemy: async commit interrupted during {step.description}; '
-            'server outcome is indeterminate, this session will not retry it, '
-            'and the session must be closed',
-        )
-
-    def _route_commit_exception(
-        self,
-        err: Exception,
-        step: CommitStep | None,
-        outcome: CommitOutcome,
-        steps: tuple[CommitStep, ...],
-        *,
-        invoked: bool,
-    ) -> Exception | None:
-        """Return a wrapped fault, or `None` for raw sole-batch passthrough."""
-        if isinstance(err, BatchReconciliationError):
-            commit_error = outcome.commit_error(err, step)
-            add_auth_note(err, commit_error, AUTH_RECOVERY_NOTE)
-            return commit_error
-        if (
-            step is not None
-            and step.kind == 'batch'
-            and outcome.contains_committed(step.operations)
-        ):
-            commit_error = outcome.commit_error(err, step)
-            add_auth_note(err, commit_error, AUTH_RECOVERY_NOTE)
-            return commit_error
-        if len(steps) == 1 and steps[0].kind == 'batch':
-            add_note_once(err, SOLE_BATCH_STAGED_NOTE)
-            if note := batch_failure_note(step, outcome, invoked=invoked):
-                add_note_once(err, note)
-            add_note_once(err, f'sgalchemy: failed during {steps[0].description}')
-            add_auth_note(err, err, AUTH_RECOVERY_NOTE)
-            return None
-        commit_error = outcome.commit_error(err, step)
-        if note := batch_failure_note(step, outcome, invoked=invoked):
-            add_note_once(commit_error, note)
-        add_auth_note(err, commit_error, AUTH_RECOVERY_NOTE)
-        return commit_error
-
     def add(self, obj: Entity) -> None:
-        """Stage one pending entity for creation.
+        """Stage a pending create or attach a detached persistent entity.
+
+        Later field assignments on attached entities are sent by `commit()`.
+        Adding a persistent entity already owned by this session is a no-op.
 
         Args:
-            obj: Schema-bound pending entity from `Entity.new()`.
+            obj: Schema-bound pending or persistent entity.
 
         Raises:
-            SgalchemyError: If `obj` is foreign, persistent, indeterminate, or
-                owned elsewhere.
+            SgalchemyError: If `obj` belongs to a different registry, is
+                outdated or indeterminate, belongs to another open session, or
+                collides with a different object loaded or staged for deletion
+                or revival.
         """
+        reject_outdated(obj)
         self._assert_session_access()
         stage_add(self, obj)
 
@@ -304,7 +244,7 @@ class AsyncSession:
             SgalchemyError: If a different object already owns the identity.
         """
         self._assert_session_access()
-        self._state.assert_identity_available(obj)
+        self.state.assert_identity_available(obj)
 
     def assert_same_registry(self, value: Entity | type[Entity]) -> None:
         """Reject a class or object owned by another registry or open session.
@@ -317,7 +257,7 @@ class AsyncSession:
                 session.
         """
         self._assert_session_access()
-        self._state.assert_same_registry(value)
+        self.state.assert_same_registry(value)
 
     def attach_for_staging(self, obj: Entity) -> None:
         """Attach one detached entity for local staging.
@@ -329,16 +269,109 @@ class AsyncSession:
             SgalchemyError: If another open session owns `obj`.
         """
         self._assert_session_access()
-        self._state.attach(obj)
+        self.state.attach(obj)
+
+    def delete(self, obj: Entity) -> None:
+        """Stage retirement or cancel an inverse local transition.
+
+        Args:
+            obj: Pending or persistent entity to transition.
+
+        Raises:
+            SgalchemyError: If `obj` is foreign, unstaged, indeterminate, or
+                owned elsewhere.
+        """
+        reject_outdated(obj)
+        self._assert_session_access()
+        stage_delete(self, obj)
+
+    def detach_canceled(self, obj: Entity) -> None:
+        """Detach a canceled object absent from this identity map.
+
+        Args:
+            obj: Entity removed from local staging.
+        """
+        self._assert_session_access()
+        self.state.detach_canceled(obj)
+
+    def expire(self, obj: Entity) -> None:
+        """Mark one session-owned entity expired without I/O.
+
+        Args:
+            obj: Entity to expire.
+
+        Raises:
+            SgalchemyError: If this session does not own `obj`.
+        """
+        reject_outdated(obj)
+        self._assert_session_access()
+        self.state.expire(obj)
+
+    def expire_all(self) -> None:
+        """Mark every session-owned entity expired without I/O."""
+        self._assert_session_access()
+        self.state.expire_all()
+
+    def identity_values(self) -> list[Entity]:
+        """Return a snapshot of identity-mapped objects."""
+        self._assert_session_access()
+        return self.state.identity_values()
+
+    def merge_dict(self, raw: Mapping[str, Any]) -> Entity:
+        """Adopt one raw entity dictionary without I/O.
+
+        Args:
+            raw: Entity dictionary containing canonical type and id.
+
+        Returns:
+            Identity-mapped entity.
+
+        Raises:
+            SgalchemyError: If task access or root identity is invalid.
+        """
+        self._assert_session_access()
+        return self.state.merge_dict(raw)
+
+    @asynccontextmanager
+    async def operation_guard(
+        self,
+        *,
+        allow_quarantined: bool = False,
+    ) -> AsyncGenerator[None]:
+        """Reject overlapping use while permitting same-task helper nesting."""
+        task = self._assert_task_access()
+        if not allow_quarantined:
+            self._assert_usable()
+        self._owner = task
+        self.depth += 1
+        try:
+            yield
+        finally:
+            self.depth -= 1
+            if self.depth == 0:
+                self._owner = None
+                if self.automatic_cleanup_pending:
+                    task_name, cancelled = self.automatic_cleanup_details
+                    automatic_cleanup(
+                        self,
+                        task_name=task_name,
+                        cancelled=cancelled,
+                    )
 
     async def close(self) -> None:
         """Revert local edits, detach entities, and retire quarantine locally.
 
         Closing performs no provider I/O and cannot undo provider writes. A
         session closed after an indeterminate submitted write stays unusable.
+
+        An object that shows as `Type(id=N, outdated)` could not be updated
+        after SG saved its batch; any use raises `SgalchemyError`, so discard
+        it and query its record again.
         """
-        async with self._operation_guard(allow_quarantined=True):
-            _release_local_state(self, _automatic_recovery_adapter(self))
+        async with self.operation_guard(allow_quarantined=True):
+            recovery = _automatic_recovery_adapter(self)
+            prepare_local_cleanup(recovery, 'close()')
+            _release_local_state(self, recovery)
 
     async def __aexit__(
         self,
@@ -383,28 +416,6 @@ class AsyncSession:
         """
         await commit_async_session(self, batch_size, wrap_ordinary_failure=False)
 
-    def delete(self, obj: Entity) -> None:
-        """Stage retirement or cancel an inverse local transition.
-
-        Args:
-            obj: Pending or persistent entity to transition.
-
-        Raises:
-            SgalchemyError: If `obj` is foreign, unstaged, indeterminate, or
-                owned elsewhere.
-        """
-        self._assert_session_access()
-        stage_delete(self, obj)
-
-    def detach_canceled(self, obj: Entity) -> None:
-        """Detach a canceled object absent from this identity map.
-
-        Args:
-            obj: Entity removed from local staging.
-        """
-        self._assert_session_access()
-        self._state.detach_canceled(obj)
-
     @property
     def engine(self) -> AsyncEngine:
         """Return the async engine bound to this session.
@@ -413,23 +424,6 @@ class AsyncSession:
             Bound async engine.
         """
         return self._engine
-
-    def expire(self, obj: Entity) -> None:
-        """Mark one session-owned entity expired without I/O.
-
-        Args:
-            obj: Entity to expire.
-
-        Raises:
-            SgalchemyError: If this session does not own `obj`.
-        """
-        self._assert_session_access()
-        self._state.expire(obj)
-
-    def expire_all(self) -> None:
-        """Mark every session-owned entity expired without I/O."""
-        self._assert_session_access()
-        self._state.expire_all()
 
     @overload
     def finish_execute_call_result(
@@ -493,34 +487,28 @@ class AsyncSession:
     async def execute_call(
         self,
         call: FindCall,
-        binding: RegistryBinding | None,
     ) -> WireRecords: ...
 
     @overload
     async def execute_call(
         self,
         call: SummarizeCall,
-        binding: RegistryBinding | None,
     ) -> WireRecord: ...
 
     @overload
     async def execute_call(
         self,
         call: FindCall | SummarizeCall,
-        binding: RegistryBinding | None,
     ) -> QueryResult: ...
 
     async def execute_call(
         self,
         call: FindCall | SummarizeCall,
-        binding: RegistryBinding | None,
     ) -> QueryResult:
-        """Execute compiled provider work through a required captured binding.
+        """Execute compiled provider work with Session fault context.
 
         Args:
             call: Compiled find or summarize call.
-            binding: Captured operation generation associated with the call and
-                later hydration.
 
         Returns:
             Provider payload in its documented outer shape.
@@ -529,8 +517,7 @@ class AsyncSession:
             SgalchemyError: If the outer result shape contradicts the call.
             Exception: Original provider exception, annotated and unwrapped.
         """
-        async with self._operation_guard():
-            del binding
+        async with self.operation_guard():
             try:
                 payload: QueryResult = await self._engine.execute_call(call)
             except Exception as err:
@@ -543,7 +530,7 @@ class AsyncSession:
         call = confirmed_field_read_call(group)
         if call is None:
             return
-        records = await self.execute_call(call, group.binding)
+        records = await self.execute_call(call)
         apply_confirmed_field_readback(self, group, records)
 
     async def _recover_confirmed_fields(
@@ -564,21 +551,6 @@ class AsyncSession:
             )
             if field_codes:
                 await self._read_confirmed_field_group(group)
-
-    async def _recover_upload_fields(
-        self,
-        reads: list[ConfirmedFieldRead],
-        binding: RegistryBinding | None,
-    ) -> None:
-        """Attempt each entity type's bounded upload current-value read."""
-        for group in group_upload_field_reads(reads, binding):
-            try:
-                await self._read_confirmed_field_group(group)
-            except Exception:
-                _LOGGER.exception(
-                    'confirmed-upload readback failed for entity_type=%s',
-                    group.entity_type,
-                )
 
     def hydrate_record(
         self,
@@ -605,12 +577,7 @@ class AsyncSession:
             SgalchemyError: If task access or identity is invalid.
         """
         self._assert_session_access()
-        return self._state.hydrate_record(entity_type_name, record, binding, retired=retired)
-
-    def hydration_scope(self) -> AbstractContextManager[None]:
-        """Share staged identity lookup for synchronous response hydration only."""
-        self._assert_session_access()
-        return self._state.hydration_scope()
+        return self.state.hydrate_record(entity_type_name, record, binding, retired=retired)
 
     async def load_binding(self, context: str, *, force: bool = False) -> RegistryBinding:
         """Load one binding under a public operation's provider context.
@@ -626,7 +593,7 @@ class AsyncSession:
             Exception: Original schema-cache or provider exception, annotated
                 and unwrapped.
         """
-        async with self._operation_guard():
+        async with self.operation_guard():
             try:
                 return await self._engine.load_binding(force=force)
             except Exception as err:
@@ -661,34 +628,6 @@ class AsyncSession:
         if not isinstance(call, FindCall):
             raise TypeError('summary statements use await session.execute(statement)')
         return call, binding
-
-    async def _plan_commit(self) -> CommitPlan:
-        """Build one complete plan with bounded pre-write schema recovery."""
-        binding = self._engine.prepared_binding()
-        refreshed = False
-        while True:
-            try:
-                return plan_commit(self, binding, self._state.identity_map)
-            except SchemaDrift as error:
-                current = self._engine.prepared_binding()
-                if current is not binding:
-                    binding = current
-                    continue
-                if binding is None:
-                    registry_binding = self._engine.registry.binding_snapshot()
-                    if registry_binding is not None and registry_binding.key != self._engine.site:
-                        raise SgalchemyError(REGISTRY_SITE_MISMATCH_MESSAGE) from None
-                    binding = await self.load_binding('raised while preparing commit')
-                    continue
-                if not refreshed:
-                    _ENGINE_LOG.info('commit schema drift: refreshing schema once')
-                    binding = await self.load_binding(
-                        'raised while preparing commit',
-                        force=True,
-                    )
-                    refreshed = True
-                    continue
-                raise schema_drift_error(error, refreshed=refreshed) from None
 
     async def _require_type_schema(
         self,
@@ -725,14 +664,14 @@ class AsyncSession:
             Exception: Original schema-cache or provider exception, annotated
                 and unwrapped.
         """
-        async with self._operation_guard():
+        async with self.operation_guard():
             if stmt.entity is not None:
                 raise TypeError('entity statements use await session.scalars(statement)')
             binding = await self.load_binding(f'raised while executing statement {stmt}')
             call = compile_statement(stmt, binding.schemas)
             if isinstance(call, SummarizeCall):
-                return await self.execute_call(call, binding)
-            records = await self.execute_call(call, binding)
+                return await self.execute_call(call)
+            records = await self.execute_call(call)
             return projection_result(call, records)
 
     async def get(self, cls: type[_EntityT], entity_id: int) -> _EntityT | None:
@@ -753,13 +692,13 @@ class AsyncSession:
             Exception: Original schema-cache or provider exception, annotated
                 and unwrapped.
         """
-        async with self._operation_guard():
+        async with self.operation_guard():
             if type(entity_id) is not int or entity_id <= 0:
                 raise SgalchemyError('entity id must be a positive integer id')
-            type_name = self._state.require_owned_class(cls)
-            existing = self._state.entity(type_name, entity_id)
+            type_name = self.state.require_owned_class(cls)
+            existing = self.state.entity(type_name, entity_id)
             if existing is not None:
-                self._state.require_owned_object(existing)
+                self.state.require_owned_object(existing)
                 return cast('_EntityT', existing)
             context = f'raised while executing find_one({type_name!r}, id={entity_id})'
             schema, binding = await self._require_type_schema(context, type_name)
@@ -783,7 +722,7 @@ class AsyncSession:
                 return None
             return cast(
                 '_EntityT',
-                self._state.hydrate_record(
+                self.state.hydrate_record(
                     type_name,
                     validated,
                     binding,
@@ -817,11 +756,13 @@ class AsyncSession:
                 absent after one forced schema refresh.
             Exception: Original provider exception, annotated and unwrapped.
         """
-        async with self._operation_guard():
-            materialized = [objects] if isinstance(objects, Entity) else list(objects)
+        materialized = [objects] if isinstance(objects, Entity) else list(objects)
+        for obj in materialized:
+            reject_outdated(obj)
+        async with self.operation_guard():
             if not materialized:
                 return
-            states = [self._state.require_owned_object(obj) for obj in materialized]
+            states = [self.state.require_owned_object(obj) for obj in materialized]
             for state in states:
                 object_type = state.entity_type
                 if object_type != field.root_type:
@@ -855,20 +796,86 @@ class AsyncSession:
                     missing_ids[retired] = ids
             await load_relationship(self, materialized, field, missing_ids, binding)
 
-    def merge_dict(self, raw: Mapping[str, Any]) -> Entity:
-        """Adopt one raw entity dictionary without I/O.
+    async def plan_commit(self) -> CommitPlan:
+        """Build one complete plan with bounded pre-write schema recovery.
 
-        Args:
-            raw: Entity dictionary containing canonical type and id.
+        Schema preparation may perform provider and cache I/O. No provider
+        writes are sent.
 
         Returns:
-            Identity-mapped entity.
+            Ordered commit plan built against one captured schema binding, or
+            an empty plan with no binding when no work is staged.
 
         Raises:
-            SgalchemyError: If task access or root identity is invalid.
+            RetiredEntityWriteError: If a retired entity has staged writes
+                without revival intent.
+            SgalchemyError: If local validation fails or schema remains
+                incompatible after bounded recovery.
+            Exception: Original schema-preparation or provider failure,
+                annotated and unwrapped.
         """
-        self._assert_session_access()
-        return self._state.merge_dict(raw)
+        binding = self._engine.prepared_binding()
+        refreshed = False
+        while True:
+            try:
+                return plan_commit(self, binding, self.state.identity_map)
+            except SchemaDrift as error:
+                current = self._engine.prepared_binding()
+                if current is not binding:
+                    binding = current
+                    continue
+                if binding is None:
+                    registry_binding = self._engine.registry.binding_snapshot()
+                    if registry_binding is not None and registry_binding.key != self._engine.site:
+                        raise SgalchemyError(REGISTRY_SITE_MISMATCH_MESSAGE) from None
+                    binding = await self.load_binding('raised while preparing commit')
+                    continue
+                if not refreshed:
+                    _ENGINE_LOG.info('commit schema drift: refreshing schema once')
+                    binding = await self.load_binding(
+                        'raised while preparing commit',
+                        force=True,
+                    )
+                    refreshed = True
+                    continue
+                raise schema_drift_error(error, refreshed=refreshed) from None
+
+    def record_commit_interruption(
+        self,
+        err: BaseException,
+        step: CommitStep | None,
+        outcome: CommitOutcome,
+        progress: CallProgress | None,
+    ) -> None:
+        """Quarantine an invoked call or dispatched work that can outlive its waiter."""
+        if progress is None or not (progress.invoked.is_set() or progress.dispatched.is_set()):
+            return
+        confirmed_batch = step is not None and batch_accepted(self.raw_unit_of_work, step, outcome)
+        if step is None or confirmed_batch:
+            return
+        self._quarantine_submitted_step(step, outcome)
+        self.quarantined_write = step.description
+        add_note_once(
+            err,
+            f'sgalchemy: async commit interrupted during {step.description}; '
+            'server outcome is indeterminate, this session will not retry it, '
+            'and the session must be closed',
+        )
+
+    async def recover_upload_fields(
+        self,
+        reads: list[ConfirmedFieldRead],
+        binding: RegistryBinding | None,
+    ) -> None:
+        """Attempt each entity type's bounded upload current-value read."""
+        for group in group_upload_field_reads(reads, binding):
+            try:
+                await self._read_confirmed_field_group(group)
+            except Exception:
+                _LOGGER.exception(
+                    'confirmed-upload readback failed for entity_type=%s',
+                    group.entity_type,
+                )
 
     async def refresh(self, obj: Entity) -> None:
         """Reload readable fields without overwriting local dirty values.
@@ -887,21 +894,22 @@ class AsyncSession:
             SgalchemyError: If ownership or provider result is invalid.
             Exception: Original provider exception, annotated and unwrapped.
         """
-        async with self._operation_guard():
-            state = self._state.require_owned_object(obj)
+        reject_outdated(obj)
+        async with self.operation_guard():
+            state = self.state.require_owned_object(obj)
             if state.id is None:
                 raise SgalchemyError('cannot refresh an entity without a server identity')
             context = f'raised while refreshing {state.entity_type}(id={state.id})'
             schema, binding = await self._require_type_schema(context, state.entity_type)
             call = refresh_call(state, schema)
-            records = await self.execute_call(call, binding)
+            records = await self.execute_call(call)
             record = validate_point_records(
                 records,
                 state.entity_type,
                 state.id,
                 allow_absent=False,
             )
-            self._state.hydrate_record(state.entity_type, record, binding)
+            self.state.hydrate_record(state.entity_type, record, binding)
             state.expired = False
 
     def register_identity(self, obj: Entity) -> None:
@@ -911,7 +919,7 @@ class AsyncSession:
             obj: Persistent object to register.
         """
         self._assert_session_access()
-        self._state.register_identity(obj)
+        self.state.register_identity(obj)
 
     def revive(self, obj: Entity) -> None:
         """Stage revival or cancel an inverse local transition.
@@ -923,6 +931,7 @@ class AsyncSession:
             SgalchemyError: If `obj` is pending, already active without a
                 staged delete, foreign, indeterminate, or owned elsewhere.
         """
+        reject_outdated(obj)
         self._assert_session_access()
         stage_revive(self, obj)
 
@@ -930,9 +939,16 @@ class AsyncSession:
         """Restore dirty snapshots and discard staged local work without I/O.
 
         Rollback changes only local state and cannot undo provider writes.
+
+        An object that shows as `Type(id=N, outdated)` could not be updated
+        after SG saved its batch; any use raises `SgalchemyError`, so discard
+        it and query its record again.
         """
-        self._assert_session_access()
-        discard_local_state(_automatic_recovery_adapter(self))
+        self._assert_task_access()
+        self._assert_not_quarantined()
+        recovery = _automatic_recovery_adapter(self)
+        prepare_local_cleanup(recovery, 'rollback()')
+        discard_local_state(recovery)
 
     async def scalars(self, stmt: Select[_EntityT]) -> list[_EntityT]:
         """Execute one entity statement and its awaited relationship loads.
@@ -963,12 +979,12 @@ class AsyncSession:
             Exception: Original schema-cache or provider exception, annotated
                 and unwrapped.
         """
-        async with self._operation_guard():
+        async with self.operation_guard():
             if stmt.entity is None:
                 raise TypeError(
                     'projection and summary statements use await session.execute(statement)'
                 )
-            type_name = self._state.require_owned_class(stmt.entity)
+            type_name = self.state.require_owned_class(stmt.entity)
             if any(isinstance(option, LazyLoad) for option in stmt.loader_options):
                 raise SgalchemyError(
                     'AsyncSession cannot await lazyload() attribute access; use '
@@ -980,17 +996,17 @@ class AsyncSession:
             call, binding = await self._compile_scalars_call(stmt, binding, context)
             if call.entity_type != type_name:
                 raise SgalchemyError('compiled entity type contradicts the owned statement class')
-            records = await self.execute_call(call, binding)
-            with self.hydration_scope():
-                objects = [
-                    self._state.hydrate_record(
-                        call.entity_type,
-                        record,
-                        binding,
-                        retired=bool(call.extra.get('retired_only', False)),
-                    )
-                    for record in records
-                ]
+            records = await self.execute_call(call)
+            self._assert_session_access()
+            objects = [
+                self.state.hydrate_record(
+                    call.entity_type,
+                    record,
+                    binding,
+                    retired=bool(call.extra.get('retired_only', False)),
+                )
+                for record in records
+            ]
             await execute_selectins(
                 self,
                 objects,
@@ -1008,25 +1024,39 @@ class AsyncSession:
         """Return this session's identity-based staging state.
 
         Returns:
-            Package-internal staging state exposing immutable category
-            snapshots.
+            Package-internal staging state for this session.
         """
         self._assert_session_access()
-        return self._unit_of_work
+        return self.raw_unit_of_work
 
-    async def _execute_commit_step(
+    async def execute_commit_step(
         self,
         step: CommitStep,
         outcome: CommitOutcome,
         progress: CallProgress,
     ) -> ConfirmedFieldRead | None:
-        """Execute and reconcile one already-planned serial provider step."""
+        """Execute and reconcile one already-planned serial provider step.
+
+        Args:
+            step: Validated revive, batch, or thumbnail-upload step.
+            outcome: Commit partitions updated by successful reconciliation.
+            progress: Fresh events recording dispatch and provider entry.
+
+        Returns:
+            Current-value read descriptor after an upload, or `None` after a
+            batch or revive. Batch echo omissions are read back here.
+
+        Raises:
+            CommitError: If a successful batch cannot be reconciled safely.
+            asyncio.CancelledError: If the awaiting task is cancelled.
+            Exception: Other provider or local reconciliation failures.
+        """
         if step.kind == 'revive':
             obj = step.entities[0]
             state = entity_state(obj)
             if state.id is None:
                 raise RuntimeError('revive entity has no server id')
-            self._active_step = step
+            self.active_step = step
             await self._engine.call_with_progress(
                 'revive', (state.entity_type, state.id), {}, progress
             )
@@ -1034,24 +1064,20 @@ class AsyncSession:
             apply_revive_result(self.unit_of_work, obj, outcome)
             return None
         if step.kind == 'batch':
-            self._active_step = step
+            self.active_step = step
             requests = serialize_chunk(step.operations)
             results = await self._engine.call_with_progress('batch', (requests,), {}, progress)
             try:
+                self._assert_session_access()
                 groups = apply_batch_results(
-                    self,
-                    step.operations,
-                    results,
-                    outcome,
-                    self._state.identity_map.__setitem__,
+                    self, _automatic_recovery_adapter(self), step, results, outcome
                 )
             except Exception as err:
-                if not outcome.contains_committed(step.operations):
+                if not batch_accepted(self.raw_unit_of_work, step, outcome):
                     apply_batch_indeterminate(self, step.operations, outcome)
-                commit_error = outcome.commit_error(err, step)
+                commit_error = build_commit_error(err, step, outcome, self.raw_unit_of_work)
                 add_auth_note(err, commit_error, AUTH_RECOVERY_NOTE)
                 raise commit_error from err
-            self._active_step = None
             try:
                 await self._recover_confirmed_fields(step, groups)
             except Exception:
@@ -1061,7 +1087,7 @@ class AsyncSession:
         state = entity_state(upload.obj)
         if state.id is None:
             raise RuntimeError('upload entity has no server id')
-        self._active_step = step
+        self.active_step = step
         await self._engine.call_with_progress(
             step.kind,
             (state.entity_type, state.id, os.fsdecode(upload.path)),
@@ -1075,39 +1101,40 @@ class AsyncSession:
 class _AsyncCommitFailure:
     """Capture one ordinary async commit failure and its exact outcome state."""
 
-    _err: Exception
-    _step: CommitStep | None
-    _outcome: CommitOutcome
-    _steps: tuple[CommitStep, ...]
-    _pending_upload_reads: list[ConfirmedFieldRead]
-    _binding: RegistryBinding | None
-    _wrap_ordinary_failure: bool
-    _invoked: bool
+    err: Exception
+    step: CommitStep | None
+    outcome: CommitOutcome
+    steps: tuple[CommitStep, ...]
+    pending_upload_reads: list[ConfirmedFieldRead]
+    binding: RegistryBinding | None
+    wrap_ordinary_failure: bool
+    invoked: bool
 
 
 def _automatic_recovery_adapter(session: 'AsyncSession') -> RecoveryAdapter:
     """Build guard-free local cleanup capabilities for one AsyncSession."""
-    state = session._state
-    unit_of_work = session._unit_of_work
+    state = session.state
+    unit_of_work = session.raw_unit_of_work
     return RecoveryAdapter(
         unit_of_work=unit_of_work,
         detach_canceled=state.detach_canceled,
         discard_identities=state.discard_identities,
         identity_values=state.identity_values,
+        install_identity=state.identity_map.__setitem__,
         owns_entity=state.owns_entity,
-        cleanup_anchors=session._cleanup_anchors,
+        cleanup_anchors=session.cleanup_anchors,
     )
 
 
 def _release_local_state(session: AsyncSession, recovery: RecoveryAdapter) -> None:
     """Discard local work and retire any cancellation quarantine."""
-    was_quarantined = session._quarantined_write is not None
+    was_quarantined = session.quarantined_write is not None
     discard_local_state(recovery)
-    session._state.close()
-    session._active_step = None
-    session._quarantined_write = None
+    session.state.close()
+    session.active_step = None
+    session.quarantined_write = None
     if was_quarantined:
-        session._discarded_after_cancel = True
+        session.discarded_after_cancel = True
 
 
 async def _route_async_commit_failure(
@@ -1115,32 +1142,40 @@ async def _route_async_commit_failure(
     failure: _AsyncCommitFailure,
 ) -> Exception | None:
     """Return the failure that the normalized async commit should raise."""
-    recover_upload_fields = session._recover_upload_fields
-    step = failure._step
-    if failure._invoked and step is not None and step.is_upload:
+    step = failure.step
+    if failure.invoked and step is not None and step.is_upload:
         try:
             upload = step.require_upload()
         except RuntimeError as error:
             return error
-        ambiguous = apply_upload_indeterminate(session, upload, failure._outcome)
-        await recover_upload_fields(
-            [*failure._pending_upload_reads, ambiguous],
-            failure._binding,
+        ambiguous = apply_upload_indeterminate(session, upload, failure.outcome)
+        await session.recover_upload_fields(
+            [*failure.pending_upload_reads, ambiguous],
+            failure.binding,
         )
-        commit_error = failure._outcome.commit_error(failure._err, step)
-        add_auth_note(failure._err, commit_error, AUTH_UPLOAD_NOTE)
+        commit_error = build_commit_error(
+            failure.err, step, failure.outcome, session.raw_unit_of_work
+        )
+        add_auth_note(failure.err, commit_error, AUTH_UPLOAD_NOTE)
         return commit_error
-    await recover_upload_fields(failure._pending_upload_reads, failure._binding)
-    route_exception = session._route_commit_exception
-    routed = route_exception(
-        failure._err, step, failure._outcome, failure._steps, invoked=failure._invoked
+    await session.recover_upload_fields(failure.pending_upload_reads, failure.binding)
+    steps = failure.steps
+    routed = route_batch_failure(
+        failure.err,
+        failure.outcome,
+        session.raw_unit_of_work,
+        sole_batch_step=steps[0] if len(steps) == 1 and steps[0].kind == 'batch' else None,
+        invoked=failure.invoked,
+        raw_passthrough=not failure.wrap_ordinary_failure,
     )
-    if routed is None and failure._wrap_ordinary_failure:
-        commit_error = failure._outcome.commit_error(failure._err, step)
-        if note := batch_failure_note(step, failure._outcome, invoked=failure._invoked):
-            add_note_once(commit_error, note)
-        add_auth_note(failure._err, commit_error, AUTH_RECOVERY_NOTE)
-        return commit_error
+    if routed is None and failure.wrap_ordinary_failure:
+        return commit_error_with_batch_status(
+            failure.err,
+            failure.outcome.current_step,
+            failure.outcome,
+            session.raw_unit_of_work,
+            invoked=failure.invoked,
+        )
     return routed
 
 
@@ -1153,27 +1188,26 @@ async def _execute_async_commit_plan(
     wrap_ordinary_failure: bool,
 ) -> None:
     """Execute one finalized asynchronous commit plan."""
-    execute_step = session._execute_commit_step
-    recover_upload_fields = session._recover_upload_fields
-    record_interruption = session._record_commit_interruption
     steps = commit_steps(plan, batch_size)
     pending_upload_reads: list[ConfirmedFieldRead] = []
     progress = None
     try:
         for step in steps:
             if pending_upload_reads and not step.is_upload:
-                await recover_upload_fields(pending_upload_reads, plan.binding)
+                await session.recover_upload_fields(pending_upload_reads, plan.binding)
                 pending_upload_reads.clear()
             progress = CallProgress()
-            read = await execute_step(step, outcome, progress)
-            session._active_step = None
+            outcome.current_step = step
+            read = await session.execute_commit_step(step, outcome, progress)
+            session.active_step = None
+            outcome.current_step = None
             if read is not None:
                 pending_upload_reads.append(read)
-        await recover_upload_fields(pending_upload_reads, plan.binding)
+        await session.recover_upload_fields(pending_upload_reads, plan.binding)
     except CommitError:
-        step = session._active_step
-        session._active_step = None
-        await recover_upload_fields(
+        step = session.active_step
+        session.active_step = None
+        await session.recover_upload_fields(
             pending_upload_reads if progress is None or not progress.invoked.is_set() else [],
             plan.binding,
         )
@@ -1186,28 +1220,28 @@ async def _execute_async_commit_plan(
             apply_upload_indeterminate(session, step.require_upload(), outcome)
         raise
     except Exception as err:
-        step = session._active_step
-        session._active_step = None
+        step = session.active_step
+        session.active_step = None
         routed = await _route_async_commit_failure(
             session,
             _AsyncCommitFailure(
-                _err=err,
-                _step=step,
-                _outcome=outcome,
-                _steps=steps,
-                _pending_upload_reads=pending_upload_reads,
-                _binding=plan.binding,
-                _wrap_ordinary_failure=wrap_ordinary_failure,
-                _invoked=progress is not None and progress.invoked.is_set(),
+                err=err,
+                step=step,
+                outcome=outcome,
+                steps=steps,
+                pending_upload_reads=pending_upload_reads,
+                binding=plan.binding,
+                wrap_ordinary_failure=wrap_ordinary_failure,
+                invoked=progress is not None and progress.invoked.is_set(),
             ),
         )
         if routed is None:
             raise
         raise routed from err
     except BaseException as err:
-        step = session._active_step
-        session._active_step = None
-        record_interruption(err, step, outcome, progress)
+        step = session.active_step
+        session.active_step = None
+        session.record_commit_interruption(err, step, outcome, progress)
         raise
 
 
@@ -1229,24 +1263,25 @@ def automatic_cleanup(
         task_name: Completed task name for non-secret diagnostics.
         cancelled: Whether the completed task was cancelled.
     """
-    if session._automatic_cleanup_done:
+    if session.automatic_cleanup_done:
         return
-    if session._depth != 0:
-        if not session._automatic_cleanup_pending:
+    if session.depth != 0:
+        if not session.automatic_cleanup_pending:
             _LOGGER.warning(
                 'automatic task cleanup deferred for cross-task borrowing: task=%r cancelled=%s',
                 task_name,
                 cancelled,
             )
-            session._automatic_cleanup_details = (task_name, cancelled)
-            session._automatic_cleanup_pending = True
+            session.automatic_cleanup_details = (task_name, cancelled)
+            session.automatic_cleanup_pending = True
         return
 
-    session._automatic_cleanup_done = True
-    session._automatic_cleanup_pending = False
-    session._automatic_cleanup_details = ('', False)
+    session.automatic_cleanup_done = True
+    session.automatic_cleanup_pending = False
+    session.automatic_cleanup_details = ('', False)
     try:
         recovery = _automatic_recovery_adapter(session)
+        release = finish_accepted_batch_for_cleanup(recovery, 'automatic task cleanup')
         dirty, pending, deletes, revives = count_unsubmitted_work(recovery)
         if dirty or pending or deletes or revives:
             _LOGGER.warning(
@@ -1259,13 +1294,24 @@ def automatic_cleanup(
                 deletes,
                 revives,
             )
+        if release:
+            release_accepted_batch(recovery)
         _release_local_state(session, recovery)
     except BaseException:
-        _LOGGER.exception(
-            'automatic task cleanup failed after releasing task scope: task=%r cancelled=%s',
-            task_name,
-            cancelled,
-        )
+        if accepted_batch_pending(session.raw_unit_of_work):
+            _LOGGER.exception(
+                'automatic task cleanup failed after releasing task scope: '
+                'task=%r cancelled=%s; %s',
+                task_name,
+                cancelled,
+                unfinished_cleanup_note('automatic task cleanup'),
+            )
+        else:
+            _LOGGER.exception(
+                'automatic task cleanup failed after releasing task scope: task=%r cancelled=%s',
+                task_name,
+                cancelled,
+            )
 
 
 async def commit_async_session(
@@ -1299,12 +1345,11 @@ async def commit_async_session(
             positive integer nor `None`, or is smaller than an indivisible
             operation group.
     """
-    operation_guard = session._operation_guard
-    async with operation_guard():
+    async with session.operation_guard():
         outcome = CommitOutcome(
             committed=[],
             staged=(
-                staged_intent_snapshot(session.unit_of_work, session._identity_values())
+                staged_intent_snapshot(session.unit_of_work, session.identity_values())
                 if wrap_ordinary_failure
                 else []
             ),
@@ -1313,8 +1358,7 @@ async def commit_async_session(
         )
         try:
             validate_batch_size(batch_size)
-            plan_commit_call = session._plan_commit
-            plan = await plan_commit_call()
+            plan = await session.plan_commit()
             plan = await asyncio.to_thread(preflight_uploads, plan)
             outcome = CommitOutcome.from_plan(plan)
             await _execute_async_commit_plan(
@@ -1327,8 +1371,17 @@ async def commit_async_session(
         except CommitError:
             raise
         except Exception as err:
-            if not wrap_ordinary_failure:
+            step = outcome.current_step
+            accepted = accepted_batch_reported(session.raw_unit_of_work, step, outcome)
+            if not wrap_ordinary_failure and not accepted:
                 raise
-            commit_error = outcome.commit_error(err, None)
+            commit_error = build_commit_error(
+                err, step if accepted else None, outcome, session.raw_unit_of_work
+            )
             add_auth_note(err, commit_error, AUTH_RECOVERY_NOTE)
             raise commit_error from err
+        except BaseException as err:
+            step = outcome.current_step
+            if accepted_batch_reported(session.raw_unit_of_work, step, outcome):
+                add_accepted_batch_notes(err, session.raw_unit_of_work, step)
+            raise

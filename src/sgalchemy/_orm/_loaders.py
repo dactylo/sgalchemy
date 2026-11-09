@@ -3,7 +3,7 @@
 import logging
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, cast
 
 from sgalchemy._core._compiler import FindCall
 from sgalchemy._core._expressions import FieldExpr
@@ -28,9 +28,9 @@ class LazyContext:
     recovery attempt.
     """
 
-    _session: 'Session'
-    _objects: list[Entity]
-    _opt: LazyLoad
+    session: 'Session'
+    objects: list[Entity]
+    opt: LazyLoad
     _failed_bindings: list[RegistryBinding] = field(default_factory=list[RegistryBinding])
 
     def _retire(self, objects: list[Entity], field_code: str) -> None:
@@ -59,31 +59,31 @@ class LazyContext:
             Exception: Original provider exception, annotated and unwrapped.
         """
         owned_objects = [
-            obj for obj in self._objects if entity_state(obj).lazy.get(field_code) is self
+            obj for obj in self.objects if entity_state(obj).lazy.get(field_code) is self
         ]
         references = collect_selectin_refs(owned_objects, field_code)
         try:
-            self._session.reserve_implicit_calls(len(references))
+            self.session.reserve_implicit_calls(len(references))
         except SgalchemyError as error:
             raise SgalchemyError(
-                f'{error}; triggering attribute {self._opt.field.root_type}.{field_code}'
+                f'{error}; triggering attribute {self.opt.field.root_type}.{field_code}'
             ) from None
         _LOGGER.info(
             'lazy load: %s.%s calls=%s',
-            self._opt.field.root_type,
+            self.opt.field.root_type,
             field_code,
             len(references),
         )
         if not references:
             self._retire(owned_objects, field_code)
             return
-        binding = self._session.load_binding(
-            f'raised while lazy-loading {self._opt.field.root_type}.{field_code}'
+        binding = self.session.load_binding(
+            f'raised while lazy-loading {self.opt.field.root_type}.{field_code}'
         )
         _execute_selectin(
-            self._session,
+            self.session,
             owned_objects,
-            self._opt,
+            self.opt,
             binding,
             failed_bindings=self._failed_bindings,
         )
@@ -108,10 +108,9 @@ def _execute_selectin_refs(
             filters=[['id', 'in', sorted(ids)]],
             fields=schema.readable_field_codes(),
         )
-        records = session.execute_call(call, binding)
-        with session.hydration_scope():
-            for record in records:
-                session.hydrate_record(target_type, record, binding)
+        records = session.execute_call(call)
+        for record in records:
+            session.hydrate_record(target_type, record, binding)
         if on_target_complete is not None:
             on_target_complete(target_type)
 
@@ -138,9 +137,9 @@ def collect_selectin_refs(
         state = entity_state(obj)
         value = state.loaded.get(field_code)
         if value is None:
-            links: list[Any] = []
+            links: list[object] = []
         elif isinstance(value, list):
-            links = cast('list[Any]', value)
+            links = cast('list[object]', value)
         else:
             links = [value]
         for link in links:
@@ -281,6 +280,8 @@ def execute_selectins(
     Raises:
         RelationshipTargetUnavailableError: If observed targets remain absent
             after one forced schema refresh.
+        SgalchemyError: If a loaded relationship contains a non-entity link
+            value.
         Exception: Original provider exception, annotated and unwrapped.
     """
     batches = [

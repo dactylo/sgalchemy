@@ -3,9 +3,8 @@
 import copy
 import datetime
 import logging
-from collections.abc import Callable, Collection, Generator, Iterable, Mapping, Sequence
-from contextlib import contextmanager
-from typing import Any, Literal, cast, overload
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from typing import Any, Literal, Protocol, cast, overload
 
 from sgalchemy._core._registry import (
     Entity,
@@ -17,13 +16,27 @@ from sgalchemy._core._registry import (
     entity_state,
     entity_type,
     initialize_entity,
+    reject_outdated,
 )
 from sgalchemy._errors import SgalchemyError
-from sgalchemy._orm._uow import UnitOfWork, assert_entity_identity_consistent
+from sgalchemy._orm._uow import (
+    UnitOfWork,
+    assert_entity_identity_consistent,
+    staged_for_identity,
+)
 from sgalchemy._shotgun import WireContainer
 from sgalchemy.schema._model import EntitySchema, FieldSchema
 
 _LOGGER = logging.getLogger('sgalchemy.session')
+
+
+class _StagingOwner(Protocol):
+    """Session surface that exposes the staging state behind its identities."""
+
+    @property
+    def unit_of_work(self) -> UnitOfWork:
+        """Return the owner's staging state."""
+        ...
 
 
 class SessionState:
@@ -38,7 +51,7 @@ class SessionState:
         """Apply flat fields, then fold deep fields into linked objects."""
         state = entity_state(obj)
         schema = None if binding is None else binding.schemas.get(state.entity_type)
-        deep: list[tuple[str, Any]] = []
+        deep: list[tuple[str, object]] = []
         for raw_key, value in record.items():
             if '.' in raw_key:
                 link_field = raw_key.partition('.')[0]
@@ -67,12 +80,12 @@ class SessionState:
         """Enforce configured task access or this state's current ownership."""
         if self._session_access_guard is not None:
             self._session_access_guard()
-        elif state.session is not self._owner:
+        if state.session is not self._owner:
             raise SgalchemyError('entity object is no longer owned by its staging session')
 
     def __init__(
         self,
-        owner: object,
+        owner: _StagingOwner,
         registry: Registry,
         schema_provider: Callable[[], RegistryBinding | None],
         mark_schema_stale: Callable[[], None],
@@ -81,7 +94,8 @@ class SessionState:
         """Bind pure state decisions to one session owner and registry.
 
         Args:
-            owner: Session that owns attached entities.
+            owner: Session that owns attached entities. Its staged deletes and
+                revivals also claim persistent identities.
             registry: Registry that owns reflected entity classes.
             schema_provider: Callable returning the current prepared binding.
             mark_schema_stale: Callback invalidating stale prepared schema.
@@ -90,7 +104,6 @@ class SessionState:
         """
         self._entity_access_guard = self._guard_entity_access
         self._identity: dict[tuple[str, int], Entity] = {}
-        self._hydration_index: dict[tuple[str, int], list[Entity]] | None = None
         self._mark_schema_stale = mark_schema_stale
         self._owner = owner
         self._registry = registry
@@ -109,7 +122,7 @@ class SessionState:
             matches = _is_canonical_link(value)
         elif field_schema.data_type == 'multi_entity':
             matches = isinstance(value, list) and all(
-                _is_canonical_link(item) for item in cast('list[Any]', value)
+                _is_canonical_link(item) for item in cast('list[object]', value)
             )
         elif field_schema.data_type in {'tag_list', 'addressing'}:
             matches = isinstance(value, list)
@@ -124,23 +137,6 @@ class SessionState:
         else:
             matches = not isinstance(value, (dict, list))
         return matches
-
-    def _staged_identity_candidates(self) -> Collection[Entity]:
-        """Return persistent staged identities when the owner has a unit of work."""
-        unit_of_work = getattr(self._owner, 'unit_of_work', None)
-        if not isinstance(unit_of_work, UnitOfWork):
-            return ()
-        return (*unit_of_work.deleted, *unit_of_work.revived)
-
-    def _staged_for_identity(self, key: tuple[str, int]) -> Collection[Entity]:
-        """Select every staged owner for one identity from this operation's index."""
-        if self._hydration_index is not None:
-            return self._hydration_index.get(key, ())
-        return tuple(
-            candidate
-            for candidate in self._staged_identity_candidates()
-            if (entity_state(candidate).entity_type, entity_state(candidate).id) == key
-        )
 
     def _warn_shape(
         self,
@@ -264,7 +260,8 @@ class SessionState:
         mapped = self._identity.get(key)
         mapped_collision = mapped is not None and mapped is not obj
         staged_collision = any(
-            candidate is not obj for candidate in self._staged_for_identity(key)
+            candidate is not obj
+            for candidate in staged_for_identity(self._owner.unit_of_work, key)
         )
         if mapped_collision or staged_collision:
             raise SgalchemyError(
@@ -300,6 +297,8 @@ class SessionState:
             SgalchemyError: If `value` belongs to another registry or open
                 session.
         """
+        if isinstance(value, Entity):
+            reject_outdated(value)
         cls = type(value) if isinstance(value, Entity) else value
         if entity_registry(cls) is not self._registry:
             raise SgalchemyError(
@@ -375,28 +374,6 @@ class SessionState:
         """
         return self._identity.get((entity_type_name, entity_id))
 
-    @contextmanager
-    def hydration_scope(self) -> Generator[None, None, None]:
-        """Reuse staged identities during one synchronous response hydration.
-
-        Nested scopes share the outer index. Exit before provider I/O or
-        staging changes; the next operation rebuilds from the authoritative raw
-        lists.
-        """
-        if self._hydration_index is not None:
-            yield
-            return
-        index: dict[tuple[str, int], list[Entity]] = {}
-        for candidate in self._staged_identity_candidates():
-            state = entity_state(candidate)
-            if state.id is not None:
-                index.setdefault((state.entity_type, state.id), []).append(candidate)
-        self._hydration_index = index
-        try:
-            yield
-        finally:
-            self._hydration_index = None
-
     def hydrate_record(
         self,
         entity_type_name: str,
@@ -421,65 +398,64 @@ class SessionState:
         Raises:
             SgalchemyError: If identity is absent, malformed, or contradictory.
         """
-        with self.hydration_scope():
-            wire_type = record.get('type', entity_type_name)
-            entity_id = record.get('id')
-            if not _is_canonical_entity_type(entity_type_name):
-                raise SgalchemyError("entity identity requires a non-empty string 'type'")
-            if wire_type != entity_type_name:
-                raise SgalchemyError(
-                    f'wire entity type {wire_type!r} contradicts expected {entity_type_name!r}'
-                )
-            if type(entity_id) is not int or entity_id <= 0:
-                raise SgalchemyError('entity identity requires a positive integer id')
-            alias_binding = binding if binding is not None else self._registry.binding_snapshot()
+        wire_type = record.get('type', entity_type_name)
+        entity_id = record.get('id')
+        if not _is_canonical_entity_type(entity_type_name):
+            raise SgalchemyError("entity identity requires a non-empty string 'type'")
+        if wire_type != entity_type_name:
+            raise SgalchemyError(
+                f'wire entity type {wire_type!r} contradicts expected {entity_type_name!r}'
+            )
+        if type(entity_id) is not int or entity_id <= 0:
+            raise SgalchemyError('entity identity requires a positive integer id')
+        alias_binding = binding if binding is not None else self._registry.binding_snapshot()
+        if (
+            alias_binding is not None
+            and entity_type_name not in alias_binding.schemas
+            and entity_type_name in alias_binding.entity_aliases
+        ):
+            canonical = alias_binding.entity_aliases[entity_type_name]
+            raise SgalchemyError(
+                f'wire entity type {entity_type_name!r} is a display alias for '
+                f'{canonical!r}; canonical wire links must use the canonical type'
+            )
+        key = (entity_type_name, entity_id)
+        obj = self._identity.get(key)
+        if obj is None:
+            class_binding = binding
             if (
-                alias_binding is not None
-                and entity_type_name not in alias_binding.schemas
-                and entity_type_name in alias_binding.entity_aliases
+                binding is not None
+                and entity_type_name not in binding.schemas
+                and entity_type_name not in binding.entity_aliases
             ):
-                canonical = alias_binding.entity_aliases[entity_type_name]
-                raise SgalchemyError(
-                    f'wire entity type {entity_type_name!r} is a display alias for '
-                    f'{canonical!r}; canonical wire links must use the canonical type'
-                )
-            key = (entity_type_name, entity_id)
-            obj = self._identity.get(key)
-            if obj is None:
-                class_binding = binding
-                if (
-                    binding is not None
-                    and entity_type_name not in binding.schemas
-                    and entity_type_name not in binding.entity_aliases
-                ):
-                    class_binding = None
-                cls = self._registry.entity_class_for(entity_type_name, binding=class_binding)
-                obj = cls.__new__(cls)
-                initialize_entity(
-                    obj,
-                    EntityState(
-                        entity_type=entity_type_name,
-                        id=entity_id,
-                        loaded={'id': entity_id},
-                        session=self._owner,
-                    ),
-                )
-                self._attach_hydrated(obj, key)
-                self._identity[key] = obj
-            else:
-                self._attach_hydrated(obj, key)
-            state = entity_state(obj)
-            if retired is not None and not any(
-                candidate is obj for candidate in self._staged_for_identity(key)
-            ):
-                state.deleted = retired
-            previously_loaded = frozenset(key for key in state.loaded if '.' not in key)
-            state.loaded['id'] = entity_id
-            self._apply_record(obj, record, binding)
-            direct_fields = {key for key in record if key != 'type' and '.' not in key}
-            if previously_loaded <= direct_fields:
-                state.expired = False
-            return obj
+                class_binding = None
+            cls = self._registry.entity_class_for(entity_type_name, binding=class_binding)
+            obj = cls.__new__(cls)
+            initialize_entity(
+                obj,
+                EntityState(
+                    entity_type=entity_type_name,
+                    id=entity_id,
+                    loaded={'id': entity_id},
+                    session=self._owner,
+                ),
+            )
+            self._attach_hydrated(obj, key)
+            self._identity[key] = obj
+        else:
+            self._attach_hydrated(obj, key)
+        state = entity_state(obj)
+        if retired is not None and not any(
+            candidate is obj for candidate in staged_for_identity(self._owner.unit_of_work, key)
+        ):
+            state.deleted = retired
+        previously_loaded = frozenset(key for key in state.loaded if '.' not in key)
+        state.loaded['id'] = entity_id
+        self._apply_record(obj, record, binding)
+        direct_fields = {key for key in record if key != 'type' and '.' not in key}
+        if previously_loaded <= direct_fields:
+            state.expired = False
+        return obj
 
     def _hydrate(self, entity_type_name: str, record: Mapping[str, Any]) -> Entity:
         """Capture prepared binding and hydrate one wire record."""
@@ -615,15 +591,15 @@ class SessionState:
 def _copy_container_graph(value: WireContainer) -> WireContainer:
     """Detach exact wire-container topology while retaining opaque leaves."""
     container_types = (dict, list, tuple)
-    memo: dict[int, Any] = {}
-    pending: list[Any] = [value]
+    memo: dict[int, object] = {}
+    pending: list[object] = [value]
     seen: set[int] = set()
     while pending:
         item = pending.pop()
         if type(item) not in container_types:
             memo[id(item)] = item
             continue
-        container = cast('dict[Any, Any] | list[Any] | tuple[Any, ...]', item)
+        container = cast('dict[object, object] | list[object] | tuple[object, ...]', item)
         item_id = id(container)
         if item_id in seen:
             continue

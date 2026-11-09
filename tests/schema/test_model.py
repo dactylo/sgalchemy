@@ -2,13 +2,13 @@ import datetime
 from pathlib import Path
 
 import pytest
-from _fakes import _FakeShotgun
-from _support import fetch_schema
 
 from sgalchemy.schema import _cache, _model
+from tests._fakes import FakeShotgun
+from tests._support import fetch_schema
 
 
-def test_build_schema_types_and_name_field(fake_sg: _FakeShotgun) -> None:
+def test_build_schema_types_and_name_field(fake_sg: FakeShotgun) -> None:
     schemas = _model.build_schema(fetch_schema(fake_sg))
     shot = schemas['Shot']
     assert shot.display_name == 'Shot'
@@ -31,7 +31,7 @@ def test_build_schema_types_and_name_field(fake_sg: _FakeShotgun) -> None:
     ],
 )
 def test_field_editability_defaults_safely(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     raw_editable: dict[str, object],
     expected: bool,
 ) -> None:
@@ -42,7 +42,7 @@ def test_field_editability_defaults_safely(
 
 
 def test_old_cached_schema_without_editability_remains_valid(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
     cache = fetch_schema(fake_sg)
@@ -56,7 +56,7 @@ def test_old_cached_schema_without_editability_remains_valid(
     assert _model.build_schema(loaded)['Shot'].fields['description'].editable
 
 
-def test_pipeline_step_summary_fields_are_not_api_readable(fake_sg: _FakeShotgun) -> None:
+def test_pipeline_step_summary_fields_are_not_api_readable(fake_sg: FakeShotgun) -> None:
     cache = fetch_schema(fake_sg)
     cache.fields['Shot']['step_1'] = {
         'data_type': {'value': 'summary'},
@@ -68,7 +68,7 @@ def test_pipeline_step_summary_fields_are_not_api_readable(fake_sg: _FakeShotgun
     assert 'step_1' not in schemas['Shot'].readable_field_codes()
 
 
-def test_query_fields_are_not_api_readable(fake_sg: _FakeShotgun) -> None:
+def test_query_fields_are_not_api_readable(fake_sg: FakeShotgun) -> None:
     schemas = _model.build_schema(fetch_schema(fake_sg))
     shot = schemas['Shot']
     assert not shot.fields['sg_qc_summary'].api_readable
@@ -78,7 +78,7 @@ def test_query_fields_are_not_api_readable(fake_sg: _FakeShotgun) -> None:
     assert codes == sorted(codes)
 
 
-def test_unknown_data_type_is_object_and_readable(fake_sg: _FakeShotgun) -> None:
+def test_unknown_data_type_is_object_and_readable(fake_sg: FakeShotgun) -> None:
     cache = fetch_schema(fake_sg)
     cache.fields['Shot']['sg_new'] = {
         'data_type': {'value': 'holo_volume'},

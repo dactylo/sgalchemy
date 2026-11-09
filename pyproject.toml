@@ -10,7 +10,7 @@ requires = [ "editables~=0.3", "hatch-fancy-pypi-readme>=25.1", "hatchling>=1.27
 # ==========================================================
 [project]
 name = "sgalchemy"
-version = "0.1.0"
+version = "0.2.0"
 description = "SQLAlchemy-style ORM for Autodesk Flow Production Tracking"
 keywords = [ "flow-production-tracking", "orm", "shotgrid", "shotgun", "sqlalchemy" ]
 license = "MIT"
@@ -53,6 +53,7 @@ dev = [
   "mdformat-shfmt",
   "pyproject-fmt",
   "ruff",
+  "zizmor",
   { include-group = "test" },
 ]
 test = [
@@ -103,12 +104,8 @@ lint.ignore = [
   "T201",   # print() found
   "TRY003", # Avoid specifying long messages outside exception class
 ]
-lint.per-file-ignores."src/sgalchemy/_core/_engine.py" = [ "SLF001" ]
-lint.per-file-ignores."src/sgalchemy/_orm/_async_session.py" = [ "SLF001" ]
-lint.per-file-ignores."src/sgalchemy/_orm/_uow.py" = [ "SLF001" ]
 lint.per-file-ignores."tests/**/*.py" = [
   "D",       # No docstrings required in tests
-  "INP001",  # pytest rootdir-style tests directory has no __init__.py by design
   "PLR2004", # Allow magic values in tests
   "S101",    # Allow asserts in tests
   "S603",    # Allow subprocess calls in tests
@@ -126,6 +123,8 @@ max_supported_python = "3.15"
 # ==========================================================
 [tool.pyright]
 pythonVersion = "3.11"  # Keep in sync with tool.ruff.target-version
+venv = ".venv"  # Created by make setup
+venvPath = "."
 typeCheckingMode = "strict"
 extraPaths = [ ".", "src" ]
 executionEnvironments = [
@@ -142,7 +141,6 @@ ini_options.pythonpath = [ "src" ]
 ini_options.addopts = [ "-q", "--strict-markers", "--tb=short" ]
 ini_options.markers = [
   "live: requires explicit Flow Production Tracking test-site configuration",
-  "mockgun_gap: exercises behavior Mockgun cannot emulate; skipped against the Mockgun backend",
   "native_async: exercises native async provider behavior",
   "provider_contract: exercises the selected real provider without credentials",
   "slow: marks tests as slow (deselect with '-m \"not slow\"')",

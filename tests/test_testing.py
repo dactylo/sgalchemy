@@ -1,15 +1,13 @@
 import asyncio
-import builtins
 import copy
+import gc
+import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from types import ModuleType
-from typing import Any
 
 import pytest
-from _fakes import _FakeShotgun
-from _support import fetch_schema
 
 import sgalchemy.testing as testing_module
 from sgalchemy._core._engine import Engine
@@ -18,13 +16,15 @@ from sgalchemy._core._statement import select
 from sgalchemy._errors import SgalchemyError
 from sgalchemy._orm._session import Session
 from sgalchemy.schema import _cache
-from sgalchemy.testing import _EngineOverOptions, engine_over, mockgun_engine
+from sgalchemy.testing import engine_over, mockgun_engine
+from tests._fakes import FakeShotgun
+from tests._support import fetch_schema
 
 
 @dataclass
 class _BackendCase:
-    _engine: Engine
-    _fake: _FakeShotgun | None
+    engine: Engine
+    fake: FakeShotgun | None
 
 
 def _minimal_schema_cache() -> _cache.SchemaCache:
@@ -46,7 +46,7 @@ def _minimal_schema_cache() -> _cache.SchemaCache:
 @pytest.fixture(params=('fake', 'mockgun'))
 def backend_case(
     request: pytest.FixtureRequest,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> _BackendCase:
     if request.param == 'fake':
@@ -60,6 +60,14 @@ def backend_case(
     pytest.importorskip('shotgun_api3')
     engine = mockgun_engine(fetch_schema(fake_sg), cache_root=tmp_path)
     return _BackendCase(engine, None)
+
+
+def test_async_mockgun_connection_accepts_a_string_cache_root(tmp_path: Path) -> None:
+    mockgun = pytest.importorskip('shotgun_api3.lib.mockgun')
+    if not hasattr(mockgun, 'AsyncShotgun'):
+        pytest.skip('selected provider lacks mockgun.AsyncShotgun')
+    testing_module.async_mockgun_connection(_minimal_schema_cache(), str(tmp_path))
+    assert (tmp_path / 'mockgun_schema.pickle').exists()
 
 
 def test_async_mockgun_replaces_same_root_schema(tmp_path: Path) -> None:
@@ -118,22 +126,22 @@ def test_async_mockgun_reports_provider_import_failure(
 
 
 def test_backend_create_query_update_contract(backend_case: _BackendCase) -> None:
-    engine = backend_case._engine
+    engine = backend_case.engine
     engine.load_schema()
     shot_cls = engine.entities.Shot
     session = Session(engine)
     pending = shot_cls.new(code='contract-A')
     session.add(pending)
     session.commit()
-    if backend_case._fake is not None:
-        backend_case._fake._find_results = [
+    if backend_case.fake is not None:
+        backend_case.fake.find_results = [
             [{'type': 'Shot', 'id': pending.id, 'code': 'contract-A'}]
         ]
     found = session.scalars(select(shot_cls).where(shot_cls.id == pending.id))[0]
     found.code = 'contract-B'
     session.commit()
-    if backend_case._fake is not None:
-        batches = [call for call in backend_case._fake._calls if call[0] == 'batch']
+    if backend_case.fake is not None:
+        batches = [call for call in backend_case.fake.calls if call[0] == 'batch']
         assert len(batches) == 2
         assert batches[-1][1][0] == [
             {
@@ -151,7 +159,13 @@ def test_backend_create_query_update_contract(backend_case: _BackendCase) -> Non
         fresh.close()
 
 
-def test_engine_over_honors_explicit_default_binding(fake_sg: _FakeShotgun) -> None:
+def test_engine_over_accepts_a_string_cache_root(fake_sg: FakeShotgun, tmp_path: Path) -> None:
+    engine = engine_over(fake_sg, cache_root=str(tmp_path))
+    engine.load_schema()
+    assert any(tmp_path.iterdir())
+
+
+def test_engine_over_honors_explicit_default_binding(fake_sg: FakeShotgun) -> None:
     process_registry = default_registry()
 
     engine = engine_over(fake_sg, registry=None, bind_default=True)
@@ -160,7 +174,7 @@ def test_engine_over_honors_explicit_default_binding(fake_sg: _FakeShotgun) -> N
 
 
 def test_engine_over_honors_explicit_default_binding_without_registry(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
 ) -> None:
     process_registry = default_registry()
 
@@ -170,7 +184,7 @@ def test_engine_over_honors_explicit_default_binding_without_registry(
 
 
 def test_engine_over_honors_explicit_none_registry_with_isolation_default(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
 ) -> None:
     process_registry = default_registry()
 
@@ -179,7 +193,7 @@ def test_engine_over_honors_explicit_none_registry_with_isolation_default(
     assert engine.registry is not process_registry
 
 
-def test_engine_over_honors_explicit_registry(fake_sg: _FakeShotgun) -> None:
+def test_engine_over_honors_explicit_registry(fake_sg: FakeShotgun) -> None:
     registry = Registry()
 
     engine = engine_over(fake_sg, registry=registry)
@@ -191,9 +205,9 @@ def test_engine_over_honors_explicit_registry(fake_sg: _FakeShotgun) -> None:
 
 def test_engine_over_isolates_sites_and_process_default(tmp_path: Path) -> None:
     process_registry = default_registry()
-    first_connection: Any = _FakeShotgun()
+    first_connection = FakeShotgun()
     first_connection.base_url = 'https://first.example.com'
-    second_connection: Any = _FakeShotgun()
+    second_connection = FakeShotgun()
     second_connection.base_url = 'https://second.example.com'
     try:
         first = engine_over(first_connection, cache_root=tmp_path / 'first')
@@ -213,36 +227,38 @@ def test_engine_over_isolates_sites_and_process_default(tmp_path: Path) -> None:
         set_default_registry(process_registry)
 
 
-def test_engine_over_option_keys() -> None:
-    assert _EngineOverOptions.__required_keys__ == frozenset()
-    assert _EngineOverOptions.__optional_keys__ == frozenset(
-        {'policy', 'echo', 'registry', 'bind_default', 'serialize'}
-    )
+@pytest.mark.parametrize('explicit_none', [False, True])
+def test_engine_over_isolates_the_schema_cache_by_default(
+    fake_sg: FakeShotgun,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    explicit_none: bool,
+) -> None:
+    monkeypatch.setenv('SGALCHEMY_SCHEMA_CACHE', str(tmp_path / 'user-cache'))
+    engine = engine_over(fake_sg, cache_root=None) if explicit_none else engine_over(fake_sg)
+    engine.load_schema()
+    root = engine._cache_root
+    assert root is not None
+    assert any(root.iterdir())
+    assert not (tmp_path / 'user-cache').exists()
+    del engine
+    gc.collect()
+    assert not root.exists()
+
+
+def test_mockgun_engine_accepts_a_string_cache_root(tmp_path: Path) -> None:
+    pytest.importorskip('shotgun_api3')
+    engine = mockgun_engine(_minimal_schema_cache(), str(tmp_path))
+    assert 'Shot' in engine.schema
 
 
 def test_mockgun_engine_accepts_module_without_legacy_schema_cache(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    from shotgun_api3.lib import mockgun  # noqa: PLC0415 - Test provider capability shape.
-
+    mockgun: ModuleType = pytest.importorskip('shotgun_api3.lib.mockgun')
     provider_module = ModuleType('mockgun_without_legacy_schema_cache')
     monkeypatch.setattr(provider_module, 'Shotgun', vars(mockgun)['Shotgun'], raising=False)
-    provider_package = ModuleType('shotgun_api3.lib_without_legacy_schema_cache')
-    monkeypatch.setattr(provider_package, 'mockgun', provider_module, raising=False)
-    original_import = builtins.__import__
-
-    def import_without_legacy_schema_cache(
-        name: str,
-        global_vars: dict[str, Any] | None = None,
-        local_vars: dict[str, Any] | None = None,
-        fromlist: tuple[str, ...] = (),
-        level: int = 0,
-    ) -> ModuleType:
-        if name == 'shotgun_api3.lib' and fromlist == ('mockgun',):
-            return provider_package
-        return original_import(name, global_vars, local_vars, fromlist, level)
-
-    monkeypatch.setattr(builtins, '__import__', import_without_legacy_schema_cache)
+    monkeypatch.setitem(sys.modules, 'shotgun_api3.lib.mockgun', provider_module)
 
     engine = mockgun_engine(_minimal_schema_cache(), tmp_path)
 
@@ -262,7 +278,7 @@ def test_mockgun_engine_does_not_mutate_caller_schema(tmp_path: Path) -> None:
 
 
 def test_mockgun_engine_replaces_stale_same_root_schema(
-    fake_sg: _FakeShotgun, tmp_path: Path
+    fake_sg: FakeShotgun, tmp_path: Path
 ) -> None:
     pytest.importorskip('shotgun_api3')
     first_cache = fetch_schema(fake_sg)
@@ -289,20 +305,7 @@ def test_mockgun_engine_reports_missing_provider(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    original_import = builtins.__import__
-
-    def blocked_import(
-        name: str,
-        global_vars: dict[str, Any] | None = None,
-        local_vars: dict[str, Any] | None = None,
-        fromlist: tuple[str, ...] = (),
-        level: int = 0,
-    ) -> ModuleType:
-        if name == 'shotgun_api3.lib':
-            raise ImportError('blocked optional provider')
-        return original_import(name, global_vars, local_vars, fromlist, level)
-
-    monkeypatch.setattr(builtins, '__import__', blocked_import)
+    monkeypatch.setitem(sys.modules, 'shotgun_api3.lib.mockgun', None)
 
     with pytest.raises(SgalchemyError, match=r'sgalchemy\[official\]') as excinfo:
         mockgun_engine(_minimal_schema_cache(), tmp_path)

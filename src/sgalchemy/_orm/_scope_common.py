@@ -1,5 +1,6 @@
 """Shared failure diagnostics for synchronous and asynchronous scoping."""
 
+from contextlib import suppress
 from logging import Logger
 from types import TracebackType
 
@@ -46,10 +47,19 @@ def record_close_failure(
         owner_name: Session type whose close operation failed.
         logger: Logger for a secondary failure that cannot be annotated.
     """
-    note = f'sgalchemy: {owner_name}.close() also failed: {type(secondary).__name__}: {secondary}'
+    detail = 'details unavailable'
+    diagnostic_available = False
+    with suppress(Exception):
+        detail = f'{type(secondary).__name__}: {secondary}'
+        diagnostic_available = True
+    note = f'sgalchemy: {owner_name}.close() also failed: {detail}'
     if not add_note_once(primary, note):
+        exc_info = None
+        if diagnostic_available:
+            with suppress(Exception):
+                exc_info = (type(secondary), secondary, secondary.__traceback__)
         logger.error(
             '%s.close() failed while preserving the primary exception',
             owner_name,
-            exc_info=(type(secondary), secondary, secondary.__traceback__),
+            exc_info=exc_info,
         )

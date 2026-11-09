@@ -93,7 +93,7 @@ class LazyLoad:
 
 @dataclass(frozen=True, eq=False)
 class LoadOnly:
-    """Restrict loaded fields to the given set (plus id)."""
+    """Restrict loaded fields to the given set (plus `id`)."""
 
     fields: tuple[FieldExpr, ...]
 
@@ -169,7 +169,7 @@ def lazyload(field: FieldExpr) -> LazyLoad:
 
 
 def load_only(*fields: FieldExpr) -> LoadOnly:
-    """Load only the named fields (plus id).
+    """Load only the named fields (plus `id`).
 
     Args:
         *fields: Fields to load.
@@ -195,7 +195,7 @@ def normalize_relationship_loaders(
         CompilationError: If one root relationship has conflicting strategies.
     """
     normalized: list[JoinedLoad | LazyLoad | SelectinLoad] = []
-    seen: set[tuple[str, tuple[tuple[str, tuple[str, ...]], ...]]] = set()
+    seen: set[JoinedLoad | LazyLoad | SelectinLoad] = set()
     strategies: dict[tuple[str, str], str] = {}
     for option in options:
         if isinstance(option, JoinedLoad):
@@ -209,8 +209,7 @@ def normalize_relationship_loaders(
             fields = (option.field,)
         else:
             continue
-        signature = (strategy, tuple((field.root_type, field.path) for field in fields))
-        if signature in seen:
+        if option in seen:
             continue
         if fields:
             first = fields[0]
@@ -223,7 +222,7 @@ def normalize_relationship_loaders(
                     'selectinload(), or lazyload()'
                 )
             strategies[key] = strategy
-        seen.add(signature)
+        seen.add(option)
         normalized.append(option)
     return tuple(normalized)
 

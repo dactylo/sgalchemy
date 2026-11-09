@@ -4,7 +4,6 @@ from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, assert_never, cast
 
-from sgalchemy._core._entity import entity_registry as registered_entity_registry
 from sgalchemy._core._entity import entity_type as registered_entity_type
 from sgalchemy._core._expressions import (
     FieldExpr,
@@ -103,8 +102,8 @@ def _known_entity_type(
     if canonical is not None:
         raise CompilationError(
             f'{entity_type!r} is the display-name alias of {canonical!r}; aliases '
-            f'resolve from a bound registry - import the class after engine creation, '
-            f'or use the canonical name'
+            f'resolve from a bound registry - import the class after engine.load_schema() '
+            f'or connect(), or use the canonical name'
         )
     if opaque_class:
         raise CompilationError(
@@ -140,6 +139,14 @@ def _validate_api_readable(
         raise CompilationError(
             f'{entity_type}.{code} is a UI-only query/summary field; it returns no usable '
             f'data through the API (in {location})'
+        )
+
+
+def _validate_field_owner(owner: str | None, path: str, entity_type: str, context: str) -> None:
+    """Reject a field owned by another entity with its clause-specific message."""
+    if owner is not None and owner != entity_type:
+        raise CompilationError(
+            f'{context} on {owner}.{path} cannot be attached to a {entity_type} statement'
         )
 
 
@@ -288,6 +295,15 @@ def _apply_joinedload(
     fields.extend(_deep_fields(opt, entity_type, schemas, defers))
 
 
+def _validate_field_path(
+    path: str, entity_type: str, schemas: Mapping[str, EntitySchema] | None
+) -> None:
+    """Validate field grammar and, when available, its schema path."""
+    _validate_path_grammar(path)
+    if schemas is not None:
+        _validate_path(path, entity_type, schemas)
+
+
 def _column_target_and_fields(
     stmt: 'Select[Entity | None]',
     schemas: Mapping[str, EntitySchema] | None,
@@ -323,9 +339,7 @@ def _column_target_and_fields(
     _known_entity_type(entity_type, schemas)
     paths = [column.filter_field for column in columns]
     for path in paths:
-        _validate_path_grammar(path)
-        if schemas is not None:
-            _validate_path(path, entity_type, schemas)
+        _validate_field_path(path, entity_type, schemas)
     return entity_type, _deduplicate_fields(paths)
 
 
@@ -339,14 +353,8 @@ def _compile_conditions(
     for cond in conds:
         match cond:
             case Filter():
-                if cond.entity_type is not None and cond.entity_type != entity_type:
-                    raise CompilationError(
-                        f'filter on {cond.entity_type}.{cond.path} cannot be attached to a '
-                        f'{entity_type} statement'
-                    )
-                _validate_path_grammar(cond.path)
-                if schemas is not None:
-                    _validate_path(cond.path, entity_type, schemas)
+                _validate_field_owner(cond.entity_type, cond.path, entity_type, 'filter')
+                _validate_field_path(cond.path, entity_type, schemas)
                 out.append([cond.path, cond.op, cond.value, *cond.extra_values])
             case RawFilters():
                 out.extend(cond.filters)
@@ -376,9 +384,7 @@ def _validate_field_loaders(
                         f'{field_expr.root_type}.{field_expr.filter_field} cannot be loaded '
                         f'on a {entity_type} statement'
                     )
-                _validate_path_grammar(field_expr.filter_field)
-                if schemas is not None:
-                    _validate_path(field_expr.filter_field, entity_type, schemas)
+                _validate_field_path(field_expr.filter_field, entity_type, schemas)
 
 
 def _validate_summary_target(stmt: 'Select[Entity | None]') -> None:
@@ -411,19 +417,11 @@ def _compile_summarize(
     _check_exec_options(stmt.exec_options, SUMMARIZE_EXECUTION_OPTIONS)
     filters = _compile_conditions(stmt.conditions, entity_type, schemas)
     for grouping in stmt.groupings:
-        if grouping.entity_type is not None and grouping.entity_type != entity_type:
-            raise CompilationError(
-                f'group_by on {grouping.entity_type}.{grouping.path} cannot be attached '
-                f'to a {entity_type} statement'
-            )
+        _validate_field_owner(grouping.entity_type, grouping.path, entity_type, 'group_by')
     for summary in summaries:
-        _validate_path_grammar(summary.path)
-        if schemas is not None:
-            _validate_path(summary.path, entity_type, schemas)
+        _validate_field_path(summary.path, entity_type, schemas)
     for grouping in stmt.groupings:
-        _validate_path_grammar(grouping.path)
-        if schemas is not None:
-            _validate_path(grouping.path, entity_type, schemas)
+        _validate_field_path(grouping.path, entity_type, schemas)
     grouping = [
         {'field': item.path, 'type': item.mode, 'direction': 'asc'} for item in stmt.groupings
     ] or None
@@ -514,11 +512,7 @@ def _entity_target_and_fields(
     """Resolve an entity selection and apply its loader projections."""
     target = cast('type[object]', stmt.entity)
     entity_type = registered_entity_type(target)
-    _known_entity_type(
-        entity_type,
-        schemas,
-        opaque_class=registered_entity_registry(target) is not None,
-    )
+    _known_entity_type(entity_type, schemas, opaque_class=True)
     load_only = [opt for opt in stmt.loader_options if isinstance(opt, LoadOnly)]
     defers = {
         field.filter_field
@@ -599,14 +593,8 @@ def compile_statement(
     _check_exec_options(stmt.exec_options, FIND_EXECUTION_OPTIONS)
     filters = _compile_conditions(stmt.conditions, entity_type, schemas)
     for ordering in stmt.orderings:
-        if ordering.entity_type is not None and ordering.entity_type != entity_type:
-            raise CompilationError(
-                f'order_by on {ordering.entity_type}.{ordering.path} cannot be attached '
-                f'to a {entity_type} statement'
-            )
-        _validate_path_grammar(ordering.path)
-        if schemas is not None:
-            _validate_path(ordering.path, entity_type, schemas)
+        _validate_field_owner(ordering.entity_type, ordering.path, entity_type, 'order_by')
+        _validate_field_path(ordering.path, entity_type, schemas)
     order = [
         {'field_name': ordering.path, 'direction': ordering.direction}
         for ordering in stmt.orderings

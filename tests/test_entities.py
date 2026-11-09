@@ -6,12 +6,12 @@ from threading import Barrier, Event
 from typing import Any
 
 import pytest
-from _fakes import _FakeShotgun
-from _support import entity_namespace_scope, fetch_schema, reset_default_registry_state
 
 from sgalchemy._core import _registry
 from sgalchemy._errors import SgalchemyError
 from sgalchemy.schema import _model
+from tests._fakes import FakeShotgun
+from tests._support import entity_namespace_scope, fetch_schema, reset_default_registry_state
 
 
 @pytest.fixture(autouse=True)
@@ -21,7 +21,7 @@ def clean_registry(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
         yield
 
 
-def test_alias_stays_live_through_repoint_and_drop(fake_sg: _FakeShotgun) -> None:
+def test_alias_stays_live_through_repoint_and_drop(fake_sg: FakeShotgun) -> None:
     ents = importlib.import_module('sgalchemy.entities')
 
     registry = _registry.default_registry()
@@ -51,7 +51,7 @@ def test_alias_stays_live_through_repoint_and_drop(fake_sg: _FakeShotgun) -> Non
 
 
 def test_binding_during_symbolic_lookup_uses_one_registry_generation(
-    fake_sg: _FakeShotgun, monkeypatch: pytest.MonkeyPatch
+    fake_sg: FakeShotgun, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     ents = importlib.import_module('sgalchemy.entities')
 
@@ -80,7 +80,7 @@ def test_binding_during_symbolic_lookup_uses_one_registry_generation(
     assert 'Vendor' not in vars(ents)
 
 
-def test_bound_unknown_and_leading_underscore_raise(fake_sg: _FakeShotgun) -> None:
+def test_bound_unknown_and_leading_underscore_raise(fake_sg: FakeShotgun) -> None:
     ents = importlib.import_module('sgalchemy.entities')
 
     with pytest.raises(AttributeError):
@@ -92,7 +92,7 @@ def test_bound_unknown_and_leading_underscore_raise(fake_sg: _FakeShotgun) -> No
         _ = ents.NoSuchType
 
 
-def test_canonical_lookup_after_binding_is_cached(fake_sg: _FakeShotgun) -> None:
+def test_canonical_lookup_after_binding_is_cached(fake_sg: FakeShotgun) -> None:
     ents = importlib.import_module('sgalchemy.entities')
 
     _registry.default_registry().bind(
@@ -148,7 +148,7 @@ def test_dir_hides_default_generation_plumbing() -> None:
     assert plumbing_names.isdisjoint(dir(ents))
 
 
-def test_dir_reports_globals_and_registry_names(fake_sg: _FakeShotgun) -> None:
+def test_dir_reports_globals_and_registry_names(fake_sg: FakeShotgun) -> None:
     ents = importlib.import_module('sgalchemy.entities')
 
     _ = ents.SymbolicOnly
@@ -162,16 +162,6 @@ def test_dir_reports_globals_and_registry_names(fake_sg: _FakeShotgun) -> None:
     assert 'CustomEntity03' in names
     assert 'Vendor' in names
     assert '__getattr__' in names
-
-
-def test_entity_namespace_scope_clears_materialized_class(fake_sg: _FakeShotgun) -> None:
-    with entity_namespace_scope(('Shot',)) as entities:
-        _registry.default_registry().bind(
-            _model.build_schema(fetch_schema(fake_sg)), key=fake_sg.base_url
-        )
-        _ = entities.Shot
-
-    assert 'Shot' not in vars(entities)
 
 
 def test_materialization_wins_before_prefreeze_default_commit(

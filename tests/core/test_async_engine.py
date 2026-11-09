@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import importlib
+import logging
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -9,15 +10,9 @@ from typing import Any, Literal, cast
 from unittest.mock import AsyncMock
 
 import pytest
-from _fakes import _FakeAsyncShotgun, _FakeShotgun, _FakeShotgunFactory
-from _support import (
-    AUTHENTICATION_FAULT,
-    STATIC_FORMS,
-    isolated_async_engine,
-    reset_default_registry_state,
-)
 
 from sgalchemy._core import _registry as registry_module
+from sgalchemy._core._async_backend import NativeAsyncBackend, ThreadedSyncBackend
 from sgalchemy._core._async_engine import AsyncEngine, create_async_engine
 from sgalchemy._core._compiler import FindCall, SummarizeCall
 from sgalchemy._core._engine import create_engine
@@ -25,6 +20,15 @@ from sgalchemy._core._registry import Registry, entity_state
 from sgalchemy._errors import SgalchemyError
 from sgalchemy.schema._cache import SchemaCache, load_cache, store_cache
 from sgalchemy.schema._cachedir import cache_file
+from tests._fakes import FakeAsyncShotgun, FakeShotgun, FakeShotgunFactory
+from tests._support import (
+    AUTHENTICATION_FAULT,
+    STATIC_FORMS,
+    break_provider_import,
+    isolated_async_engine,
+    reset_default_registry_state,
+    run_async,
+)
 
 _NON_SCHEMA_FAULT_CASES: list[tuple[str, Exception, tuple[Any, ...]]] = [
     ('find', RuntimeError('requested record does not exist'), ('Shot', [], ['id'])),
@@ -32,18 +36,34 @@ _NON_SCHEMA_FAULT_CASES: list[tuple[str, Exception, tuple[Any, ...]]] = [
 ]
 
 
+def test_async_cache_serialization_errors_still_propagate(
+    tmp_path: Path,
+) -> None:
+    class InfoShotgun(FakeAsyncShotgun):
+        async def info(self) -> object:
+            return {'opaque': object()}
+
+    async def scenario() -> None:
+        engine = isolated_async_engine(InfoShotgun(), tmp_path)
+        with pytest.raises(TypeError, match='is not JSON serializable'):
+            await engine.load_schema()
+        await engine.dispose()
+
+    asyncio.run(scenario())
+
+
 def test_async_creator_is_public_awaited_and_lazy(tmp_path: Path) -> None:
     async def scenario() -> None:
-        created: list[_FakeAsyncShotgun] = []
+        created: list[FakeAsyncShotgun] = []
 
-        async def make() -> _FakeAsyncShotgun:
-            client = _FakeAsyncShotgun()
+        async def make() -> FakeAsyncShotgun:
+            client = FakeAsyncShotgun()
             created.append(client)
             return client
 
         engine = create_async_engine(
             'https://fake.example.com',
-            async_creator=cast('Any', make),
+            async_creator=make,
             cache_root=tmp_path,
         )
         assert created == []
@@ -55,10 +75,10 @@ def test_async_creator_is_public_awaited_and_lazy(tmp_path: Path) -> None:
 
 def test_async_creator_rejects_sync_client_before_publication() -> None:
     async def scenario() -> None:
-        created: list[_FakeShotgun] = []
+        created: list[FakeShotgun] = []
 
-        async def make() -> _FakeShotgun:
-            client = _FakeShotgun()
+        async def make() -> FakeShotgun:
+            client = FakeShotgun()
             created.append(client)
             return client
 
@@ -72,8 +92,8 @@ def test_async_creator_rejects_sync_client_before_publication() -> None:
                 await engine.call('schema_read')
 
         assert len(created) == 2
-        assert all(client._closed for client in created)
-        assert all(client._calls == [] for client in created)
+        assert all(client.closed for client in created)
+        assert all(client.calls == [] for client in created)
         await engine.dispose()
 
     asyncio.run(scenario())
@@ -81,9 +101,9 @@ def test_async_creator_rejects_sync_client_before_publication() -> None:
 
 def test_async_creator_rejects_sync_result_and_awaits_cleanup() -> None:
     async def scenario() -> None:
-        client = _FakeAsyncShotgun()
+        client = FakeAsyncShotgun()
 
-        def make() -> _FakeAsyncShotgun:
+        def make() -> FakeAsyncShotgun:
             return client
 
         engine = create_async_engine('https://fake.example.com', async_creator=cast('Any', make))
@@ -91,14 +111,14 @@ def test_async_creator_rejects_sync_result_and_awaits_cleanup() -> None:
         with pytest.raises(TypeError, match='async_creator returned a non-awaitable'):
             await engine.call('schema_read')
 
-        assert client._closed is True
-        assert [name for name, _, _ in client._calls].count('close') == 1
+        assert client.closed is True
+        assert [name for name, _, _ in client.calls].count('close') == 1
 
     asyncio.run(scenario())
 
 
 def test_async_default_engine_rejects_different_site_binding(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -131,12 +151,12 @@ def test_async_default_engine_rejects_different_site_binding(
 
 
 def test_async_engine_call_attaches_auth_note_for_direct_users(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
 ) -> None:
     async def scenario() -> None:
         engine = create_async_engine(connection=fake_async_sg)
         fault = AUTHENTICATION_FAULT('rejected')
-        fake_async_sg._errors.setdefault('find', []).append(fault)
+        fake_async_sg.errors.setdefault('find', []).append(fault)
 
         with pytest.raises(AUTHENTICATION_FAULT) as excinfo:
             await engine.call('find', 'Shot', [])
@@ -152,12 +172,10 @@ def test_async_engine_call_attaches_auth_note_when_async_creator_rejects() -> No
     async def scenario() -> None:
         fault = AUTHENTICATION_FAULT('creator rejected')
 
-        async def rejected_creator() -> _FakeAsyncShotgun:
+        async def rejected_creator() -> FakeAsyncShotgun:
             raise fault
 
-        engine = create_async_engine(
-            'https://fake.example.com', async_creator=cast('Any', rejected_creator)
-        )
+        engine = create_async_engine('https://fake.example.com', async_creator=rejected_creator)
 
         with pytest.raises(AUTHENTICATION_FAULT) as excinfo:
             await engine.call('find', 'Shot', [])
@@ -177,16 +195,14 @@ def test_async_engine_call_does_not_mark_schema_stale_for_async_creator_setup(
         fault = RuntimeError('unknown field during creator setup')
         marked = False
 
-        async def rejected_creator() -> _FakeAsyncShotgun:
+        async def rejected_creator() -> FakeAsyncShotgun:
             raise fault
 
         def mark_schema_stale() -> None:
             nonlocal marked
             marked = True
 
-        engine = create_async_engine(
-            'https://fake.example.com', async_creator=cast('Any', rejected_creator)
-        )
+        engine = create_async_engine('https://fake.example.com', async_creator=rejected_creator)
         monkeypatch.setattr(engine, 'mark_schema_stale', mark_schema_stale)
 
         with pytest.raises(RuntimeError) as excinfo:
@@ -199,7 +215,7 @@ def test_async_engine_call_does_not_mark_schema_stale_for_async_creator_setup(
 
 
 def test_async_engine_call_marks_schema_stale_for_provider_invocation(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def scenario() -> None:
@@ -212,7 +228,7 @@ def test_async_engine_call_marks_schema_stale_for_provider_invocation(
 
         engine = create_async_engine(connection=fake_async_sg)
         monkeypatch.setattr(engine, 'mark_schema_stale', mark_schema_stale)
-        fake_async_sg._errors.setdefault('find', []).append(fault)
+        fake_async_sg.errors.setdefault('find', []).append(fault)
 
         with pytest.raises(RuntimeError) as excinfo:
             await engine.call('find', 'Shot', [])
@@ -224,7 +240,7 @@ def test_async_engine_call_marks_schema_stale_for_provider_invocation(
 
 
 def test_async_engine_dispose_resets_and_engine_remains_usable(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -233,7 +249,7 @@ def test_async_engine_dispose_resets_and_engine_remains_usable(
             await engine.call('schema_read')
             await engine.dispose()
             await engine.call('schema_read')
-        assert fake_async_sg._closed is False
+        assert fake_async_sg.closed is False
 
     asyncio.run(scenario())
 
@@ -244,12 +260,12 @@ def test_async_engine_load_schema_classifies_async_creator_auth_failure(
     async def scenario() -> None:
         fault = AUTHENTICATION_FAULT('creator rejected')
 
-        async def rejected_creator() -> _FakeAsyncShotgun:
+        async def rejected_creator() -> FakeAsyncShotgun:
             raise fault
 
         engine = create_async_engine(
             'https://fake.example.com',
-            async_creator=cast('Any', rejected_creator),
+            async_creator=rejected_creator,
             cache_root=tmp_path,
             registry=Registry(),
             bind_default=False,
@@ -266,7 +282,7 @@ def test_async_engine_load_schema_classifies_async_creator_auth_failure(
     asyncio.run(scenario())
 
 
-def test_async_engine_registry_is_read_only(fake_async_sg: _FakeAsyncShotgun) -> None:
+def test_async_engine_registry_is_read_only(fake_async_sg: FakeAsyncShotgun) -> None:
     engine = create_async_engine(
         connection=fake_async_sg,
         registry=Registry(),
@@ -278,7 +294,7 @@ def test_async_engine_registry_is_read_only(fake_async_sg: _FakeAsyncShotgun) ->
 
 
 def test_async_engine_rejects_cross_loop_reuse(
-    fake_async_sg: _FakeAsyncShotgun, tmp_path: Path
+    fake_async_sg: FakeAsyncShotgun, tmp_path: Path
 ) -> None:
     engine = create_async_engine(
         connection=fake_async_sg,
@@ -319,18 +335,8 @@ def test_async_engine_rejects_cross_loop_reuse(
         ),
         (
             (),
-            {'strategy': 'native', 'sync_connection': object()},
-            'native strategy does not accept sync_connection',
-        ),
-        (
-            (),
             {'connection': object(), 'script_name': 'ignored'},
             'a supplied connection cannot be combined with url, credentials, or creators',
-        ),
-        (
-            (),
-            {'strategy': 'threaded', 'connection': object()},
-            'threaded strategy does not accept connection or async_creator',
         ),
         (
             (),
@@ -344,11 +350,6 @@ def test_async_engine_rejects_cross_loop_reuse(
             (),
             {'strategy': 'threaded', 'sync_connection': object(), 'api_key': 'ignored'},
             'a supplied connection cannot be combined with url, credentials, or creators',
-        ),
-        (
-            (),
-            {'strategy': 'invalid'},
-            "strategy must be 'native' or 'threaded'",
         ),
     ],
 )
@@ -370,7 +371,7 @@ def test_async_engine_shared_creator_failure_never_marks_schema_stale(
         release = asyncio.Event()
         marked = 0
 
-        async def rejected_creator() -> _FakeAsyncShotgun:
+        async def rejected_creator() -> FakeAsyncShotgun:
             entered.set()
             await release.wait()
             raise fault
@@ -386,9 +387,7 @@ def test_async_engine_shared_creator_failure_never_marks_schema_stale(
                 return err
             raise AssertionError('provider call unexpectedly succeeded')
 
-        engine = create_async_engine(
-            'https://fake.example.com', async_creator=cast('Any', rejected_creator)
-        )
+        engine = create_async_engine('https://fake.example.com', async_creator=rejected_creator)
         monkeypatch.setattr(engine, 'mark_schema_stale', mark_schema_stale)
         first = asyncio.create_task(capture_failure(engine))
         await entered.wait()
@@ -401,11 +400,11 @@ def test_async_engine_shared_creator_failure_never_marks_schema_stale(
         assert failures[1] is fault
         assert marked == 0
 
-    asyncio.run(scenario())
+    run_async(scenario())
 
 
 def test_async_engine_valid_live_schema_publishes_and_updates_cache(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     registry = Registry()
@@ -430,37 +429,35 @@ def test_async_engine_valid_live_schema_publishes_and_updates_cache(
 
 
 def test_async_factory_accepts_http_for_caller_owned_sources(
-    fake_async_sg: _FakeAsyncShotgun,
-    fake_sg: _FakeShotgun,
+    fake_async_sg: FakeAsyncShotgun,
+    fake_sg: FakeShotgun,
 ) -> None:
     fake_async_sg.base_url = 'http://caller.example.com'
     fake_sg.base_url = 'http://caller.example.com'
     supplied_native = create_async_engine(connection=fake_async_sg)
     supplied_threaded = create_async_engine(strategy='threaded', sync_connection=fake_sg)
-    created_async = _FakeAsyncShotgun()
+    created_async = FakeAsyncShotgun()
     created_async.base_url = 'http://caller.example.com'
-    created_sync = _FakeShotgun()
+    created_sync = FakeShotgun()
     created_sync.base_url = 'http://caller.example.com'
     async_creator_calls = 0
     creator_calls = 0
 
-    async def async_creator() -> _FakeAsyncShotgun:
+    async def async_creator() -> FakeAsyncShotgun:
         nonlocal async_creator_calls
         async_creator_calls += 1
         return created_async
 
-    def creator() -> _FakeShotgun:
+    def creator() -> FakeShotgun:
         nonlocal creator_calls
         creator_calls += 1
         return created_sync
 
-    owned_native = create_async_engine(
-        'http://caller.example.com', async_creator=cast('Any', async_creator)
-    )
+    owned_native = create_async_engine('http://caller.example.com', async_creator=async_creator)
     owned_threaded = create_async_engine(
         'http://caller.example.com',
         strategy='threaded',
-        creator=cast('Any', creator),
+        creator=creator,
     )
 
     assert supplied_native.site == 'http://caller.example.com'
@@ -479,13 +476,13 @@ def test_async_factory_accepts_http_for_caller_owned_sources(
     asyncio.run(scenario())
     assert async_creator_calls == 1
     assert creator_calls == 1
-    assert fake_async_sg._closed is False
-    assert fake_sg._closed is False
+    assert fake_async_sg.closed is False
+    assert fake_sg.closed is False
 
 
 def test_async_factory_canonicalizes_supplied_connection_sites(
-    fake_async_sg: _FakeAsyncShotgun,
-    fake_sg: _FakeShotgun,
+    fake_async_sg: FakeAsyncShotgun,
+    fake_sg: FakeShotgun,
 ) -> None:
     fake_async_sg.base_url = 'HTTPS://FAKE.EXAMPLE.COM/'
     fake_sg.base_url = 'HTTPS://FAKE.EXAMPLE.COM/'
@@ -497,7 +494,7 @@ def test_async_factory_canonicalizes_supplied_connection_sites(
     assert threaded.site == 'https://fake.example.com'
 
 
-def test_async_find_preserves_compiler_call_shape(fake_async_sg: _FakeAsyncShotgun) -> None:
+def test_async_find_preserves_compiler_call_shape(fake_async_sg: FakeAsyncShotgun) -> None:
     async def scenario() -> None:
         engine = create_async_engine(
             connection=fake_async_sg,
@@ -517,7 +514,7 @@ def test_async_find_preserves_compiler_call_shape(fake_async_sg: _FakeAsyncShotg
 
         await engine.execute_call(call)
 
-        assert fake_async_sg._calls[-1] == (
+        assert fake_async_sg.calls[-1] == (
             'find',
             ('Shot', [['code', 'is', 'AB']], ['id', 'code']),
             {
@@ -532,7 +529,7 @@ def test_async_find_preserves_compiler_call_shape(fake_async_sg: _FakeAsyncShotg
 
 
 def test_async_schema_is_explicit_and_cached(
-    fake_async_sg: _FakeAsyncShotgun, tmp_path: Path
+    fake_async_sg: FakeAsyncShotgun, tmp_path: Path
 ) -> None:
     async def scenario() -> None:
         process_defaults = list(registry_module._DEFAULT_REGISTRIES)
@@ -547,7 +544,7 @@ def test_async_schema_is_explicit_and_cached(
         binding = await engine.load_binding()
         assert binding is engine.prepared_binding()
         assert binding.schemas is engine.schema
-        assert [name for name, _, _ in fake_async_sg._calls].count('schema_read') == 1
+        assert [name for name, _, _ in fake_async_sg.calls].count('schema_read') == 1
 
     asyncio.run(scenario())
 
@@ -601,20 +598,22 @@ def test_async_static_credentials_require_https(
     ('kwargs', 'message'),
     [
         (
-            {'strategy': 'native', 'session_token': 'tok', 'max_workers': 2},
-            'native strategy does not accept max_workers',
-        ),
-        (
-            {'strategy': 'native', 'session_token': 'tok', 'creator': _FakeShotgun},
-            'native strategy does not accept sync_connection or creator',
+            {'strategy': 'native', 'session_token': 'tok', 'creator': FakeShotgun},
+            (
+                "strategy='native' does not accept sync_connection or creator; "
+                "omit strategy or pass strategy='threaded'"
+            ),
         ),
         (
             {
                 'strategy': 'threaded',
                 'session_token': 'tok',
-                'async_creator': _FakeShotgun,
+                'async_creator': FakeShotgun,
             },
-            'threaded strategy does not accept connection or async_creator',
+            (
+                "strategy='threaded' does not accept connection or async_creator; "
+                "omit strategy or pass strategy='native'"
+            ),
         ),
         (
             {'strategy': 'threaded', 'session_token': 'tok', 'max_workers': 0},
@@ -640,7 +639,7 @@ def test_async_factory_rejects_inconsistent_options(
     _NON_SCHEMA_FAULT_CASES,
 )
 def test_async_non_schema_fault_does_not_mark_schema_stale(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
     method: str,
     error: Exception,
@@ -649,11 +648,11 @@ def test_async_non_schema_fault_does_not_mark_schema_stale(
     async def scenario() -> None:
         engine = isolated_async_engine(fake_async_sg, tmp_path)
         await engine.load_schema()
-        fake_async_sg._errors[method] = [error]
+        fake_async_sg.errors[method] = [error]
         with pytest.raises(type(error), match='does not exist'):
             await engine.call(method, *args)
         await engine.load_schema()
-        assert [name for name, _, _ in fake_async_sg._calls].count('schema_read') == 1
+        assert [name for name, _, _ in fake_async_sg.calls].count('schema_read') == 1
 
     asyncio.run(scenario())
 
@@ -667,7 +666,7 @@ def test_async_non_schema_fault_does_not_mark_schema_stale(
     ],
 )
 def test_async_engine_rejects_malformed_live_schema_without_publication_or_cache_update(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     malformed_shape: str,
     monkeypatch: pytest.MonkeyPatch,
     schema_fixture: dict[str, Any],
@@ -688,14 +687,14 @@ def test_async_engine_rejects_malformed_live_schema_without_publication_or_cache
         live_fields['Shot']['project']['properties']['valid_types']['value'] = 'schema-secret'
 
     async def schema_read() -> dict[str, Any]:
-        await fake_async_sg._record('schema_read')
+        await fake_async_sg.record('schema_read')
         return live_fields
 
     monkeypatch.setattr(fake_async_sg, 'schema_read', schema_read)
     if malformed_shape == 'entity_metadata':
 
         async def schema_entity_read() -> dict[str, Any]:
-            await fake_async_sg._record('schema_entity_read')
+            await fake_async_sg.record('schema_entity_read')
             return {'Shot': ['schema-secret']}
 
         monkeypatch.setattr(fake_async_sg, 'schema_entity_read', schema_entity_read)
@@ -729,14 +728,14 @@ def test_async_engine_rejects_malformed_live_schema_without_publication_or_cache
     ],
 )
 def test_async_schema_refresh_preserves_only_dictionary_server_info(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     info_value: object,
     expected: dict[str, Any] | None,
 ) -> None:
     async def info() -> object:
-        await fake_async_sg._record('info')
+        await fake_async_sg.record('info')
         return info_value
 
     monkeypatch.setattr(fake_async_sg, 'info', info, raising=False)
@@ -749,10 +748,31 @@ def test_async_schema_refresh_preserves_only_dictionary_server_info(
     cached = load_cache(cache_file(fake_async_sg.base_url, root=tmp_path))
     assert cached is not None
     assert cached.server_info == expected
+    assert [name for name, _, _ in fake_async_sg.calls] == [
+        'info',
+        'schema_read',
+        'schema_entity_read',
+    ]
+
+
+def test_async_string_cache_root_is_accepted(
+    fake_async_sg: FakeAsyncShotgun, tmp_path: Path
+) -> None:
+    async def scenario() -> None:
+        engine = create_async_engine(
+            connection=fake_async_sg, cache_root=str(tmp_path), bind_default=False
+        )
+        try:
+            await engine.load_schema()
+            assert cache_file(engine.site, root=tmp_path).exists()
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
 
 
 def test_async_summary_preserves_grouping_presence(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -779,6 +799,47 @@ def test_async_summary_preserves_grouping_presence(
         assert summarize.call_args.kwargs['grouping'] == grouping
 
     asyncio.run(scenario())
+
+
+def test_async_unwritable_cache_warns_and_publishes_the_fetched_schema(
+    fake_async_sg: FakeAsyncShotgun, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    root = tmp_path / 'not-a-directory'
+    root.write_text('')
+
+    async def scenario() -> None:
+        engine = isolated_async_engine(fake_async_sg, root)
+        with caplog.at_level(logging.WARNING, logger='sgalchemy.engine'):
+            schemas = await engine.load_schema()
+        assert 'Shot' in schemas
+        assert engine.schema == schemas
+        path = cache_file(engine.site, root=root)
+        [message] = [r.getMessage() for r in caplog.records if r.name == 'sgalchemy.engine']
+        assert message.startswith(f'could not write the schema cache {path}: ')
+        assert message.endswith(
+            '; using the fetched schema without caching it. Set SGALCHEMY_SCHEMA_CACHE or pass '
+            'cache_root= to use a writable directory'
+        )
+        await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_create_async_engine_rejects_wrong_kind_connections(
+    fake_async_sg: FakeAsyncShotgun, fake_sg: FakeShotgun
+) -> None:
+    with pytest.raises(TypeError) as native_error:
+        create_async_engine(connection=fake_sg)  # pyright: ignore[reportArgumentType]
+    assert str(native_error.value) == (
+        'connection= received a sync client; pass it to '
+        'create_async_engine(sync_connection=...) instead'
+    )
+    with pytest.raises(TypeError) as threaded_error:
+        create_async_engine(sync_connection=fake_async_sg)  # pyright: ignore[reportArgumentType]
+    assert str(threaded_error.value) == (
+        'sync_connection= received an async client; pass it to '
+        'create_async_engine(connection=...) instead'
+    )
 
 
 def test_native_credentials_are_lazy_and_missing_extra_is_taught(
@@ -823,7 +884,7 @@ def test_native_static_session_token_builds_async_client(
     async def scenario() -> None:
         recorded: dict[str, Any] = {}
 
-        class AsyncProvider(_FakeAsyncShotgun):
+        class AsyncProvider(FakeAsyncShotgun):
             def __init__(self, base_url: str, **kwargs: object) -> None:
                 super().__init__()
                 recorded['base_url'] = base_url
@@ -852,7 +913,7 @@ def test_owned_native_connection_is_lazy_and_closed_by_context(
 ) -> None:
     instances: list[Any] = []
 
-    class RecordingAsyncShotgun(_FakeAsyncShotgun):
+    class RecordingAsyncShotgun(FakeAsyncShotgun):
         def __init__(
             self,
             base_url: str,
@@ -862,7 +923,7 @@ def test_owned_native_connection_is_lazy_and_closed_by_context(
         ) -> None:
             super().__init__()
             self.base_url = base_url
-            self._credentials = script_name, api_key
+            self.credentials = script_name, api_key
             instances.append(self)
 
     provider = ModuleType('shotgun_api3')
@@ -884,16 +945,16 @@ def test_owned_native_connection_is_lazy_and_closed_by_context(
 
     asyncio.run(scenario())
     assert len(instances) == 1
-    assert instances[0]._credentials == ('s', 'k')
-    assert instances[0]._closed is True
+    assert instances[0].credentials == ('s', 'k')
+    assert instances[0].closed is True
 
 
 def test_stale_mark_during_awaited_load_is_not_lost(
-    fake_async_sg: _FakeAsyncShotgun,
+    fake_async_sg: FakeAsyncShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
-        entered, release = fake_async_sg._block('schema_read')
+        entered, release = fake_async_sg.block('schema_read')
         engine = isolated_async_engine(fake_async_sg, tmp_path)
         loading = asyncio.create_task(engine.load_schema())
         await entered.wait()
@@ -901,29 +962,94 @@ def test_stale_mark_during_awaited_load_is_not_lost(
         release.set()
         await loading
         await engine.load_schema()
-        assert [name for name, _, _ in fake_async_sg._calls].count('schema_read') == 2
+        assert [name for name, _, _ in fake_async_sg.calls].count('schema_read') == 2
 
-    asyncio.run(scenario())
+    run_async(scenario())
+
+
+@pytest.mark.parametrize(
+    ('kwargs', 'message'),
+    [
+        (
+            {'strategy': 'native', 'sync_connection': object()},
+            (
+                "strategy='native' does not accept sync_connection or creator; "
+                "omit strategy or pass strategy='threaded'"
+            ),
+        ),
+        (
+            {'strategy': 'native', 'max_workers': 2},
+            (
+                "strategy='native' does not accept max_workers; "
+                "omit strategy or pass strategy='threaded'"
+            ),
+        ),
+        (
+            {'strategy': 'threaded', 'connection': object()},
+            (
+                "strategy='threaded' does not accept connection or async_creator; "
+                "omit strategy or pass strategy='native'"
+            ),
+        ),
+        (
+            {'connection': object(), 'max_workers': 2},
+            (
+                "connection= selects strategy='native' but max_workers= selects "
+                "strategy='threaded'; pass keywords for one strategy"
+            ),
+        ),
+        ({'strategy': 'both'}, "strategy must be 'native', 'threaded', or None"),
+    ],
+)
+def test_strategy_conflicts_name_the_fix(kwargs: dict[str, Any], message: str) -> None:
+    with pytest.raises(ValueError, match='strategy') as excinfo:
+        create_async_engine(**kwargs)
+    assert str(excinfo.value) == message
+
+
+def test_strategy_follows_the_source_keyword(
+    fake_async_sg: FakeAsyncShotgun,
+    fake_sg: FakeShotgun,
+    fake_sg_factory: FakeShotgunFactory,
+) -> None:
+    assert isinstance(create_async_engine(sync_connection=fake_sg)._backend, ThreadedSyncBackend)
+    assert isinstance(
+        create_async_engine('https://fake.example.com', creator=fake_sg_factory)._backend,
+        ThreadedSyncBackend,
+    )
+    assert isinstance(
+        create_async_engine(
+            'https://fake.example.com', session_token=str(123), max_workers=2
+        )._backend,
+        ThreadedSyncBackend,
+    )
+    assert isinstance(create_async_engine(connection=fake_async_sg)._backend, NativeAsyncBackend)
+    assert isinstance(
+        create_async_engine('https://fake.example.com', session_token=str(123))._backend,
+        NativeAsyncBackend,
+    )
 
 
 def test_supplied_sync_connection_defaults_to_one_worker_and_opts_into_more(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
     engine = create_async_engine(strategy='threaded', sync_connection=fake_sg, cache_root=tmp_path)
-    assert cast('Any', engine)._backend._max_workers == 1
+    assert isinstance(engine._backend, ThreadedSyncBackend)
+    assert engine._backend._max_workers == 1
     wide = create_async_engine(
         strategy='threaded',
         sync_connection=fake_sg,
         max_workers=3,
         cache_root=tmp_path,
     )
-    assert cast('Any', wide)._backend._max_workers == 3
+    assert isinstance(wide._backend, ThreadedSyncBackend)
+    assert wide._backend._max_workers == 3
 
 
 def test_sync_and_async_default_engines_share_live_schema_binding(
-    fake_async_sg: _FakeAsyncShotgun,
-    fake_sg: _FakeShotgun,
+    fake_async_sg: FakeAsyncShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
     schema_fixture: dict[str, Any],
     tmp_path: Path,
@@ -945,7 +1071,7 @@ def test_sync_and_async_default_engines_share_live_schema_binding(
     async_schema['Shot']['description']['data_type']['value'] = 'image'
 
     async def schema_read() -> dict[str, Any]:
-        await fake_async_sg._record('schema_read')
+        await fake_async_sg.record('schema_read')
         return copy.deepcopy(async_schema)
 
     monkeypatch.setattr(fake_async_sg, 'schema_read', schema_read)
@@ -976,22 +1102,22 @@ def test_sync_and_async_default_engines_share_live_schema_binding(
 
 def test_threaded_creator_is_public_and_lazy(tmp_path: Path) -> None:
     async def scenario() -> None:
-        factory = _FakeShotgunFactory()
+        factory = FakeShotgunFactory()
         engine = create_async_engine(
             'https://fake.example.com',
             strategy='threaded',
-            creator=cast('Any', factory),
+            creator=factory,
             cache_root=tmp_path,
         )
-        assert factory._instances == []
+        assert factory.instances == []
         await engine.call('schema_read')
-        assert len(factory._instances) == 1
+        assert len(factory.instances) == 1
 
     asyncio.run(scenario())
 
 
 def test_threaded_factory_uses_supplied_sync_connection(
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -1008,15 +1134,70 @@ def test_threaded_factory_uses_supplied_sync_connection(
         await engine.dispose()
 
     asyncio.run(scenario())
-    assert [name for name, _, _ in fake_sg._calls].count('schema_read') == 1
+    assert [name for name, _, _ in fake_sg.calls].count('schema_read') == 1
+
+
+def test_threaded_missing_provider_dependency_keeps_its_original_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    break_provider_import(monkeypatch, 'provider_dependency')
+
+    async def scenario() -> None:
+        engine = create_async_engine(
+            'https://fake.example.com',
+            strategy='threaded',
+            session_token=tmp_path.name,
+            cache_root=tmp_path,
+            bind_default=False,
+        )
+        try:
+            with pytest.raises(ModuleNotFoundError) as excinfo:
+                await engine.load_schema()
+            assert excinfo.value.name == 'provider_dependency'
+            assert str(excinfo.value) == "No module named 'provider_dependency'"
+            assert excinfo.value.__cause__ is None
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_threaded_missing_provider_names_the_extras(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setitem(sys.modules, 'shotgun_api3', None)
+
+    async def scenario() -> None:
+        engine = create_async_engine(
+            'https://fake.example.com',
+            strategy='threaded',
+            session_token=tmp_path.name,
+            cache_root=tmp_path,
+            bind_default=False,
+        )
+        try:
+            with pytest.raises(ModuleNotFoundError) as excinfo:
+                await engine.load_schema()
+            assert excinfo.value.name == 'shotgun_api3'
+            assert str(excinfo.value) == (
+                'no SG API provider is installed; install sgalchemy with the official, api, '
+                'or async extra, or pass sync_connection= or creator='
+            )
+            assert isinstance(excinfo.value.__cause__, ModuleNotFoundError)
+            assert excinfo.value.__cause__.name == 'shotgun_api3'
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
 
 
 def test_threaded_owned_client_defaults_to_four_workers(tmp_path: Path) -> None:
     engine = create_async_engine(
         'https://fake.example.com',
         strategy='threaded',
-        creator=cast('Any', _FakeShotgunFactory()),
+        creator=FakeShotgunFactory(),
         cache_root=tmp_path,
     )
 
-    assert cast('Any', engine)._backend._max_workers == 4
+    assert isinstance(engine._backend, ThreadedSyncBackend)
+    assert engine._backend._max_workers == 4

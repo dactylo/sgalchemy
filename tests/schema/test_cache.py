@@ -5,10 +5,10 @@ from typing import Any
 from unittest.mock import Mock
 
 import pytest
-from _fakes import _FakeShotgun
-from _support import fetch_schema
 
 from sgalchemy.schema import _cache
+from tests._fakes import FakeShotgun
+from tests._support import fetch_schema
 
 
 def _valid_payload() -> dict[str, Any]:
@@ -151,7 +151,7 @@ def test_normalize_server_info_preserves_only_dictionaries(
     assert _cache.normalize_server_info(value) == expected
 
 
-def test_round_trip(tmp_path: Path, fake_sg: _FakeShotgun) -> None:
+def test_round_trip(tmp_path: Path, fake_sg: FakeShotgun) -> None:
     cache = fetch_schema(fake_sg)
     path = tmp_path / 'x.json'
     _cache.store_cache(path, cache)
@@ -164,7 +164,7 @@ def test_round_trip(tmp_path: Path, fake_sg: _FakeShotgun) -> None:
 
 def test_store_replacement_failure_preserves_existing_cache(
     tmp_path: Path,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cache = fetch_schema(fake_sg)
@@ -184,7 +184,7 @@ def test_store_replacement_failure_preserves_existing_cache(
 
 def test_store_serialization_failure_preserves_existing_cache(
     tmp_path: Path,
-    fake_sg: _FakeShotgun,
+    fake_sg: FakeShotgun,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cache = fetch_schema(fake_sg)

@@ -33,14 +33,3 @@ def test_register_entity_class_stores_type_and_registry_outside_class() -> None:
     assert entity_registry(Asset) is registry
     assert 'entity_type' not in vars(Asset)
     assert 'entity_registry' not in vars(Asset)
-
-
-def test_register_entity_class_with_none_clears_stale_registry() -> None:
-    class Asset:
-        pass
-
-    register_entity_class(Asset, 'Asset', object())
-    register_entity_class(Asset, 'Asset', None)
-
-    assert entity_type(Asset) == 'Asset'
-    assert entity_registry(Asset) is None

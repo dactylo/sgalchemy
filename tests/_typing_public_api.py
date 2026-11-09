@@ -2,24 +2,40 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, assert_type
 
-from _support import mapped_entity
+from shotgun_api3.shotgun import Shotgun
 
 from sgalchemy import (
+    AsyncClosableShotgunLike,
     AsyncEngine,
     AsyncScopedSession,
     AsyncSession,
     AsyncSessionFactory,
     AsyncShotgunLike,
+    ClosableShotgunLike,
     CommitError,
+    Defer,
     Engine,
     Entity,
+    EntityNamespace,
+    Filter,
+    FilterGroup,
+    FindCall,
+    Grouping,
+    JoinedLoad,
+    LazyLoad,
+    LoadOnly,
+    Ordering,
+    RawFilters,
     Registry,
     Result,
     ScopedSession,
     Select,
+    SelectinLoad,
     Session,
     SessionFactory,
     ShotgunLike,
+    SummarizeCall,
+    Summary,
     async_scoped_session,
     async_sessionmaker,
     connect,
@@ -27,17 +43,25 @@ from sgalchemy import (
     select,
     sessionmaker,
 )
-from sgalchemy._core._compiler import FindCall, SummarizeCall
-from sgalchemy._core._expressions import FieldExpr, Summary, func
+from sgalchemy._core._expressions import FieldExpr, func
 from sgalchemy._orm._state import validate_point_records
-from sgalchemy._shotgun import ClosableShotgunLike
 from sgalchemy.schema import EntitySchema, FieldSchema, TTLPolicy
 from sgalchemy.testing import engine_over
+from tests._support import mapped_entity
 
 
 @mapped_entity('Shot')
 class _Shot(Entity):
     pass
+
+
+async def _check_async_commit_on_success_leaves_block_values_bound(  # pyright: ignore[reportUnusedFunction]
+    engine: AsyncEngine,
+) -> None:
+    async with async_sessionmaker(engine).commit_on_success() as session:
+        shot = _Shot.new()
+        session.add(shot)
+    assert_type(shot, _Shot)
 
 
 async def _check_async_entity_types(  # pyright: ignore[reportUnusedFunction]
@@ -67,6 +91,15 @@ def _check_commit_error_evidence(  # pyright: ignore[reportUnusedFunction]
     assert_type(error.staged, list[object])
     assert_type(error.indeterminate, list[object])
     assert_type(error.withdrawn, list[object])
+
+
+def _check_commit_on_success_leaves_block_values_bound(  # pyright: ignore[reportUnusedFunction]
+    engine: Engine,
+) -> None:
+    with sessionmaker(engine).commit_on_success() as session:
+        shot = _Shot.new()
+        session.add(shot)
+    assert_type(shot, _Shot)
 
 
 def _check_compile_capabilities(  # pyright: ignore[reportUnusedFunction]
@@ -133,10 +166,30 @@ def _check_func_types(  # pyright: ignore[reportUnusedFunction]
     assert_type(func.record_count(field), Summary)
 
 
+def _check_provider_protocol_conformance(  # pyright: ignore[reportUnusedFunction]
+    client: Shotgun,
+) -> ClosableShotgunLike:
+    return client
+
+
 def _check_public_annotation_types(  # pyright: ignore[reportUnusedFunction]
     engine: Engine,
     async_engine: AsyncEngine,
     async_connection: AsyncShotgunLike,
+    types: tuple[
+        AsyncClosableShotgunLike,
+        Defer,
+        EntityNamespace,
+        Filter,
+        FilterGroup,
+        Grouping,
+        JoinedLoad,
+        LazyLoad,
+        LoadOnly,
+        Ordering,
+        RawFilters,
+        SelectinLoad,
+    ],
 ) -> None:
     factory = sessionmaker(engine)
     assert_type(factory, SessionFactory)
@@ -147,6 +200,23 @@ def _check_public_annotation_types(  # pyright: ignore[reportUnusedFunction]
     assert_type(engine.schema, Mapping[str, EntitySchema])
     assert_type(engine.schema['Shot'].fields, Mapping[str, FieldSchema])
     assert_type(async_connection, AsyncShotgunLike)
+    assert_type(
+        types,
+        tuple[
+            AsyncClosableShotgunLike,
+            Defer,
+            EntityNamespace,
+            Filter,
+            FilterGroup,
+            Grouping,
+            JoinedLoad,
+            LazyLoad,
+            LoadOnly,
+            Ordering,
+            RawFilters,
+            SelectinLoad,
+        ],
+    )
 
 
 def _check_sync_entity_types(  # pyright: ignore[reportUnusedFunction]

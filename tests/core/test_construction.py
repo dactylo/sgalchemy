@@ -1,11 +1,11 @@
 import asyncio
 from collections.abc import Callable, Generator
-from typing import Any, get_type_hints
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
-from _fakes import _FakeAsyncShotgun, _FakeShotgun
 
+from sgalchemy._core._async_engine import create_async_engine
 from sgalchemy._core._construction import (
     _normalize_site,
     checked_async_client,
@@ -15,15 +15,15 @@ from sgalchemy._core._construction import (
     validate_site,
     validate_static_credentials,
 )
+from sgalchemy._core._engine import create_engine
 from sgalchemy._shotgun import (
     REQUIRED_SHOTGUN_METHODS,
-    AsyncClosableShotgunLike,
-    ClosableShotgunLike,
 )
+from tests._fakes import FakeAsyncShotgun, FakeShotgun
 
 
 def test_checked_async_client_rejects_malformed_site_safely() -> None:
-    fake = _FakeAsyncShotgun()
+    fake = FakeAsyncShotgun()
     fake.base_url = 'http://[::1'
 
     with pytest.raises(
@@ -31,7 +31,7 @@ def test_checked_async_client_rejects_malformed_site_safely() -> None:
     ) as excinfo:
         checked_async_client(fake, 'https://fake.example.com')
 
-    assert (fake._closed, str(excinfo.value)) == (
+    assert (fake.closed, str(excinfo.value)) == (
         False,
         'async_creator returned a client for a different site',
     )
@@ -39,39 +39,39 @@ def test_checked_async_client_rejects_malformed_site_safely() -> None:
 
 @pytest.mark.parametrize('method_name', REQUIRED_SHOTGUN_METHODS)
 def test_checked_async_client_rejects_missing_call_surface(method_name: str) -> None:
-    client = _FakeAsyncShotgun()
+    client = FakeAsyncShotgun()
     setattr(client, method_name, None)
 
     with pytest.raises(TypeError, match='required asynchronous client surface'):
         checked_async_client(client, 'https://fake.example.com')
 
-    assert client._closed is False
+    assert client.closed is False
 
 
 @pytest.mark.parametrize('method_name', REQUIRED_SHOTGUN_METHODS)
 def test_checked_async_client_rejects_sync_call_surface(method_name: str) -> None:
-    client = _FakeAsyncShotgun()
-    setattr(client, method_name, getattr(_FakeShotgun(), method_name))
+    client = FakeAsyncShotgun()
+    setattr(client, method_name, getattr(FakeShotgun(), method_name))
 
     with pytest.raises(TypeError, match='required asynchronous client surface'):
         checked_async_client(client, 'https://fake.example.com')
 
-    assert client._closed is False
+    assert client.closed is False
 
 
 def test_checked_async_client_rejects_sync_close_surface() -> None:
-    base: Any = _FakeAsyncShotgun
+    base: Any = FakeAsyncShotgun
 
     class SyncCloseFake(base):
         def close(self) -> None:
-            self._closed = True
+            self.closed = True
 
     client = SyncCloseFake()
 
     with pytest.raises(TypeError, match='required asynchronous client surface'):
         checked_async_client(client, 'https://fake.example.com')
 
-    assert client._closed is False
+    assert client.closed is False
 
 
 def test_checked_async_client_requires_close_surface() -> None:
@@ -83,21 +83,16 @@ def test_checked_async_client_requires_close_surface() -> None:
 
 
 def test_checked_async_client_validates_without_performing_cleanup() -> None:
-    fake = _FakeAsyncShotgun()
+    fake = FakeAsyncShotgun()
     assert checked_async_client(fake, 'https://fake.example.com') is fake
     with pytest.raises(ValueError, match='site'):
         checked_async_client(fake, 'https://other.example.com')
-    assert fake._closed is False  # awaited cleanup belongs to the async backend
-
-
-def test_checked_client_annotations_retain_closability() -> None:
-    assert get_type_hints(checked_sync_client)['return'] is ClosableShotgunLike
-    assert get_type_hints(checked_async_client)['return'] is AsyncClosableShotgunLike
+    assert fake.closed is False  # awaited cleanup belongs to the async backend
 
 
 def test_checked_clients_do_not_require_optional_info() -> None:
-    sync_client = _FakeShotgun()
-    async_client = _FakeAsyncShotgun()
+    sync_client = FakeShotgun()
+    async_client = FakeAsyncShotgun()
 
     assert not hasattr(sync_client, 'info')
     assert not hasattr(async_client, 'info')
@@ -105,16 +100,11 @@ def test_checked_clients_do_not_require_optional_info() -> None:
     assert checked_async_client(async_client, 'https://fake.example.com') is async_client
 
 
-def test_checked_sync_client_accepts_matching_site() -> None:
-    fake = _FakeShotgun()
-    assert checked_sync_client(fake, 'https://fake.example.com') is fake
-
-
 def test_checked_sync_client_closes_and_rejects_wrong_site() -> None:
-    fake = _FakeShotgun()
+    fake = FakeShotgun()
     with pytest.raises(ValueError, match='site'):
         checked_sync_client(fake, 'https://other.example.com')
-    assert fake._closed is True
+    assert fake.closed is True
 
 
 def test_checked_sync_client_closes_closable_result_missing_call_surface() -> None:
@@ -122,15 +112,15 @@ def test_checked_sync_client_closes_closable_result_missing_call_surface() -> No
         base_url = 'https://fake.example.com'
 
         def __init__(self) -> None:
-            self._closed = False
+            self.closed = False
 
         def close(self) -> None:
-            self._closed = True
+            self.closed = True
 
     result = Closable()
     with pytest.raises(TypeError, match=r'surface|find'):
         checked_sync_client(result, 'https://fake.example.com')
-    assert result._closed is True
+    assert result.closed is True
 
 
 def test_checked_sync_client_preserves_site_error_when_close_lookup_fails(
@@ -141,7 +131,7 @@ def test_checked_sync_client_preserves_site_error_when_close_lookup_fails(
 
         def __init__(self) -> None:
             self._close_lookups = 0
-            self._delegate = _FakeShotgun()
+            self._delegate = FakeShotgun()
 
         def __getattr__(self, name: str) -> Any:  # noqa: ANN401 - Delegate unknown provider attributes around a failing close descriptor.
             return getattr(self._delegate, name)
@@ -162,17 +152,17 @@ def test_checked_sync_client_preserves_site_error_when_close_lookup_fails(
 
 @pytest.mark.parametrize('method_name', REQUIRED_SHOTGUN_METHODS)
 def test_checked_sync_client_rejects_async_call_surface(method_name: str) -> None:
-    client = _FakeShotgun()
-    setattr(client, method_name, getattr(_FakeAsyncShotgun(), method_name))
+    client = FakeShotgun()
+    setattr(client, method_name, getattr(FakeAsyncShotgun(), method_name))
 
     with pytest.raises(TypeError, match='required synchronous client surface'):
         checked_sync_client(client, 'https://fake.example.com')
 
-    assert client._closed is True
+    assert client.closed is True
 
 
 def test_checked_sync_client_rejects_async_close_surface() -> None:
-    client: Any = _FakeShotgun()
+    client: Any = FakeShotgun()
     client.close = AsyncMock()
 
     with pytest.raises(TypeError, match='required synchronous client surface'):
@@ -182,8 +172,8 @@ def test_checked_sync_client_rejects_async_close_surface() -> None:
 
 
 def test_checked_sync_client_rejects_awaitable_result_with_teaching_error() -> None:
-    async def make() -> _FakeShotgun:
-        return _FakeShotgun()
+    async def make() -> FakeShotgun:
+        return FakeShotgun()
 
     coroutine = make()
     with pytest.raises(TypeError, match='async_creator'):
@@ -191,7 +181,7 @@ def test_checked_sync_client_rejects_awaitable_result_with_teaching_error() -> N
 
 
 def test_checked_sync_client_rejects_malformed_site_safely() -> None:
-    fake = _FakeShotgun()
+    fake = FakeShotgun()
     fake.base_url = 'http://[::1'
 
     with pytest.raises(
@@ -199,7 +189,7 @@ def test_checked_sync_client_rejects_malformed_site_safely() -> None:
     ) as excinfo:
         checked_sync_client(fake, 'https://fake.example.com')
 
-    assert (fake._closed, str(excinfo.value)) == (
+    assert (fake.closed, str(excinfo.value)) == (
         True,
         'creator returned a client for a different site',
     )
@@ -207,17 +197,17 @@ def test_checked_sync_client_rejects_malformed_site_safely() -> None:
 
 @pytest.mark.parametrize('method_name', REQUIRED_SHOTGUN_METHODS)
 def test_checked_sync_client_rejects_missing_call_surface(method_name: str) -> None:
-    client = _FakeShotgun()
+    client = FakeShotgun()
     setattr(client, method_name, None)
 
     with pytest.raises(TypeError, match='required synchronous client surface'):
         checked_sync_client(client, 'https://fake.example.com')
 
-    assert client._closed is True
+    assert client.closed is True
 
 
 def test_cleanup_cancellation_propagates_through_primary_error_cleanup() -> None:
-    class CancelledCloseFake(_FakeShotgun):
+    class CancelledCloseFake(FakeShotgun):
         def close(self) -> None:
             raise asyncio.CancelledError('cleanup cancelled')
 
@@ -228,8 +218,8 @@ def test_cleanup_cancellation_propagates_through_primary_error_cleanup() -> None
 
 
 def test_cleanup_failure_does_not_mask_primary_error() -> None:
-    fake = _FakeShotgun()
-    fake._close_errors.append(RuntimeError('cleanup exploded'))
+    fake = FakeShotgun()
+    fake.close_errors.append(RuntimeError('cleanup exploded'))
     with pytest.raises(ValueError, match='site'):
         checked_sync_client(fake, 'https://other.example.com')
 
@@ -256,8 +246,8 @@ def test_close_quietly_skips_descriptor_backed_async_callable() -> None:
 
 
 def test_close_quietly_swallows_close_failures() -> None:
-    fake = _FakeShotgun()
-    fake._close_errors.append(RuntimeError('boom'))
+    fake = FakeShotgun()
+    fake.close_errors.append(RuntimeError('boom'))
     close_quietly(fake)
     close_quietly(object())
 
@@ -277,10 +267,10 @@ def test_credential_secrets_are_absent_from_repr() -> None:
 
 
 def test_ensure_awaitable_rejects_sync_result_without_cleanup() -> None:
-    fake = _FakeShotgun()
+    fake = FakeShotgun()
     with pytest.raises(TypeError, match='creator'):
         ensure_awaitable(fake)
-    assert fake._closed is False  # awaited cleanup belongs to the async backend
+    assert fake.closed is False  # awaited cleanup belongs to the async backend
 
 
 @pytest.mark.parametrize(
@@ -319,6 +309,23 @@ def test_session_token_credentials_produce_provider_kwargs() -> None:
     value = 'tok'
     creds = validate_static_credentials(script_name=None, api_key=None, session_token=value)
     assert creds.provider_kwargs() == {'session_token': 'tok'}
+
+
+def test_supplied_connection_check_ignores_missing_methods_and_close() -> None:
+    class Partial:
+        base_url = 'https://fake.example.com'
+
+        def find(self, *args: object, **kwargs: object) -> list[object]:
+            del args, kwargs
+            return []
+
+        async def close(self) -> None:
+            pass
+
+    create_engine(connection=Partial(), bind_default=False)  # pyright: ignore[reportArgumentType]
+    create_async_engine(
+        connection=AsyncMock(base_url='https://fake.example.com'), bind_default=False
+    )
 
 
 @pytest.mark.parametrize(

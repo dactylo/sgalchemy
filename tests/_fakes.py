@@ -14,17 +14,17 @@ if TYPE_CHECKING:
     from sgalchemy._shotgun import WireRecord, WireRecords
 
 __all__ = [
-    '_SCHEMA_FIXTURE',
-    '_FakeAsyncShotgun',
-    '_FakeShotgun',
-    '_FakeShotgunFactory',
-    '_SchemaFixture',
+    'SCHEMA_FIXTURE',
+    'FakeAsyncShotgun',
+    'FakeShotgun',
+    'FakeShotgunFactory',
+    'SchemaFixture',
 ]
 
 _CallTranscript: TypeAlias = tuple[str, tuple[Any, ...], dict[str, Any]]
 _P = ParamSpec('_P')
 _R = TypeVar('_R')
-_SchemaFixture: TypeAlias = dict[str, dict[str, Any]]
+SchemaFixture: TypeAlias = dict[str, dict[str, Any]]
 
 _ENTITY = {'editable': {'value': True}, 'visible': {'value': True}}
 _ENTITY_FIXTURE: dict[str, dict[str, Any]] = {
@@ -41,7 +41,7 @@ _ENTITY_FIXTURE: dict[str, dict[str, Any]] = {
         ('CustomEntity03', 'Vendor'),
     ]
 }
-_SCHEMA_FIXTURE: _SchemaFixture = {
+SCHEMA_FIXTURE: SchemaFixture = {
     'Project': {
         'id': {
             'data_type': {'value': 'number'},
@@ -285,81 +285,31 @@ def _record_async_call(
         instance, name, transcript_args, transcript_kwargs = _normalize_transcript(
             method, args, kwargs
         )
-        await instance._record(name, *transcript_args, **transcript_kwargs)
+        await instance.record(name, *transcript_args, **transcript_kwargs)
         return await method(*args, **kwargs)
 
     return wrapper
 
 
-class _FakeAsyncShotgun:
+class FakeAsyncShotgun:
     base_url = 'https://fake.example.com'
 
     def __init__(self, find_results: list[WireRecords] | None = None) -> None:
-        self._calls: list[_CallTranscript] = []
-        self._close_errors: list[Exception] = []
-        self._closed = False
-        self._errors: dict[str, list[BaseException]] = {}
-        self._find_results: list[Any] = list(find_results or [])
-        self._batch_results: list[list[Any]] = []
-        self._fail_on_batch_index: int | None = None
-        self._find_error: BaseException | None = None
+        self.calls: list[_CallTranscript] = []
+        self.close_errors: list[Exception] = []
+        self.closed = False
+        self.errors: dict[str, list[BaseException | None]] = {}
+        self.find_results: list[Any] = list(find_results or [])
+        self.batch_results: list[list[Any]] = []
+        self.fail_on_batch_index: int | None = None
+        self.find_error: BaseException | None = None
         self._blocks: dict[str, tuple[asyncio.Event, asyncio.Event]] = {}
         self._next_id = 9000
 
-    def _block(self, method: str) -> tuple[asyncio.Event, asyncio.Event]:
+    def block(self, method: str) -> tuple[asyncio.Event, asyncio.Event]:
         events = (asyncio.Event(), asyncio.Event())
         self._blocks[method] = events
         return events
-
-    def _gate(self, method: str, entered: asyncio.Event, release: asyncio.Event) -> None:
-        self._blocks[method] = (entered, release)
-
-    async def _record(self, name: str, *args: object, **kwargs: object) -> None:
-        self._calls.append((name, args, kwargs))
-        block = self._blocks.get(name)
-        if block is not None:
-            entered, release = block
-            entered.set()
-            await release.wait()
-        errors = self._errors.get(name, [])
-        if errors:
-            raise errors.pop(0)
-
-    async def batch(self, requests: list[WireRecord]) -> list[Any]:
-        index = sum(1 for name, _, _ in self._calls if name == 'batch')
-        await self._record('batch', requests)
-        if self._fail_on_batch_index == index:
-            raise RuntimeError('batch failed (FakeAsyncShotgun)')
-        if self._batch_results:
-            return self._batch_results.pop(0)
-        out: list[Any] = []
-        for request in requests:
-            if request['request_type'] == 'create':
-                self._next_id += 1
-                out.append(
-                    {
-                        'type': request['entity_type'],
-                        'id': self._next_id,
-                        **request['data'],
-                    }
-                )
-            elif request['request_type'] == 'update':
-                out.append(
-                    {
-                        'type': request['entity_type'],
-                        'id': request['entity_id'],
-                        **request['data'],
-                    }
-                )
-            else:
-                out.append(True)
-        return out
-
-    async def close(self) -> None:
-        await self._record('close')
-        if self._close_errors:
-            raise self._close_errors.pop(0)
-        self._closed = True
 
     @_record_async_call
     async def find(  # noqa: PLR0913, PLR0917
@@ -387,10 +337,60 @@ class _FakeAsyncShotgun:
             include_archived_projects,
             additional_filter_presets,
         )
-        if self._find_error is not None:
-            error, self._find_error = self._find_error, None
+        if self.find_error is not None:
+            error, self.find_error = self.find_error, None
             raise error
-        return self._find_results.pop(0) if self._find_results else []
+        return self.find_results.pop(0) if self.find_results else []
+
+    def gate(self, method: str, entered: asyncio.Event, release: asyncio.Event) -> None:
+        self._blocks[method] = (entered, release)
+
+    async def record(self, name: str, *args: object, **kwargs: object) -> None:
+        self.calls.append((name, args, kwargs))
+        block = self._blocks.get(name)
+        if block is not None:
+            entered, release = block
+            entered.set()
+            await release.wait()
+        errors = self.errors.get(name, [])
+        if errors and (error := errors.pop(0)) is not None:
+            raise error
+
+    async def batch(self, requests: list[WireRecord]) -> list[Any]:
+        index = sum(1 for name, _, _ in self.calls if name == 'batch')
+        await self.record('batch', requests)
+        if self.fail_on_batch_index == index:
+            raise RuntimeError('batch failed (FakeAsyncShotgun)')
+        if self.batch_results:
+            return self.batch_results.pop(0)
+        out: list[Any] = []
+        for request in requests:
+            if request['request_type'] == 'create':
+                self._next_id += 1
+                out.append(
+                    {
+                        'type': request['entity_type'],
+                        'id': self._next_id,
+                        **request['data'],
+                    }
+                )
+            elif request['request_type'] == 'update':
+                out.append(
+                    {
+                        'type': request['entity_type'],
+                        'id': request['entity_id'],
+                        **request['data'],
+                    }
+                )
+            else:
+                out.append(True)
+        return out
+
+    async def close(self) -> None:
+        await self.record('close')
+        if self.close_errors:
+            raise self.close_errors.pop(0)
+        self.closed = True
 
     async def find_one(
         self,
@@ -398,21 +398,21 @@ class _FakeAsyncShotgun:
         filters: list[Any],
         fields: list[str] | None = None,
     ) -> WireRecord | None:
-        await self._record('find_one', entity_type, filters, fields)
-        rows: WireRecords = self._find_results.pop(0) if self._find_results else []
+        await self.record('find_one', entity_type, filters, fields)
+        rows: WireRecords = self.find_results.pop(0) if self.find_results else []
         return rows[0] if rows else None
 
     async def revive(self, entity_type: str, entity_id: int) -> bool:
-        await self._record('revive', entity_type, entity_id)
+        await self.record('revive', entity_type, entity_id)
         return True
 
-    async def schema_entity_read(self) -> _SchemaFixture:
-        await self._record('schema_entity_read')
+    async def schema_entity_read(self) -> SchemaFixture:
+        await self.record('schema_entity_read')
         return copy.deepcopy(_ENTITY_FIXTURE)
 
-    async def schema_read(self) -> _SchemaFixture:
-        await self._record('schema_read')
-        return copy.deepcopy(_SCHEMA_FIXTURE)
+    async def schema_read(self) -> SchemaFixture:
+        await self.record('schema_read')
+        return copy.deepcopy(SCHEMA_FIXTURE)
 
     @_record_async_call
     async def summarize(  # noqa: PLR0913, PLR0917
@@ -440,7 +440,7 @@ class _FakeAsyncShotgun:
         entity_id: int,
         path: str,
     ) -> int:
-        await self._record('upload_filmstrip_thumbnail', entity_type, entity_id, path)
+        await self.record('upload_filmstrip_thumbnail', entity_type, entity_id, path)
         return 1
 
     async def upload_thumbnail(
@@ -449,7 +449,7 @@ class _FakeAsyncShotgun:
         entity_id: int,
         path: str,
     ) -> int:
-        await self._record('upload_thumbnail', entity_type, entity_id, path)
+        await self.record('upload_thumbnail', entity_type, entity_id, path)
         return 1
 
 
@@ -460,13 +460,13 @@ def _record_sync_call(method: Callable[_P, _R]) -> Callable[_P, _R]:
         instance, name, transcript_args, transcript_kwargs = _normalize_transcript(
             method, args, kwargs
         )
-        instance._record(name, *transcript_args, **transcript_kwargs)
+        instance.record(name, *transcript_args, **transcript_kwargs)
         return method(*args, **kwargs)
 
     return wrapper
 
 
-class _FakeShotgun:
+class FakeShotgun:
     base_url = 'https://fake.example.com'
 
     def __init__(
@@ -475,24 +475,24 @@ class _FakeShotgun:
         *,
         worker_barriers: dict[str, threading.Barrier] | None = None,
     ) -> None:
-        self._calls: list[_CallTranscript] = []
-        self._close_errors: list[Exception] = []
-        self._closed = False
-        self._errors: dict[str, list[BaseException | None]] = {}
-        self._find_results: list[Any] = list(find_results or [])
-        self._batch_results: list[list[Any]] = []
-        self._fail_on_batch_index: int | None = None
-        self._find_error: BaseException | None = None  # raised (once) by the next find()
-        self._max_active_calls = 0
-        self._raise_on_concurrent = False
-        self._thread_ids: set[int] = set()
+        self.calls: list[_CallTranscript] = []
+        self.close_errors: list[Exception] = []
+        self.closed = False
+        self.errors: dict[str, list[BaseException | None]] = {}
+        self.find_results: list[Any] = list(find_results or [])
+        self.batch_results: list[list[Any]] = []
+        self.fail_on_batch_index: int | None = None
+        self.find_error: BaseException | None = None  # raised (once) by the next find()
+        self.max_active_calls = 0
+        self.raise_on_concurrent = False
+        self.thread_ids: set[int] = set()
         self._active_calls = 0
         self._blocks: dict[str, list[tuple[threading.Event, threading.Event]]] = {}
         self._next_id = 9000  # monotonic create ids; never collide across batch calls
         self._state_lock = threading.Lock()
         self._worker_barriers = dict(worker_barriers or {})
 
-    def _block_next(
+    def block_next(
         self,
         method: str,
         *,
@@ -502,56 +502,10 @@ class _FakeShotgun:
         with self._state_lock:
             self._blocks.setdefault(method, []).append((entered, release))
 
-    def _record(self, name: str, *args: object, **kwargs: object) -> None:
-        with self._state_lock:
-            self._calls.append((name, args, kwargs))
-            self._thread_ids.add(threading.get_ident())
-            self._active_calls += 1
-            self._max_active_calls = max(self._max_active_calls, self._active_calls)
-            concurrent = self._raise_on_concurrent and self._active_calls > 1
-            blocks = self._blocks.get(name, [])
-            block = blocks.pop(0) if blocks else None
-            barrier = self._worker_barriers.pop(name, None)
-            errors = self._errors.get(name, [])
-            error = errors.pop(0) if errors else None
-        try:
-            if concurrent:
-                raise RuntimeError('concurrent fake Shotgun call')
-            if block is not None:
-                entered, release = block
-                entered.set()
-                if not release.wait(timeout=_WORKER_TIMEOUT_SECONDS):
-                    raise TimeoutError(f'timed out waiting to release fake {name}')
-            if barrier is not None:
-                barrier.wait(timeout=_WORKER_TIMEOUT_SECONDS)
-            if error is not None:
-                raise error
-        finally:
-            with self._state_lock:
-                self._active_calls -= 1
-
-    def batch(self, requests: list[WireRecord]) -> list[Any]:
-        index = sum(1 for name, _, _ in self._calls if name == 'batch')
-        self._record('batch', requests)
-        if self._fail_on_batch_index == index:
-            raise RuntimeError('batch failed (FakeShotgun)')
-        if self._batch_results:
-            return self._batch_results.pop(0)
-        out: list[Any] = []
-        for req in requests:
-            if req['request_type'] == 'create':
-                self._next_id += 1
-                out.append({'type': req['entity_type'], 'id': self._next_id, **req['data']})
-            elif req['request_type'] == 'update':
-                out.append({'type': req['entity_type'], 'id': req['entity_id'], **req['data']})
-            else:
-                out.append(True)
-        return out
-
     def close(self) -> None:
-        if self._close_errors:
-            raise self._close_errors.pop(0)
-        self._closed = True
+        if self.close_errors:
+            raise self.close_errors.pop(0)
+        self.closed = True
 
     @_record_sync_call
     def find(  # noqa: PLR0913, PLR0917 - Preserve provider call compatibility.
@@ -581,10 +535,56 @@ class _FakeShotgun:
             additional_filter_presets,
             kwargs,
         )
-        if self._find_error is not None:
-            err, self._find_error = self._find_error, None
+        if self.find_error is not None:
+            err, self.find_error = self.find_error, None
             raise err
-        return self._find_results.pop(0) if self._find_results else []
+        return self.find_results.pop(0) if self.find_results else []
+
+    def record(self, name: str, *args: object, **kwargs: object) -> None:
+        with self._state_lock:
+            self.calls.append((name, args, kwargs))
+            self.thread_ids.add(threading.get_ident())
+            self._active_calls += 1
+            self.max_active_calls = max(self.max_active_calls, self._active_calls)
+            concurrent = self.raise_on_concurrent and self._active_calls > 1
+            blocks = self._blocks.get(name, [])
+            block = blocks.pop(0) if blocks else None
+            barrier = self._worker_barriers.pop(name, None)
+            errors = self.errors.get(name, [])
+            error = errors.pop(0) if errors else None
+        try:
+            if concurrent:
+                raise RuntimeError('concurrent fake Shotgun call')
+            if block is not None:
+                entered, release = block
+                entered.set()
+                if not release.wait(timeout=_WORKER_TIMEOUT_SECONDS):
+                    raise TimeoutError(f'timed out waiting to release fake {name}')
+            if barrier is not None:
+                barrier.wait(timeout=_WORKER_TIMEOUT_SECONDS)
+            if error is not None:
+                raise error
+        finally:
+            with self._state_lock:
+                self._active_calls -= 1
+
+    def batch(self, requests: list[WireRecord]) -> list[Any]:
+        index = sum(1 for name, _, _ in self.calls if name == 'batch')
+        self.record('batch', requests)
+        if self.fail_on_batch_index == index:
+            raise RuntimeError('batch failed (FakeShotgun)')
+        if self.batch_results:
+            return self.batch_results.pop(0)
+        out: list[Any] = []
+        for req in requests:
+            if req['request_type'] == 'create':
+                self._next_id += 1
+                out.append({'type': req['entity_type'], 'id': self._next_id, **req['data']})
+            elif req['request_type'] == 'update':
+                out.append({'type': req['entity_type'], 'id': req['entity_id'], **req['data']})
+            else:
+                out.append(True)
+        return out
 
     def find_one(
         self,
@@ -592,21 +592,21 @@ class _FakeShotgun:
         filters: list[Any],
         fields: list[str] | None = None,
     ) -> WireRecord | None:
-        self._record('find_one', entity_type, filters, fields)
-        rows: WireRecords = self._find_results.pop(0) if self._find_results else []
+        self.record('find_one', entity_type, filters, fields)
+        rows: WireRecords = self.find_results.pop(0) if self.find_results else []
         return rows[0] if rows else None
 
     def revive(self, entity_type: str, entity_id: int) -> bool:
-        self._record('revive', entity_type, entity_id)
+        self.record('revive', entity_type, entity_id)
         return True
 
-    def schema_entity_read(self) -> _SchemaFixture:
-        self._record('schema_entity_read')
+    def schema_entity_read(self) -> SchemaFixture:
+        self.record('schema_entity_read')
         return copy.deepcopy(_ENTITY_FIXTURE)
 
-    def schema_read(self) -> _SchemaFixture:
-        self._record('schema_read')
-        return copy.deepcopy(_SCHEMA_FIXTURE)
+    def schema_read(self) -> SchemaFixture:
+        self.record('schema_read')
+        return copy.deepcopy(SCHEMA_FIXTURE)
 
     @_record_sync_call
     def summarize(  # noqa: PLR0913, PLR0917 - Preserve provider call compatibility.
@@ -636,7 +636,7 @@ class _FakeShotgun:
         entity_id: int,
         path: str,
     ) -> int:
-        self._record('upload_filmstrip_thumbnail', entity_type, entity_id, path)
+        self.record('upload_filmstrip_thumbnail', entity_type, entity_id, path)
         return 1
 
     def upload_thumbnail(
@@ -645,21 +645,21 @@ class _FakeShotgun:
         entity_id: int,
         path: str,
     ) -> int:
-        self._record('upload_thumbnail', entity_type, entity_id, path)
+        self.record('upload_thumbnail', entity_type, entity_id, path)
         return 1
 
 
-class _FakeShotgunFactory:
+class FakeShotgunFactory:
     def __init__(self) -> None:
-        self._instances: list[_FakeShotgun] = []
+        self.instances: list[FakeShotgun] = []
         self._worker_barriers: dict[str, threading.Barrier] = {}
 
-    def __call__(self) -> _FakeShotgun:
-        instance = _FakeShotgun(worker_barriers=self._worker_barriers)
-        self._instances.append(instance)
+    def __call__(self) -> FakeShotgun:
+        instance = FakeShotgun(worker_barriers=self._worker_barriers)
+        self.instances.append(instance)
         return instance
 
-    def _block_workers(self, method: str, parties: int) -> threading.Barrier:
+    def block_workers(self, method: str, parties: int) -> threading.Barrier:
         barrier = threading.Barrier(parties)
         self._worker_barriers[method] = barrier
         return barrier
